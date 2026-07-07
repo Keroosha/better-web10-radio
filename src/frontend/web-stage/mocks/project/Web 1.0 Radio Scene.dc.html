@@ -1,0 +1,761 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;700;900&family=VT323&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<style>
+  html,body{margin:0;padding:0;height:100%;overflow:hidden;background:#ffdccb;font-family:'Tahoma','Segoe UI',system-ui,sans-serif}
+  *{box-sizing:border-box}
+  a{color:#0a86c9;text-decoration:none}a:hover{color:#0b3a5a}
+  @keyframes eqbar{0%,100%{transform:scaleY(0.35)}50%{transform:scaleY(1)}}
+  @keyframes livepulse{0%,100%{opacity:1}50%{opacity:0.25}}
+  @keyframes toastpop{0%{transform:translateY(14px) scale(0.9);opacity:0}18%{transform:translateY(0) scale(1.04);opacity:1}30%{transform:scale(1)}100%{transform:translateY(0) scale(1);opacity:1}}
+  @keyframes shimmer{0%{background-position:-140% 0}100%{background-position:240% 0}}
+  @keyframes floatin{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+</style>
+</helmet>
+<div style="position:fixed;inset:0;background:linear-gradient(180deg,#bfe0ff 0%,#d6ecff 34%,#ffe3d0 74%,#ffcfe0 100%);overflow:hidden;font-family:'Tahoma','Segoe UI',system-ui,sans-serif">
+
+  <canvas ref="{{ setCanvas }}" style="position:fixed;inset:0;width:100%;height:100%;display:block" data-comment-anchor="41b163b129-canvas"></canvas>
+
+  <div style="position:fixed;inset:0;pointer-events:none;background:radial-gradient(120% 90% at 50% 44%, transparent 55%, rgba(120,60,90,0.18) 100%);z-index:2"></div>
+
+  <sc-if value="{{ notReady }}" hint-placeholder-val="{{ true }}">
+    <div style="position:fixed;inset:0;display:flex;align-items:center;justify-content:center;z-index:9;font-family:'Tahoma',sans-serif">
+      <div style="background:#c3c7cb;box-shadow:inset -1px -1px 0 #000, inset 1px 1px 0 #dfe3e6, inset -2px -2px 0 #85898c, inset 2px 2px 0 #fff;padding:3px;width:280px">
+        <div style="background:linear-gradient(90deg,#000080,#1084d0);color:#fff;font-weight:bold;font-size:12px;padding:3px 5px">web1radio.exe</div>
+        <div style="padding:16px 14px;font-size:12px;color:#000">
+          <div style="margin-bottom:9px">Загрузка сцены…</div>
+          <div style="height:16px;background:#fff;box-shadow:inset 1px 1px 0 #85898c, inset -1px -1px 0 #dfe3e6;padding:2px;overflow:hidden">
+            <div style="height:100%;width:60%;background:repeating-linear-gradient(90deg,#000080 0 10px,transparent 10px 13px)"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+  <!-- ===== OVERLAY ===== -->
+  <div style="{{ containerStyle }}">
+
+    <!-- NOW PLAYING bar -->
+    <div style="{{ wNow }}">
+      <div style="display:flex;align-items:center;gap:11px;padding:8px 13px 8px 9px">
+        <div style="width:34px;height:34px;flex:none;border-radius:8px;overflow:hidden;box-shadow:0 0 0 1px rgba(255,255,255,0.6), 0 2px 6px rgba(0,0,0,0.2);background:#dff3ff">
+          <x-import component-from-global-scope="image-slot" from="./image-slot.js" id="ch-logo" src="uploads/photo_2022-04-03_15-15-42.jpg" fit="contain" placeholder="лого" style="width:100%;height:100%"></x-import>
+        </div>
+        <div style="min-width:0">
+          <div style="font-size:9px;letter-spacing:0.16em;font-weight:700;opacity:0.65;color:{{ cAccent }}">NOW PLAYING · 24/7</div>
+          <div style="font-family:'Noto Sans JP',sans-serif;font-weight:700;font-size:14px;line-height:1.15;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:300px">{{ track.title }}</div>
+          <div style="font-size:11px;opacity:0.75;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:300px">{{ track.artist }}</div>
+        </div>
+        <div style="display:flex;align-items:flex-end;gap:3px;height:22px;margin-left:2px">
+          <span style="width:3px;height:100%;background:{{ cAccent }};transform-origin:bottom;animation:eqbar 0.7s ease-in-out infinite;border-radius:2px"></span>
+          <span style="width:3px;height:100%;background:{{ cAccent }};transform-origin:bottom;animation:eqbar 0.55s ease-in-out infinite 0.12s;border-radius:2px"></span>
+          <span style="width:3px;height:100%;background:{{ cAccent }};transform-origin:bottom;animation:eqbar 0.8s ease-in-out infinite 0.28s;border-radius:2px"></span>
+          <span style="width:3px;height:100%;background:{{ cAccent }};transform-origin:bottom;animation:eqbar 0.6s ease-in-out infinite 0.05s;border-radius:2px"></span>
+          <span style="width:3px;height:100%;background:{{ cAccent }};transform-origin:bottom;animation:eqbar 0.72s ease-in-out infinite 0.2s;border-radius:2px"></span>
+        </div>
+        <div style="display:flex;align-items:center;gap:5px;padding:3px 8px;margin-left:4px;border-radius:20px;background:rgba(230,40,70,0.14);color:#c11f43;font-weight:700;font-size:10px;letter-spacing:0.08em">
+          <span style="width:7px;height:7px;border-radius:50%;background:#e5183d;animation:livepulse 1.4s ease-in-out infinite"></span>LIVE
+        </div>
+      </div>
+    </div>
+
+    <!-- DONATION -->
+    <div style="{{ wDon }}">
+      <div style="{{ sTitle }}"><span>DONATION GOAL</span><span style="{{ sBtn }}">×</span></div>
+      <div style="{{ sBody }}">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:11px;padding:8px 10px;border-radius:10px;background:{{ cHiRow }}">
+          <div style="width:38px;height:38px;flex:none;border-radius:9px;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:17px;color:#fff;background:linear-gradient(150deg,#ffd76a,#ff8f3c);box-shadow:0 2px 7px rgba(220,130,40,0.4)">★</div>
+          <div style="min-width:0">
+            <div style="font-size:9px;font-weight:700;letter-spacing:0.13em;opacity:0.6">TOP DONATOR</div>
+            <div style="font-weight:700;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ don.top.name }}</div>
+          </div>
+          <div style="margin-left:auto;font-family:'VT323',monospace;font-size:26px;line-height:1;color:{{ cAccent }}">{{ don.top.amountFmt }}</div>
+        </div>
+
+        <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:5px">
+          <span style="font-family:'VT323',monospace;font-size:24px;line-height:1">{{ don.raisedFmt }}</span>
+          <span style="font-size:11px;opacity:0.7">цель {{ don.goalFmt }}</span>
+        </div>
+        <div style="{{ barTrack }}">
+          <div style="{{ barFill }}"></div>
+        </div>
+        <div style="text-align:right;font-size:10px;opacity:0.65;margin-top:4px">{{ don.pctStr }}% собрано</div>
+
+        <div style="margin-top:11px;display:flex;flex-direction:column;gap:5px">
+          <sc-for list="{{ don.recent }}" as="d" hint-placeholder-count="3">
+            <div style="display:flex;align-items:center;gap:8px;padding:5px 9px;border-radius:8px;background:{{ cRow }};font-size:12px;animation:floatin 0.4s ease">
+              <span style="width:6px;height:6px;border-radius:50%;background:{{ cAccent }};flex:none"></span>
+              <span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ d.name }}</span>
+              <span style="margin-left:auto;font-family:'VT323',monospace;font-size:17px;color:{{ cAccent }}">{{ d.amountFmt }}</span>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+    </div>
+
+    <!-- PAID MESSAGES -->
+    <div style="{{ wMsg }}">
+      <div style="{{ sTitle }}"><span>SUPER CHAT</span><span style="{{ sBtn }}">×</span></div>
+      <div style="{{ sBody }}">
+        <div style="display:flex;flex-direction:column;gap:7px">
+          <sc-for list="{{ messages }}" as="m" hint-placeholder-count="3">
+            <div style="border-radius:10px;overflow:hidden;background:{{ cRow }};animation:floatin 0.45s ease;box-shadow:0 1px 4px rgba(0,0,0,0.08)">
+              <div style="display:flex;align-items:center;gap:7px;padding:5px 9px;background:{{ m.color }};color:#fff">
+                <span style="font-weight:700;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ m.user }}</span>
+                <span style="margin-left:auto;font-family:'VT323',monospace;font-size:18px;line-height:1;text-shadow:0 1px 1px rgba(0,0,0,0.25)">{{ m.amountFmt }}</span>
+              </div>
+              <div style="padding:6px 10px 8px;font-size:12px;line-height:1.35">{{ m.text }}</div>
+            </div>
+          </sc-for>
+        </div>
+      </div>
+    </div>
+
+    <!-- SOCIAL / QR -->
+    <div style="{{ wSoc }}">
+      <div style="{{ sTitle }}"><span>FOLLOW US</span><span style="{{ sBtn }}">×</span></div>
+      <div style="{{ sBody }}">
+        <div style="display:flex;gap:11px;align-items:center">
+          <div style="width:88px;height:88px;flex:none;border-radius:10px;overflow:hidden;background:#fff;box-shadow:inset 0 0 0 1px rgba(0,0,0,0.1), 0 2px 6px rgba(0,0,0,0.15)">
+            <x-import component-from-global-scope="image-slot" from="./image-slot.js" id="social-qr" src="uploads/web10qr.png" fit="contain" placeholder="QR-код" style="width:100%;height:100%"></x-import>
+          </div>
+          <div style="min-width:0;flex:1">
+            <div style="font-size:9px;font-weight:700;letter-spacing:0.13em;opacity:0.6">СЕЙЧАС В ЭФИРЕ</div>
+            <div style="display:flex;align-items:center;gap:7px;margin-top:3px">
+              <span style="width:22px;height:22px;flex:none;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:900;color:#fff;background:{{ curSocial.color }}">{{ curSocial.glyph }}</span>
+              <div style="min-width:0">
+                <div style="font-weight:700;font-size:13px;line-height:1.1">{{ curSocial.name }}</div>
+                <div style="font-size:11px;opacity:0.7;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">{{ curSocial.handle }}</div>
+              </div>
+            </div>
+            <div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:9px">
+              <sc-for list="{{ socials }}" as="s" hint-placeholder-count="4">
+                <span style="width:19px;height:19px;border-radius:5px;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:900;color:#fff;background:{{ s.color }};opacity:{{ s.op }}">{{ s.glyph }}</span>
+              </sc-for>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- DONATE TOAST -->
+  <sc-if value="{{ toast }}" hint-placeholder-val="{{ false }}">
+    <div style="{{ toastStyle }}">
+      <div style="display:flex;align-items:center;gap:10px">
+        <div style="width:40px;height:40px;flex:none;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:900;color:#fff;background:linear-gradient(150deg,#ffd76a,#ff7a3c);box-shadow:0 3px 10px rgba(220,120,40,0.5)">♥</div>
+        <div>
+          <div style="font-size:10px;font-weight:700;letter-spacing:0.12em;opacity:0.7">НОВЫЙ ДОНАТ</div>
+          <div style="font-weight:700;font-size:15px">{{ toast.name }} · <span style="font-family:'VT323',monospace;font-size:20px;color:{{ cAccent }}">{{ toast.amountFmt }}</span></div>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;overlayStyle&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;aero&quot;,&quot;win9x&quot;],&quot;default&quot;:&quot;aero&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Стиль&quot;,&quot;label&quot;:&quot;Стиль оверлеев&quot;},&quot;layout&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;corners&quot;,&quot;sidebar&quot;,&quot;bottombar&quot;],&quot;default&quot;:&quot;corners&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Стиль&quot;,&quot;label&quot;:&quot;Раскладка виджетов&quot;}}">
+class Component extends DCLogic {
+  state = {
+    ready: false,
+    trackIdx: 0,
+    raised: 3820,
+    goal: 5000,
+    top: { name: 'CyberDove', amount: 500 },
+    recent: [
+      { id: 1, name: 'neonghost', amount: 25 },
+      { id: 2, name: 'aqua_dreamer', amount: 50 },
+      { id: 3, name: 'plaza_kid', amount: 15 },
+    ],
+    messages: [
+      { id: 1, user: 'vhs_wanderer', amount: 100, text: 'this station literally saved my night shift 🌙', color: '#e0439a' },
+      { id: 2, user: 'marble_bust', amount: 20, text: 'いい曲！greetings from Tokyo', color: '#2a8fe0' },
+      { id: 3, user: 'poolside_99', amount: 10, text: 'requesting more slowed & reverb pls', color: '#39b36a' },
+    ],
+    socialIdx: 0,
+    toast: null,
+  };
+
+  playlist = [
+    { title: 'リサフランク420 / 現代のコンピュー', artist: 'Macintosh Plus' },
+    { title: 'ブート / Boot', artist: 'FLORAL SHOPPE' },
+    { title: '花の専門店 (Interlude)', artist: 'New Plaza FM' },
+  ];
+
+  socials = [
+    { name: 'Telegram', handle: '@web1radio', glyph: 'T', color: '#2aabee' },
+    { name: 'YouTube', handle: '/web1radio', glyph: 'Y', color: '#e5342b' },
+    { name: 'Instagram', handle: '@web1.radio', glyph: 'I', color: '#c9379d' },
+    { name: 'Discord', handle: 'discord.gg/web1', glyph: 'D', color: '#5865f2' },
+  ];
+
+  names = ['starlit_os', 'chrome_lily', 'y2k_angel', 'dolphinware', 'palm_ce', 'geocitizen', 'frutiger_fan', 'winamp_wraith', 'lagoon.dll', 'seafoam95'];
+  msgTexts = ['первый раз тут — влюбился ✨', 'this is the internet i miss', 'храм выглядит божественно', 'keep it 24/7 forever 🙏', 'aero glass supremacy', 'reminds me of my old iMac', 'мурашки от этого трека'];
+  msgColors = ['#e0439a', '#2a8fe0', '#39b36a', '#e0a020', '#8b5cf6'];
+
+  setCanvas = (el) => {
+    this.canvasEl = el;
+    if (el) this._tryInit();
+  };
+
+  _tryInit = () => {
+    if (this._inited) return;
+    if (typeof window !== 'undefined' && window.THREE) {
+      this._inited = true;
+      try { this.initThree(); } catch (e) { console.error('three init', e); }
+    } else {
+      this._pollId = setTimeout(this._tryInit, 120);
+    }
+  };
+
+  componentDidMount() {
+    this._intervals = [];
+    // donation ticker
+    this._intervals.push(setInterval(() => this.addDonation(), 5200));
+    // superchat ticker
+    this._intervals.push(setInterval(() => this.addMessage(), 7600));
+    // social rotator
+    this._intervals.push(setInterval(() => {
+      this.setState(s => ({ socialIdx: (s.socialIdx + 1) % this.socials.length }));
+    }, 4200));
+    // track rotator
+    this._intervals.push(setInterval(() => {
+      this.setState(s => {
+        const n = (s.trackIdx + 1) % this.playlist.length;
+        this.updateTrackArt(this.playlist[n]);
+        return { trackIdx: n };
+      });
+    }, 20000));
+    if (document.fonts && document.fonts.ready) {
+      document.fonts.ready.then(() => {
+        this.updateTrackArt(this.playlist[this.state.trackIdx]);
+      });
+    }
+  }
+
+  componentWillUnmount() {
+    (this._intervals || []).forEach(clearInterval);
+    if (this._pollId) clearTimeout(this._pollId);
+    if (this._raf) cancelAnimationFrame(this._raf);
+    if (this._onResize) window.removeEventListener('resize', this._onResize);
+    if (this._onMove) window.removeEventListener('mousemove', this._onMove);
+    if (this.renderer) this.renderer.dispose();
+    if (this._toastT) clearTimeout(this._toastT);
+  }
+
+  addDonation() {
+    const amount = [5, 10, 15, 20, 25, 50, 100, 250][Math.floor(Math.random() * 8)];
+    const name = this.names[Math.floor(Math.random() * this.names.length)];
+    this.setState(s => {
+      const recent = [{ id: Date.now(), name, amount }, ...s.recent].slice(0, 5);
+      const raised = Math.min(s.goal, s.raised + amount);
+      const top = amount > s.top.amount ? { name, amount } : s.top;
+      return { recent, raised, top, toast: { name, amount } };
+    });
+    if (this._toastT) clearTimeout(this._toastT);
+    this._toastT = setTimeout(() => this.setState({ toast: null }), 3800);
+  }
+
+  addMessage() {
+    const amount = [5, 10, 20, 50, 100][Math.floor(Math.random() * 5)];
+    const user = this.names[Math.floor(Math.random() * this.names.length)];
+    const text = this.msgTexts[Math.floor(Math.random() * this.msgTexts.length)];
+    const color = amount >= 100 ? '#e0439a' : amount >= 50 ? '#e0a020' : amount >= 20 ? '#2a8fe0' : '#39b36a';
+    this.setState(s => ({ messages: [{ id: Date.now(), user, amount, text, color }, ...s.messages].slice(0, 4) }));
+  }
+
+  // ---------- money ----------
+  fmt(n) { return '$' + Number(n).toLocaleString('en-US'); }
+
+  // ---------- THREE ----------
+  initThree() {
+    const THREE = window.THREE;
+    const canvas = this.canvasEl;
+    const w = canvas.clientWidth || window.innerWidth;
+    const h = canvas.clientHeight || window.innerHeight;
+
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.setSize(w, h, false);
+    this.renderer = renderer;
+
+    // recover from WebGL context loss (24/7 runtime, tab idling, GPU resets)
+    if (!this._ctxHooked) {
+      this._ctxHooked = true;
+      canvas.addEventListener('webglcontextlost', (e) => {
+        e.preventDefault();
+        if (this._raf) cancelAnimationFrame(this._raf);
+      });
+      canvas.addEventListener('webglcontextrestored', () => {
+        this._inited = false;
+        try { this.initThree(); } catch (err) { console.error('reinit', err); }
+      });
+    }
+
+    const scene = new THREE.Scene();
+    scene.fog = new THREE.Fog(0xffc9c0, 90, 260);
+
+    const camera = new THREE.PerspectiveCamera(50, w / h, 0.1, 2000);
+    camera.position.set(0, 7.6, 26);
+    camera.lookAt(0, 5.6, 0);
+    this.camera = camera;
+
+    // ---- lights ----
+    scene.add(new THREE.HemisphereLight(0xbfe4ff, 0xffc9ad, 0.62));
+    scene.add(new THREE.AmbientLight(0xffffff, 0.18));
+    const sun = new THREE.DirectionalLight(0xffe2c4, 1.65);
+    sun.position.set(-16, 18, 14);
+    scene.add(sun);
+    const rim = new THREE.DirectionalLight(0x8fd0ff, 0.7);
+    rim.position.set(18, 8, -16);
+    scene.add(rim);
+
+    // ---- sky dome ----
+    const skyGeo = new THREE.SphereGeometry(800, 32, 20);
+    const skyMat = new THREE.ShaderMaterial({
+      side: THREE.BackSide, depthWrite: false,
+      uniforms: {
+        top: { value: new THREE.Color(0x5fa8f0) },
+        mid: { value: new THREE.Color(0xffcbe4) },
+        bot: { value: new THREE.Color(0xffab7e) },
+      },
+      vertexShader: `varying vec3 vP; void main(){ vP=(modelMatrix*vec4(position,1.0)).xyz; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0);} `,
+      fragmentShader: `uniform vec3 top; uniform vec3 mid; uniform vec3 bot; varying vec3 vP;
+        void main(){ float hgt=normalize(vP).y; float t=clamp(hgt,-0.15,1.0);
+          vec3 c = t>0.18 ? mix(mid, top, smoothstep(0.18,0.75,t)) : mix(bot, mid, smoothstep(-0.15,0.18,t));
+          gl_FragColor=vec4(c,1.0);} `,
+    });
+    scene.add(new THREE.Mesh(skyGeo, skyMat));
+
+    // ---- sun glow ----
+    const glowTex = this._radialTex('#fff7e6', 'rgba(255,179,122,0)');
+    const glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, transparent: true, depthWrite: false, opacity: 0.9, blending: THREE.AdditiveBlending }));
+    glow.position.set(-30, 26, -120);
+    glow.scale.set(90, 90, 1);
+    scene.add(glow);
+
+    // ---- clouds ----
+    const cloudTex = this._radialTex('#ffffff', 'rgba(255,255,255,0)');
+    this.clouds = [];
+    for (let i = 0; i < 14; i++) {
+      const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: cloudTex, transparent: true, depthWrite: false, opacity: 0.55 + Math.random() * 0.3 }));
+      const sc = 22 + Math.random() * 34;
+      s.scale.set(sc, sc * 0.62, 1);
+      s.position.set(-140 + Math.random() * 280, 22 + Math.random() * 46, -60 - Math.random() * 160);
+      s.userData.sp = 0.6 + Math.random() * 1.4;
+      scene.add(s); this.clouds.push(s);
+    }
+
+    // ---- checker floor ----
+    const checkerTex = this._checkerTex();
+    checkerTex.wrapS = checkerTex.wrapT = THREE.RepeatWrapping;
+    checkerTex.repeat.set(30, 30);
+    checkerTex.magFilter = THREE.NearestFilter;
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(600, 600), new THREE.MeshBasicMaterial({ map: checkerTex }));
+    floor.rotation.x = -Math.PI / 2; floor.position.y = -1.6;
+    scene.add(floor);
+
+    // ---- water ----
+    const waterGeo = new THREE.PlaneGeometry(600, 600, 140, 140);
+    this.waterMat = new THREE.ShaderMaterial({
+      transparent: true, depthWrite: false,
+      uniforms: { uTime: { value: 0 } },
+      vertexShader: `uniform float uTime; varying float vW; varying vec2 vUv;
+        void main(){ vUv=uv; vec3 p=position;
+          float w = sin(p.x*0.055 + uTime*0.7)*0.15 + cos(p.y*0.07 + uTime*0.5)*0.15 + sin((p.x+p.y)*0.028 + uTime*0.35)*0.08;
+          p.z += w; vW=w;
+          gl_Position=projectionMatrix*modelViewMatrix*vec4(p,1.0);} `,
+      fragmentShader: `varying float vW; varying vec2 vUv;
+        void main(){ vec3 deep=vec3(0.10,0.40,0.72); vec3 crest=vec3(0.66,0.90,1.0);
+          float f=smoothstep(-0.15,0.25,vW); vec3 col=mix(deep,crest,f);
+          col += pow(max(f,0.0),3.0)*0.30;
+          gl_FragColor=vec4(col, 0.60);} `,
+    });
+    const water = new THREE.Mesh(waterGeo, this.waterMat);
+    water.rotation.x = -Math.PI / 2; water.position.y = 0.35;
+    scene.add(water);
+
+    // ---- temple ----
+    const temple = new THREE.Group();
+    const marble = new THREE.MeshStandardMaterial({ color: 0xf0e6dc, roughness: 0.5, metalness: 0.06 });
+    const marble2 = new THREE.MeshStandardMaterial({ color: 0xe4d6ce, roughness: 0.58, metalness: 0.06 });
+
+    // platform steps rising from water
+    const step1 = new THREE.Mesh(new THREE.CylinderGeometry(8.4, 8.8, 1.4, 40), marble2);
+    step1.position.y = 0.7; temple.add(step1);
+    const step2 = new THREE.Mesh(new THREE.CylinderGeometry(7.2, 7.6, 0.8, 40), marble);
+    step2.position.y = 1.7; temple.add(step2);
+    const deck = new THREE.Mesh(new THREE.CylinderGeometry(6.6, 6.9, 0.5, 40), marble2);
+    deck.position.y = 2.2; temple.add(deck);
+    const deckTopY = 2.45;
+
+    // columns
+    const colH = 8;
+    const cx = 4.4;
+    const colPos = [[cx, cx], [-cx, cx], [cx, -cx], [-cx, -cx]];
+    colPos.forEach(([x, z]) => {
+      const base = new THREE.Mesh(new THREE.BoxGeometry(1.5, 0.5, 1.5), marble);
+      base.position.set(x, deckTopY + 0.25, z); temple.add(base);
+      const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.52, 0.62, colH, 20), marble);
+      shaft.position.set(x, deckTopY + 0.5 + colH / 2, z); temple.add(shaft);
+      const cap = new THREE.Mesh(new THREE.BoxGeometry(1.6, 0.5, 1.6), marble);
+      cap.position.set(x, deckTopY + 0.5 + colH + 0.25, z); temple.add(cap);
+    });
+    // open entablature (frame, no roof)
+    const topY = deckTopY + 0.5 + colH + 0.7;
+    const beamMat = marble;
+    const mkBeam = (len, x, z, rotY) => {
+      const b = new THREE.Mesh(new THREE.BoxGeometry(len, 0.7, 0.9), beamMat);
+      b.position.set(x, topY, z); b.rotation.y = rotY; temple.add(b);
+    };
+    mkBeam(cx * 2 + 1.6, 0, cx, 0);
+    mkBeam(cx * 2 + 1.6, 0, -cx, 0);
+    mkBeam(cx * 2 + 1.6, cx, 0, Math.PI / 2);
+    mkBeam(cx * 2 + 1.6, -cx, 0, Math.PI / 2);
+
+    // podium
+    const podium = new THREE.Mesh(new THREE.CylinderGeometry(1.7, 2.1, 2.6, 32), new THREE.MeshStandardMaterial({ color: 0xf7eff4, roughness: 0.4, metalness: 0.1 }));
+    podium.position.set(0, deckTopY + 1.3, 0); temple.add(podium);
+    const podTop = new THREE.Mesh(new THREE.CylinderGeometry(1.9, 1.9, 0.3, 32), marble);
+    podTop.position.set(0, deckTopY + 2.75, 0); temple.add(podTop);
+
+    // nameplate
+    this.nameCanvas = document.createElement('canvas');
+    this.nameCanvas.width = 1024; this.nameCanvas.height = 260;
+    this.nameTex = new THREE.CanvasTexture(this.nameCanvas);
+    const plate = new THREE.Mesh(new THREE.PlaneGeometry(3.5, 0.9), new THREE.MeshBasicMaterial({ map: this.nameTex, transparent: true }));
+    plate.position.set(0, deckTopY + 1.5, 2.12); temple.add(plate);
+
+    scene.add(temple);
+
+    // ---- CD jewel case ----
+    const cd = new THREE.Group();
+    this.albumCanvas = document.createElement('canvas');
+    this.albumCanvas.width = this.albumCanvas.height = 512;
+    this.albumTex = new THREE.CanvasTexture(this.albumCanvas);
+    // FRONT: cover-art insert.  BACK: black disc tray with rosette hub.
+    const artMat = new THREE.MeshBasicMaterial({ map: this.albumTex });
+    this.artMat = artMat;
+    const trayMat = new THREE.MeshStandardMaterial({ map: this._trayTex(), roughness: 0.5, metalness: 0.15 });
+    const rimMat = new THREE.MeshStandardMaterial({ color: 0x0e0f12, roughness: 0.6 });
+    // material order: +x,-x,+y,-y,+z(front),-z(back)
+    const insert = new THREE.Mesh(new THREE.BoxGeometry(3.4, 3.4, 0.34), [rimMat, rimMat, rimMat, rimMat, artMat, trayMat]);
+    cd.add(insert);
+    // clear plastic shell (very transparent, glossy)
+    const caseMat = new THREE.MeshPhysicalMaterial({ color: 0xeaf6ff, roughness: 0.04, metalness: 0, transparent: true, opacity: 0.13, clearcoat: 1, clearcoatRoughness: 0.02, side: THREE.DoubleSide });
+    const jcase = new THREE.Mesh(new THREE.BoxGeometry(3.66, 3.66, 0.5), caseMat);
+    cd.add(jcase);
+    // black ridged hinge spine on the left
+    const spineMat = new THREE.MeshStandardMaterial({ map: this._spineTex(), roughness: 0.55, metalness: 0.2 });
+    const spine = new THREE.Mesh(new THREE.BoxGeometry(0.24, 3.68, 0.56), spineMat);
+    spine.position.set(-1.84, 0, 0); cd.add(spine);
+    // clear corner clips
+    const tabMat = new THREE.MeshPhysicalMaterial({ color: 0xffffff, roughness: 0.1, transparent: true, opacity: 0.35, clearcoat: 1 });
+    [[1.55, 1.55], [-1.55, 1.55], [1.55, -1.55], [-1.55, -1.55]].forEach(([x, y]) => {
+      const tab = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.34, 0.54), tabMat);
+      tab.position.set(x, y, 0); cd.add(tab);
+    });
+    cd.position.set(0, 8.6, 0);
+    scene.add(cd);
+    this.cd = cd;
+
+    // real album cover onto the insert
+    new THREE.TextureLoader().load('uploads/cover.jpg', (tex) => {
+      tex.colorSpace = THREE.SRGBColorSpace || undefined;
+      artMat.map = tex; artMat.needsUpdate = true;
+    });
+
+    this.updateTrackArt(this.playlist[this.state.trackIdx]);
+
+    // ---- interaction: parallax ----
+    if (!this._mouse) this._mouse = { x: 0, y: 0 };
+    if (this._onMove) window.removeEventListener('mousemove', this._onMove);
+    this._onMove = (e) => {
+      this._mouse.x = (e.clientX / window.innerWidth - 0.5);
+      this._mouse.y = (e.clientY / window.innerHeight - 0.5);
+    };
+    window.addEventListener('mousemove', this._onMove);
+
+    if (this._onResize) window.removeEventListener('resize', this._onResize);
+    this._onResize = () => {
+      const nw = canvas.clientWidth || window.innerWidth;
+      const nh = canvas.clientHeight || window.innerHeight;
+      renderer.setSize(nw, nh, false);
+      camera.aspect = nw / nh; camera.updateProjectionMatrix();
+    };
+    window.addEventListener('resize', this._onResize);
+
+    const clock = new THREE.Clock();
+    const animate = () => {
+      const t = clock.getElapsedTime();
+      this.waterMat.uniforms.uTime.value = t;
+      this.clouds.forEach(c => {
+        c.position.x += c.userData.sp * 0.02;
+        if (c.position.x > 160) c.position.x = -160;
+      });
+      if (this.cd) {
+        this.cd.rotation.y = t * 0.6;
+        this.cd.position.y = 8.6 + Math.sin(t * 1.1) * 0.5;
+      }
+      const tx = this._mouse.x * 5, ty = this._mouse.y * 2.5;
+      camera.position.x += (tx - camera.position.x) * 0.03;
+      camera.position.y += ((7.6 - ty) - camera.position.y) * 0.03;
+      camera.lookAt(0, 5.6, 0);
+      renderer.render(scene, camera);
+      this._raf = requestAnimationFrame(animate);
+    };
+    animate();
+    this.setState({ ready: true });
+  }
+
+  _radialTex(inner, outer) {
+    const c = document.createElement('canvas'); c.width = c.height = 128;
+    const g = c.getContext('2d');
+    const grd = g.createRadialGradient(64, 64, 4, 64, 64, 64);
+    grd.addColorStop(0, inner); grd.addColorStop(1, outer);
+    g.fillStyle = grd; g.fillRect(0, 0, 128, 128);
+    return new window.THREE.CanvasTexture(c);
+  }
+
+  _checkerTex() {
+    const c = document.createElement('canvas'); c.width = c.height = 64;
+    const g = c.getContext('2d');
+    g.fillStyle = '#ffffff'; g.fillRect(0, 0, 64, 64);
+    g.fillStyle = '#5cc7f5'; g.fillRect(0, 0, 32, 32); g.fillRect(32, 32, 32, 32);
+    return new window.THREE.CanvasTexture(c);
+  }
+
+  _trayTex() {
+    const S = 512, c = document.createElement('canvas'); c.width = c.height = S;
+    const g = c.getContext('2d');
+    // dark tray base with soft vignette
+    const bg = g.createRadialGradient(S / 2, S / 2, 40, S / 2, S / 2, S * 0.72);
+    bg.addColorStop(0, '#33363b'); bg.addColorStop(0.7, '#212327'); bg.addColorStop(1, '#15161a');
+    g.fillStyle = bg; g.fillRect(0, 0, S, S);
+    const cx = S / 2, cy = S / 2;
+    // disc impression rings
+    g.strokeStyle = 'rgba(255,255,255,0.05)'; g.lineWidth = 2;
+    [232, 214, 92].forEach(r => { g.beginPath(); g.arc(cx, cy, r, 0, 7); g.stroke(); });
+    g.fillStyle = 'rgba(255,255,255,0.03)';
+    g.beginPath(); g.arc(cx, cy, 226, 0, 7); g.fill();
+    // central hub rosette
+    const hubR = 66;
+    const hb = g.createRadialGradient(cx, cy, 8, cx, cy, hubR);
+    hb.addColorStop(0, '#8b9096'); hb.addColorStop(0.6, '#63676c'); hb.addColorStop(1, '#3a3d42');
+    g.fillStyle = hb; g.beginPath(); g.arc(cx, cy, hubR, 0, 7); g.fill();
+    // finger teeth
+    const teeth = 11;
+    for (let i = 0; i < teeth; i++) {
+      const a = (i / teeth) * Math.PI * 2;
+      g.save(); g.translate(cx, cy); g.rotate(a);
+      g.fillStyle = '#c7ccd2';
+      g.beginPath();
+      g.moveTo(16, -6); g.lineTo(hubR - 6, -3); g.lineTo(hubR - 6, 3); g.lineTo(16, 6);
+      g.closePath(); g.fill();
+      g.restore();
+    }
+    // star burst + hole
+    g.fillStyle = '#e8ecf0';
+    g.beginPath();
+    for (let i = 0; i < 16; i++) {
+      const a = (i / 16) * Math.PI * 2, r = i % 2 ? 9 : 22;
+      const x = cx + Math.cos(a) * r, y = cy + Math.sin(a) * r;
+      i ? g.lineTo(x, y) : g.moveTo(x, y);
+    }
+    g.closePath(); g.fill();
+    g.fillStyle = '#17181c'; g.beginPath(); g.arc(cx, cy, 8, 0, 7); g.fill();
+    // corner clip hints
+    g.fillStyle = 'rgba(255,255,255,0.06)';
+    [[40, 40], [S - 40, 40], [40, S - 40], [S - 40, S - 40]].forEach(([x, y]) => {
+      g.fillRect(x - 14, y - 6, 28, 12);
+    });
+    // compact disc mark
+    g.fillStyle = 'rgba(200,205,210,0.4)';
+    g.font = '600 15px Tahoma, sans-serif';
+    g.fillText('COMPACT', 34, S - 46); g.fillText('disc', 34, S - 30);
+    const t = new window.THREE.CanvasTexture(c);
+    return t;
+  }
+
+  _spineTex() {
+    const c = document.createElement('canvas'); c.width = 48; c.height = 256;
+    const g = c.getContext('2d');
+    g.fillStyle = '#0b0c0e'; g.fillRect(0, 0, 48, 256);
+    for (let y = 0; y < 256; y += 6) {
+      g.fillStyle = 'rgba(255,255,255,0.09)'; g.fillRect(0, y, 48, 1);
+      g.fillStyle = 'rgba(0,0,0,0.5)'; g.fillRect(0, y + 3, 48, 2);
+    }
+    const t = new window.THREE.CanvasTexture(c);
+    return t;
+  }
+
+  _roundRect(g, x, y, w, h, r) {
+    g.beginPath();
+    g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r);
+    g.arcTo(x + w, y + h, x, y + h, r); g.arcTo(x, y + h, x, y, r);
+    g.arcTo(x, y, x + w, y, r); g.closePath();
+  }
+
+  updateTrackArt(track) {
+    if (!track) return;
+    // nameplate
+    if (this.nameCanvas) {
+      const g = this.nameCanvas.getContext('2d');
+      g.clearRect(0, 0, 1024, 260);
+      g.fillStyle = 'rgba(10,32,54,0.82)';
+      this._roundRect(g, 20, 20, 984, 220, 26); g.fill();
+      g.fillStyle = '#66e0ff';
+      this._roundRect(g, 20, 20, 984, 8, 6); g.fill();
+      g.textAlign = 'center';
+      g.fillStyle = '#fff';
+      g.font = "700 78px 'Noto Sans JP', sans-serif";
+      g.fillText(this._fit(g, track.title, 78, 940), 512, 130);
+      g.fillStyle = '#bdff6';
+      g.font = "400 46px 'Tahoma', sans-serif";
+      g.fillText(track.artist, 512, 196);
+      this.nameTex.needsUpdate = true;
+    }
+    // album placeholder
+    if (this.albumCanvas) {
+      const g = this.albumCanvas.getContext('2d');
+      const grd = g.createLinearGradient(0, 0, 0, 512);
+      grd.addColorStop(0, '#ffd1ec'); grd.addColorStop(0.5, '#cfe9ff'); grd.addColorStop(1, '#bff3e0');
+      g.fillStyle = grd; g.fillRect(0, 0, 512, 512);
+      // sun
+      const sg = g.createRadialGradient(256, 200, 20, 256, 200, 150);
+      sg.addColorStop(0, 'rgba(255,244,214,0.95)'); sg.addColorStop(1, 'rgba(255,180,120,0)');
+      g.fillStyle = sg; g.beginPath(); g.arc(256, 200, 150, 0, 7); g.fill();
+      // horizon grid
+      g.strokeStyle = 'rgba(255,255,255,0.55)'; g.lineWidth = 2;
+      for (let i = 0; i <= 10; i++) { g.beginPath(); g.moveTo(0, 320 + i * 20); g.lineTo(512, 320 + i * 20); g.stroke(); }
+      for (let i = -6; i <= 6; i++) { g.beginPath(); g.moveTo(256, 320); g.lineTo(256 + i * 90, 512); g.stroke(); }
+      g.textAlign = 'center';
+      g.fillStyle = 'rgba(20,50,80,0.85)';
+      g.font = "700 40px 'Noto Sans JP', sans-serif";
+      g.fillText(this._fit(g, track.title, 40, 460), 256, 300);
+      g.font = "16px 'Tahoma', monospace";
+      g.fillStyle = 'rgba(20,50,80,0.6)';
+      g.fillText('[ drop cover.jpg ]', 256, 470);
+      this.albumTex.needsUpdate = true;
+    }
+  }
+
+  _fit(g, text, size, maxW) {
+    let t = text;
+    while (g.measureText(t).width > maxW && t.length > 4) t = t.slice(0, -2);
+    return t === text ? text : t + '…';
+  }
+
+  // ---------- theme ----------
+  theme(os) {
+    if (os === 'win9x') {
+      return {
+        win: { background: '#c3c7cb', boxShadow: 'inset -1px -1px 0 #000, inset 1px 1px 0 #dfe3e6, inset -2px -2px 0 #85898c, inset 2px 2px 0 #fff', color: '#000', fontFamily: "'Tahoma','MS Sans Serif',sans-serif", padding: '3px' },
+        title: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '6px', padding: '3px 4px 3px 6px', background: 'linear-gradient(90deg,#000080,#1084d0)', color: '#fff', fontWeight: 'bold', fontSize: '12px', letterSpacing: '0.02em' },
+        btn: { width: '16px', height: '14px', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#c3c7cb', boxShadow: 'inset -1px -1px 0 #000, inset 1px 1px 0 #fff, inset -2px -2px 0 #85898c', fontSize: '11px', color: '#000', fontWeight: 'bold', lineHeight: 1 },
+        body: { padding: '9px 9px 10px', background: '#c3c7cb', color: '#000' },
+        accent: '#000080',
+        row: '#ffffff',
+        hiRow: '#dfe3e6',
+        barTrack: { height: '20px', background: '#fff', boxShadow: 'inset 1px 1px 0 #85898c, inset -1px -1px 0 #dfe3e6', padding: '2px', overflow: 'hidden' },
+        barFill: { height: '100%', background: 'repeating-linear-gradient(90deg,#000080 0 12px,#1030a8 12px 15px)' },
+      };
+    }
+    return {
+      win: { background: 'linear-gradient(180deg, rgba(255,255,255,0.62), rgba(210,240,255,0.42))', backdropFilter: 'blur(16px)', WebkitBackdropFilter: 'blur(16px)', border: '1px solid rgba(255,255,255,0.75)', borderRadius: '16px', boxShadow: '0 12px 36px rgba(40,100,150,0.28), inset 0 1px 0 rgba(255,255,255,0.95)', color: '#0c3550', overflow: 'hidden', fontFamily: "'Tahoma','Segoe UI',sans-serif" },
+      title: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', padding: '9px 12px', background: 'linear-gradient(180deg, rgba(255,255,255,0.92), rgba(174,220,255,0.62))', borderBottom: '1px solid rgba(255,255,255,0.6)', fontWeight: 700, fontSize: '11.5px', letterSpacing: '0.09em', color: '#0b3a5a', textShadow: '0 1px 0 rgba(255,255,255,0.8)' },
+      btn: { width: '15px', height: '15px', borderRadius: '50%', background: 'radial-gradient(circle at 35% 28%, #ffffff, #86c6ff 58%, #2b8fe0)', boxShadow: 'inset 0 0 0 1px rgba(255,255,255,0.7), 0 1px 2px rgba(0,0,0,0.2)', flex: 'none', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '9px', lineHeight: 1, color: 'rgba(255,255,255,0.95)', fontWeight: 700, textShadow: '0 1px 1px rgba(0,0,0,0.25)' },
+      body: { padding: '12px 13px 13px', color: '#0c3550' },
+      accent: '#0a86c9',
+      row: 'rgba(255,255,255,0.5)',
+      hiRow: 'rgba(255,255,255,0.6)',
+      barTrack: { height: '18px', borderRadius: '9px', background: 'rgba(10,50,80,0.16)', boxShadow: 'inset 0 1px 3px rgba(0,0,0,0.25)', padding: '3px', overflow: 'hidden' },
+      barFill: { height: '100%', borderRadius: '6px', background: 'linear-gradient(180deg,#e0ffb0,#5fce55 55%,#3ba838)', boxShadow: '0 0 8px rgba(120,220,90,0.6), inset 0 1px 0 rgba(255,255,255,0.7)' },
+    };
+  }
+
+  renderVals() {
+    const os = this.props.overlayStyle ?? 'aero';
+    const layout = this.props.layout ?? 'corners';
+    const t = this.theme(os);
+    const s = this.state;
+    const track = this.playlist[s.trackIdx];
+
+    const pct = Math.min(100, (s.raised / s.goal) * 100);
+
+    // ---- positions ----
+    const auto = { pointerEvents: 'auto' };
+    const nowPos = { position: 'absolute', top: '16px', left: '50%', transform: 'translateX(-50%)', maxWidth: '92vw', zIndex: 5, ...auto };
+    let container, dPos, mPos, pPos;
+    if (layout === 'sidebar') {
+      container = { position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '14px', padding: '78px 18px 18px', zIndex: 4, pointerEvents: 'none' };
+      dPos = { position: 'relative', width: '320px', ...auto };
+      mPos = { position: 'relative', width: '320px', ...auto };
+      pPos = { position: 'relative', width: '320px', ...auto };
+    } else if (layout === 'bottombar') {
+      container = { position: 'absolute', inset: 0, display: 'flex', flexDirection: 'row', alignItems: 'flex-end', justifyContent: 'center', gap: '16px', padding: '18px', zIndex: 4, pointerEvents: 'none' };
+      dPos = { position: 'relative', width: 'clamp(240px,30%,330px)', ...auto };
+      mPos = { position: 'relative', width: 'clamp(240px,30%,330px)', ...auto };
+      pPos = { position: 'relative', width: 'clamp(240px,30%,330px)', ...auto };
+    } else {
+      container = { position: 'absolute', inset: 0, zIndex: 4, pointerEvents: 'none' };
+      dPos = { position: 'absolute', top: '18px', left: '18px', width: '300px', ...auto };
+      mPos = { position: 'absolute', bottom: '18px', left: '18px', width: '312px', ...auto };
+      pPos = { position: 'absolute', bottom: '18px', right: '18px', width: '272px', ...auto };
+    }
+
+    const msgLimit = layout === 'bottombar' ? 3 : 4;
+    const socialColored = this.socials.map((x, i) => ({ ...x, op: i === s.socialIdx ? 1 : 0.4 }));
+
+    return {
+      setCanvas: this.setCanvas,
+      notReady: !s.ready,
+      cAccent: t.accent,
+      cRow: t.row,
+      cHiRow: t.hiRow,
+      containerStyle: container,
+      sTitle: t.title,
+      sBody: t.body,
+      sBtn: t.btn,
+      wNow: { ...t.win, ...nowPos },
+      wDon: { ...t.win, ...dPos },
+      wMsg: { ...t.win, ...mPos },
+      wSoc: { ...t.win, ...pPos },
+      barTrack: t.barTrack,
+      barFill: { ...t.barFill, width: pct + '%' },
+      track: { title: track.title, artist: track.artist },
+      don: {
+        raisedFmt: this.fmt(s.raised),
+        goalFmt: this.fmt(s.goal),
+        pctStr: Math.round(pct),
+        top: { name: s.top.name, amountFmt: this.fmt(s.top.amount) },
+        recent: s.recent.map(d => ({ id: d.id, name: d.name, amountFmt: this.fmt(d.amount) })),
+      },
+      messages: s.messages.slice(0, msgLimit).map(m => ({ id: m.id, user: m.user, text: m.text, color: m.color, amountFmt: this.fmt(m.amount) })),
+      socials: socialColored,
+      curSocial: this.socials[s.socialIdx],
+      toast: s.toast ? { name: s.toast.name, amountFmt: this.fmt(s.toast.amount) } : null,
+      toastStyle: {
+        position: 'fixed', bottom: '22px', left: '50%', transform: 'translateX(-50%)', zIndex: 20,
+        ...t.win, padding: os === 'win9x' ? '8px 12px' : '12px 16px',
+        animation: 'toastpop 0.5s ease both', pointerEvents: 'none',
+      },
+    };
+  }
+}
+</script>
+</body>
+</html>

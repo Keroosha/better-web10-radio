@@ -1,12 +1,14 @@
 import type { ReactElement } from 'react';
 
-import { SHARED_PACKAGE } from '@web10/shared';
+import { formatStars } from '@web10/shared';
 
+// F1 placeholder cabinet. The real admin pages arrive in F4; this only proves the
+// app is wired to the validated @web10/shared layer.
 export function App(): ReactElement {
   return (
     <main>
       <h1>Web10.Radio — Admin</h1>
-      <p>Wired to shared package: {SHARED_PACKAGE}</p>
+      <p>Raised: {formatStars(3820)} ⭐</p>
     </main>
   );
 }

@@ -9,6 +9,10 @@
 
   <ItemGroup>
     <Compile Include="ConfigurationTests.fs" />
+    <Compile Include="DatabaseTestSupport.fs" />
+    <Compile Include="MigrationMetadataTests.fs" />
+    <Compile Include="DatabaseMigrationTests.fs" />
+    <Compile Include="PlaybackQueueRepositoryTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
@@ -18,12 +22,14 @@
     <PackageReference Include="NUnit" Version="4.3.2" />
     <PackageReference Include="NUnit.Analyzers" Version="4.7.0" />
     <PackageReference Include="NUnit3TestAdapter" Version="5.0.0" />
+    <PackageReference Include="Testcontainers.PostgreSql" Version="4.13.0" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\Web10.Radio.API\Web10.Radio.API.fsproj" />
     <ProjectReference Include="..\Web10.Radio.Database\Web10.Radio.Database.fsproj" />
     <ProjectReference Include="..\Web10.Radio.Telegram\Web10.Radio.Telegram.fsproj" />
+    <ProjectReference Include="..\Web10.Radio.Migrator\Web10.Radio.Migrator.fsproj" />
   </ItemGroup>
 
 </Project>

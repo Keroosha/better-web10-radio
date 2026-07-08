@@ -77,6 +77,7 @@ flowchart LR
 Общие правила API:
 
 - JSON content type: `application/json; charset=utf-8`.
+- Все frontend-facing routes (`/api/v0/player/*`, `/api/v0/admin/*`) сериализуют JSON в camelCase — и имена полей, и enum-значения. Это фиксированный контракт для frontend (там принят camelCase). Внутренние PascalCase доменные состояния из БД (например `PlaybackQueue.Status`, `SayMessages.Status`, `StreamNodeHeartbeats.Status`) проецируются в camelCase на API-границе; frontend никогда не видит PascalCase и не видит внутренних состояний, которых нет в enum'ах ниже.
 - Все timestamps — UTC ISO-8601 strings ending with `Z`.
 - `amountStars`, `raisedStars`, `goalStars` — integer Telegram Stars, not cents.
 - Public player routes read-only и unauthenticated, если deployment later не поставит их behind CDN/internal network.
@@ -127,7 +128,7 @@ flowchart LR
         "trackId": "uuid-v7",
         "title": "Track title",
         "artist": "Artist",
-        "source": "playlist|request|admin",
+        "source": "playlist|request|admin|fallback",
         "status": "queued|claimed|playing|played|failed"
       }
     ]
@@ -269,6 +270,10 @@ Persistence rules:
 - PostgreSQL is the v0 database.
 - Use ADO.NET only: no ORM in app persistence code, no EF Core, no Dapper, no object mapper.
 - Use SQL migration files owned by `Web10.Radio.Database`.
+- Migrations are implemented with FluentMigrator classes owned by `Web10.Radio.Database`.
+- Migration versions are 12-digit Int64 values in YYYYMMDDmmss format; the first migration version is 202607080001.
+- Schema upgrades run in a separate `Web10.Radio.Migrator` application/container before the API container is started or promoted.
+- The API process never applies migrations during request-path startup; failed migration exits the migrator container non-zero.
 - Use Dodo.Primitives `Uuid` for backend domain identifiers; generate RFC9562 UUIDv7 IDs for new domain objects and store them as PostgreSQL `uuid`.
 - Every mutable table has `IsDeleted BOOLEAN NOT NULL DEFAULT false`, `CreatedAtUtc`, and `UpdatedAtUtc`.
 - Application code never uses `DELETE` for domain data. Deletion means `UPDATE ... SET IsDeleted = true`.
@@ -333,6 +338,15 @@ Startup rules:
 - URL/config parsing happens at startup, not first request.
 - Telegram token and RTMP key are config/Docker secrets in v0, not database rows.
 - If a later admin feature stores secrets in PostgreSQL, the secret payload is protected with ASP.NET Core Data Protection and the key ring is persisted outside the container filesystem.
+
+
+Правила Container/Docker Compose:
+
+- Docker images не должны быть Alpine/libmusl based. Для non-.NET infrastructure используются Debian/Ubuntu-based images, даже если они больше.
+- .NET final/runtime images используют Microsoft .NET chiseled variants. Текущие backend runtime tags используют `10.0-noble-chiseled`; SDK build stages остаются на официальных non-Alpine SDK images, потому что Microsoft не публикует chiseled SDK images.
+- `compose.yaml` — текущий backend infrastructure smoke path: PostgreSQL `postgres:17`, one-shot `Web10.Radio.Migrator`, затем `Web10.Radio.API`.
+- Compose startup order: PostgreSQL healthcheck → migrator successful completion → API startup. Migrator обязан применить pending FluentMigrator migrations до старта API.
+- Текущий compose smoke намеренно не закрывает full v0 Compose target с frontend, stream-node и observability collector; это остается для later Docker verification phase.
 
 DI rules aligned with ASP.NET guidance:
 

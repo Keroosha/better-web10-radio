@@ -11,6 +11,8 @@ Project("{F2A71F9B-5D33-465A-A702-920D77279786}") = "Web10.Radio.Database", "Web
 EndProject
 Project("{F2A71F9B-5D33-465A-A702-920D77279786}") = "Web10.Radio.Tests", "Web10.Radio.Tests\Web10.Radio.Tests.fsproj", "{A67B8C0D-F994-4384-9500-DDAF2C4CC4C7}"
 EndProject
+Project("{F2A71F9B-5D33-465A-A702-920D77279786}") = "Web10.Radio.Migrator", "Web10.Radio.Migrator\Web10.Radio.Migrator.fsproj", "{D5C47A4B-6C3D-46A5-A181-4C5FA8607D64}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -69,6 +71,18 @@ Global
 		{A67B8C0D-F994-4384-9500-DDAF2C4CC4C7}.Release|x64.Build.0 = Release|Any CPU
 		{A67B8C0D-F994-4384-9500-DDAF2C4CC4C7}.Release|x86.ActiveCfg = Release|Any CPU
 		{A67B8C0D-F994-4384-9500-DDAF2C4CC4C7}.Release|x86.Build.0 = Release|Any CPU
+		{D5C47A4B-6C3D-46A5-A181-4C5FA8607D64}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D5C47A4B-6C3D-46A5-A181-4C5FA8607D64}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D5C47A4B-6C3D-46A5-A181-4C5FA8607D64}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{D5C47A4B-6C3D-46A5-A181-4C5FA8607D64}.Debug|x64.Build.0 = Debug|Any CPU
+		{D5C47A4B-6C3D-46A5-A181-4C5FA8607D64}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{D5C47A4B-6C3D-46A5-A181-4C5FA8607D64}.Debug|x86.Build.0 = Debug|Any CPU
+		{D5C47A4B-6C3D-46A5-A181-4C5FA8607D64}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D5C47A4B-6C3D-46A5-A181-4C5FA8607D64}.Release|Any CPU.Build.0 = Release|Any CPU
+		{D5C47A4B-6C3D-46A5-A181-4C5FA8607D64}.Release|x64.ActiveCfg = Release|Any CPU
+		{D5C47A4B-6C3D-46A5-A181-4C5FA8607D64}.Release|x64.Build.0 = Release|Any CPU
+		{D5C47A4B-6C3D-46A5-A181-4C5FA8607D64}.Release|x86.ActiveCfg = Release|Any CPU
+		{D5C47A4B-6C3D-46A5-A181-4C5FA8607D64}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

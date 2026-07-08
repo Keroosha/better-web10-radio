@@ -6,12 +6,13 @@ COPY Web10.Radio.API/Web10.Radio.API.fsproj Web10.Radio.API/
 COPY Web10.Radio.Database/Web10.Radio.Database.fsproj Web10.Radio.Database/
 COPY Web10.Radio.Telegram/Web10.Radio.Telegram.fsproj Web10.Radio.Telegram/
 COPY Web10.Radio.Tests/Web10.Radio.Tests.fsproj Web10.Radio.Tests/
+COPY Web10.Radio.Migrator/Web10.Radio.Migrator.fsproj Web10.Radio.Migrator/
 RUN dotnet restore Web10.Radio.sln
 
 COPY . .
 RUN dotnet publish Web10.Radio.API/Web10.Radio.API.fsproj -c Release -o /app/publish --no-restore
 
-FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
+FROM mcr.microsoft.com/dotnet/aspnet:10.0-noble-chiseled AS runtime
 WORKDIR /app
 ENV ASPNETCORE_URLS=http://+:8080
 EXPOSE 8080

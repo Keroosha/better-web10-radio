@@ -4,32 +4,39 @@
 
 ## 1. Контракты и ограничения
 
-- [ ] Read `docs/SPEC.md` sections 5, 10, and 12 before coding.
-- [ ] Copy the exact DTO names and enum literals from `SPEC.md` into `src/frontend/shared` domain types.
-- [ ] Use `/api/v0/player/state`, `/api/v0/player/events`, `/api/v0/player/stream`, and `/api/v0/admin/*` only; do not invent alternate route names.
-- [ ] Keep prototype files under `src/frontend/web-stage/mocks/` as read-only reference assets.
-- [ ] Do not copy prototype `support.js` or `image-slot.js` into production runtime.
-- [ ] Use TypeScript `.ts`/`.tsx` only; no JavaScript source files.
-- [ ] Enforce `strict: true`, `noImplicitAny`, `noUncheckedIndexedAccess`, and `exactOptionalPropertyTypes`.
-- [ ] Add linter/type rules that fail on authored `any` and `unknown` in `src/frontend`.
+- [x] Read `docs/SPEC.md` sections 5, 10, and 12 before coding.
+- [x] Copy the exact DTO names and enum literals from `SPEC.md` into `src/frontend/shared` domain types.
+- [x] Use `/api/v0/player/state`, `/api/v0/player/events`, `/api/v0/player/stream`, and `/api/v0/admin/*` only; do not invent alternate route names.
+- [x] Keep prototype files under `src/frontend/web-stage/mocks/` as read-only reference assets.
+- [x] Do not copy prototype `support.js` or `image-slot.js` into production runtime.
+- [x] Use TypeScript `.ts`/`.tsx` only; no JavaScript source files.
+- [x] Enforce `strict: true`, `noImplicitAny`, `noUncheckedIndexedAccess`, and `exactOptionalPropertyTypes`.
+- [x] Add linter/type rules that fail on authored `any` and `unknown` in `src/frontend`.
 
 ### Phase F0 — Workspace foundation
 
-- [ ] Create Bun workspace root at `src/frontend/package.json` with workspaces `web-stage`, `admin`, and `shared`.
-- [ ] Create `src/frontend/tsconfig.base.json` with strict TypeScript settings.
-- [ ] Create `src/frontend/shared` for domain types, API client primitives, formatting helpers, and design tokens.
-- [ ] Create `src/frontend/web-stage` and `src/frontend/admin` as separate React apps.
-- [ ] Configure both apps to import shared domain code only through `src/frontend/shared` public exports.
-- [ ] Add scripts for typecheck/build/test at workspace and per-app level.
+- [x] Create Bun workspace root at `src/frontend/package.json` with workspaces `web-stage`, `admin`, and `shared`.
+- [x] Create `src/frontend/tsconfig.base.json` with strict TypeScript settings.
+- [x] Create `src/frontend/shared` for domain types, API client primitives, formatting helpers, and design tokens.
+- [x] Create `src/frontend/web-stage` and `src/frontend/admin` as separate React apps.
+- [x] Configure both apps to import shared domain code only through `src/frontend/shared` public exports.
+- [x] Add scripts for typecheck/build/test at workspace and per-app level.
 
 ### Phase F1 — Shared frontend domain and API client
 
-- [ ] Define domain types for `PlayerState`, `StreamState`, `NowPlaying`, `QueueState`, `DonationGoal`, `SuperChatMessage`, `SocialLink`, and `OverlaySettings` using exact fields from `SPEC.md`.
-- [ ] Define enum/domain literal types for stream status, queue status, social kind, overlay style, and layout.
-- [ ] Implement typed API client functions for `/api/v0/player/state`, `/api/v0/player/events`, `/api/v0/player/stream`, and admin routes.
-- [ ] Implement SSE client for `player.state`, `player.queue`, `player.say`, `player.donation`, `player.health`.
-- [ ] Implement polling fallback: after two SSE disconnects in 30 seconds, poll `/api/v0/player/state` every 5 seconds.
-- [ ] Implement shared formatters for Stars amounts, UTC time, track duration/progress, and fallback `artist — title` strings.
+> **Admin scope note:** SPEC §5 defines player DTOs fully but does not define admin
+> request/response bodies. Per the locked decision, F1 ships the player layer complete
+> and admin limited to the GETs that reuse known DTOs (`getDonationGoal`,
+> `getSocialLinks`); remaining admin DTOs (playlists, storage, `/say` moderation,
+> stream-node control, all PUT/POST) land in F4 once the backend pins those shapes.
+> Payload validation uses Zod (`4.4.3`); domain types are inferred from the schemas.
+
+- [x] Define domain types for `PlayerState`, `StreamState`, `NowPlaying`, `QueueState`, `DonationGoal`, `SuperChatMessage`, `SocialLink`, and `OverlaySettings` using exact fields from `SPEC.md`.
+- [x] Define enum/domain literal types for stream status, queue status, social kind, overlay style, and layout.
+- [x] Implement typed API client functions for `/api/v0/player/state`, `/api/v0/player/events`, `/api/v0/player/stream`, and admin routes.
+- [x] Implement SSE client for `player.state`, `player.queue`, `player.say`, `player.donation`, `player.health`.
+- [x] Implement polling fallback: after two SSE disconnects in 30 seconds, poll `/api/v0/player/state` every 5 seconds.
+- [x] Implement shared formatters for Stars amounts, UTC time, track duration/progress, and fallback `artist — title` strings.
 
 ### Phase F2 — web-stage scene port
 

@@ -9,12 +9,19 @@
     <Compile Include="Postgres.fs" />
     <Compile Include="DatabaseSession.fs" />
     <Compile Include="Migrations\InitialSchema.fs" />
+    <Compile Include="Repositories\RepositoryError.fs" />
     <Compile Include="Repositories\TrackRepository.fs" />
+    <Compile Include="Repositories\OutboxEventRepository.fs" />
+    <Compile Include="Repositories\TelegramUpdateInboxRepository.fs" />
+    <Compile Include="Repositories\LibraryScanRepository.fs" />
+    <Compile Include="Repositories\PaymentRepository.fs" />
+    <Compile Include="Repositories\StreamNodeHeartbeatRepository.fs" />
     <Compile Include="Repositories\PlaybackQueueRepository.fs" />
     <Compile Include="Composition.fs" />
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="FsToolkit.ErrorHandling" Version="5.2.0" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.9" />
     <PackageReference Include="FluentMigrator" Version="8.0.1" />
     <PackageReference Include="Npgsql" Version="10.0.3" />

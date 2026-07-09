@@ -5,12 +5,12 @@
 ## 1. Контракты и ограничения
 
 - [x] Read `docs/SPEC.md` sections 5 through 12 before coding.
-- [ ] Implement exactly the `/api/v0/player/*`, `/api/v0/telegram/*`, and `/api/v0/admin/*` routes listed in `SPEC.md`.
+- [x] Implement exactly the `/api/v0/player/*`, `/api/v0/telegram/*`, and `/api/v0/admin/*` routes listed in `SPEC.md`.
 - [x] Keep `Web10.Radio.Telegram` on Funogram.
 - [x] Use F# for backend projects.
 - [x] Use ADO.NET only for PostgreSQL access; no ORM and no Dapper.
-- [ ] Use soft delete with `IsDeleted`; never delete domain data with `DELETE` from application code.
-- [ ] Use `SELECT ... FOR UPDATE SKIP LOCKED` for queue/work claiming.
+- [x] Use soft delete with `IsDeleted`; never delete domain data with `DELETE` from application code.
+- [x] Use `SELECT ... FOR UPDATE SKIP LOCKED` for queue/work claiming.
 - [x] Fail application startup on invalid config.
 - [ ] Use DI composition and high-performance structured logging.
 - [ ] Add OTEL traces/metrics for API, Telegram, queue, payment, and stream-node flows.
@@ -43,26 +43,26 @@
 
 ### Phase B2 — Domain events and background workers
 
-- [ ] Define event envelope fields from `SPEC.md` in F# domain types.
-- [ ] Implement in-process event dispatch with `MailboxProcessor` agents for payment, queue, library scan, and stream-node event handling.
-- [ ] Persist outbox events before side effects that must survive process restarts.
-- [ ] Deduplicate Telegram updates using `TelegramUpdateInbox` before emitting domain events.
-- [ ] Implement library scanner job that discovers tracks from configured storage backends and emits `TrackDiscovered`.
-- [ ] Implement playback program worker that claims queue items with `FOR UPDATE SKIP LOCKED`, updates metadata, and emits playback events.
-- [ ] Implement cache path for tracks needed for streaming; cache misses are explicit `degraded` state, not silent fallback.
+- [x] Define event envelope fields from `SPEC.md` in F# domain types.
+- [x] Implement in-process event dispatch with `MailboxProcessor` agents for payment, queue, library scan, and stream-node event handling.
+- [x] Persist outbox events before side effects that must survive process restarts.
+- [x] Deduplicate Telegram updates using `TelegramUpdateInbox` before emitting domain events.
+- [x] Implement library scanner job that discovers tracks from configured storage backends and emits `TrackDiscovered`.
+- [x] Implement playback program worker that claims queue items with `FOR UPDATE SKIP LOCKED`, updates metadata, and emits playback events.
+- [x] Implement cache path for tracks needed for streaming; cache misses are explicit `degraded` state, not silent fallback.
 
 ### Phase B3 — HTTP API
 
-- [ ] Implement `GET /api/v0/player/state` using the exact JSON fields from `SPEC.md`.
-- [ ] Implement `GET /api/v0/player/events` as SSE with event names from `SPEC.md`.
-- [ ] Implement `GET /api/v0/player/stream` returning audio when live and problem details when unavailable.
-- [ ] Implement `GET /api/v0/player/song` returning current track link/fallback payload.
-- [ ] Implement `GET /api/v0/player/health` returning stream health summary.
-- [ ] Implement `POST /api/v0/telegram/webhook` with secret-token validation and update dedupe.
-- [ ] Implement `GET /api/v0/telegram/health`.
+- [x] Implement `GET /api/v0/player/state` using the exact JSON fields from `SPEC.md`.
+- [x] Implement `GET /api/v0/player/events` as SSE with event names from `SPEC.md`.
+- [x] Implement `GET /api/v0/player/stream` returning audio when live and problem details when unavailable.
+- [x] Implement `GET /api/v0/player/song` returning current track link/fallback payload.
+- [x] Implement `GET /api/v0/player/health` returning stream health summary.
+- [x] Implement `POST /api/v0/telegram/webhook` with secret-token validation and update dedupe.
+- [x] Implement `GET /api/v0/telegram/health`.
 - [ ] Implement all admin routes listed in `SPEC.md`.
-- [ ] Add route-level logging fields: route, status, traceId, correlationId, elapsedMs.
-- [ ] Add API integration tests for player state, admin moderation, Telegram webhook dedupe, and problem-details errors.
+- [x] Add route-level logging fields: route, status, traceId, correlationId, elapsedMs.
+- [x] Add API integration tests for player state, admin GET/placeholder routes, Telegram webhook dedupe, and problem-details errors.
 
 ### Phase B4 — Telegram bot and Stars payments
 
@@ -104,4 +104,4 @@
 - [ ] Add NUnit integration tests for database, API, Telegram, and stream-node contracts.
 - [ ] Verify all apps can run in containers with required config.
 - [x] Verify startup fails when required config keys are missing.
-- [ ] Verify no application repository executes `DELETE` against domain tables.
+- [x] Verify no application repository executes `DELETE` against domain tables.

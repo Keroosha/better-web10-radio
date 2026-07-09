@@ -1,0 +1,18 @@
+/* Global stage reset. The scene canvas is fixed and fills the viewport; the gradient shows
+   behind the loading window before the first frame (mirrors the mock's root styles). */
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  background: linear-gradient(180deg, #bfe0ff 0%, #d6ecff 34%, #ffe3d0 74%, #ffcfe0 100%);
+  font-family: 'Tahoma', 'Segoe UI', system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}

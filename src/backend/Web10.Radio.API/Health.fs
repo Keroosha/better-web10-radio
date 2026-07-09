@@ -61,19 +61,6 @@ type StorageHealthCheck(options: StorageOptions) =
                 )
             |> Task.FromResult
 
-type StreamNodeHeartbeatState() =
-    let syncRoot = obj()
-    let mutable lastHeartbeatUtc: DateTimeOffset option = None
-    let mutable lastFailure: string option = None
-
-    member _.LastHeartbeatUtc = lock syncRoot (fun () -> lastHeartbeatUtc)
-
-    member _.LastFailure = lock syncRoot (fun () -> lastFailure)
-
-    member _.RecordHeartbeat(heartbeatUtc: DateTimeOffset, failure: string option) =
-        lock syncRoot (fun () ->
-            lastHeartbeatUtc <- Some heartbeatUtc
-            lastFailure <- failure)
 
 type StreamNodeHeartbeatHealthCheck(state: StreamNodeHeartbeatState, clock: IClock) =
     interface IHealthCheck with

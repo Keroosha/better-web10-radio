@@ -39,3 +39,33 @@ module DatabaseSession =
 
                 return raise ex
         }
+
+    let withTransactionResult<'T, 'E>
+        (dataSource: NpgsqlDataSource)
+        (work: NpgsqlConnection -> NpgsqlTransaction -> CancellationToken -> Task<Result<'T, 'E>>)
+        (cancellationToken: CancellationToken)
+        : Task<Result<'T, 'E>> =
+        task {
+            let! connection = dataSource.OpenConnectionAsync(cancellationToken)
+            use connection = connection
+            let! transaction = connection.BeginTransactionAsync(cancellationToken)
+            use transaction = transaction
+
+            try
+                let! result = work connection transaction cancellationToken
+
+                match result with
+                | Ok _ ->
+                    do! transaction.CommitAsync(cancellationToken)
+                    return result
+                | Error _ ->
+                    do! transaction.RollbackAsync(cancellationToken)
+                    return result
+            with ex ->
+                try
+                    do! transaction.RollbackAsync(cancellationToken)
+                with _ ->
+                    ()
+
+                return raise ex
+        }

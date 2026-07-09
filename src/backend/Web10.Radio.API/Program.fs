@@ -3,8 +3,12 @@ namespace Web10.Radio.API
 open System
 open Microsoft.AspNetCore.Builder
 open Microsoft.Extensions.Configuration
+open Microsoft.Extensions.DependencyInjection
+open System.Text.Json
 open Web10.Radio.Database
 open Web10.Radio.Telegram
+
+type ApiProgramMarker = class end
 
 module Program =
     let private invalidConfigurationMessage (errors: string list) =
@@ -18,6 +22,11 @@ module Program =
     [<EntryPoint>]
     let main args =
         let builder = WebApplication.CreateBuilder(args)
+        builder.Services.ConfigureHttpJsonOptions(fun options ->
+            options.SerializerOptions.PropertyNamingPolicy <- JsonNamingPolicy.CamelCase
+            options.SerializerOptions.DictionaryKeyPolicy <- JsonNamingPolicy.CamelCase)
+        |> ignore
+
         builder.Configuration.AddEnvironmentVariables(prefix = "WEB10_") |> ignore
 
         let options =
@@ -29,12 +38,13 @@ module Program =
         |> DatabaseComposition.addDatabase options.Postgres
         |> ApplicationComposition.addApplicationServices
         |> TelegramComposition.addTelegram options.Telegram
-        // B2 adds real MailboxProcessor-backed workers here.
+        |> BackgroundWorkerComposition.addBackgroundWorkers options
         |> HealthComposition.addHealthChecks options
         |> ObservabilityComposition.addObservability options.Otel builder.Environment
         |> ignore
 
         let app = builder.Build()
         HealthEndpoints.mapHealthEndpoints app
+        ApiEndpoints.mapApiV0Endpoints app
         app.Run()
         0

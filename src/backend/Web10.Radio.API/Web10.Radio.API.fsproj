@@ -8,8 +8,13 @@
   <ItemGroup>
     <Compile Include="Configuration.fs" />
     <Compile Include="Application.fs" />
+    <Compile Include="Events.fs" />
+    <Compile Include="BackgroundWorkers.fs" />
     <Compile Include="Health.fs" />
     <Compile Include="Observability.fs" />
+    <Compile Include="ApiContracts.fs" />
+    <Compile Include="ApiReadModels.fs" />
+    <Compile Include="ApiEndpoints.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 
@@ -19,6 +24,8 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Dodo.Primitives" Version="5.0.0" />
+    <PackageReference Include="FsToolkit.ErrorHandling" Version="5.2.0" />
     <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.16.0" />
     <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.16.0" />
     <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.16.0" />

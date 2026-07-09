@@ -11,6 +11,10 @@
     "lint": "eslint ."
   },
   "dependencies": {
-    "@web10/shared": "workspace:*"
+    "@web10/shared": "workspace:*",
+    "three": "^0.185.1"
+  },
+  "devDependencies": {
+    "@types/three": "^0.185.0"
   }
 }

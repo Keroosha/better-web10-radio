@@ -40,15 +40,15 @@
 
 ### Phase F2 — web-stage scene port
 
-- [ ] Recreate fullscreen canvas scene from `Web 1.0 Radio Scene.dc.html` in React + Three.js, not by embedding the prototype runtime.
-- [ ] Implement loading overlay matching `web1radio.exe` behavior until Three.js scene reports ready.
-- [ ] Implement scene elements from the mock: gradient sky, water shader, checker floor, temple, rotating CD jewel case, album texture/nameplate, clouds, lighting.
-- [ ] Use React effects only to synchronize with external systems; every effect that starts listeners, animation frames, textures, or renderers must return cleanup.
-- [ ] Handle `webglcontextlost` by preventing default and stopping the frame loop.
-- [ ] Handle `webglcontextrestored` by rebuilding renderer resources.
-- [ ] Cap renderer pixel ratio as in the mock and resize renderer/camera on container changes.
-- [ ] Dispose renderer, geometries, materials, textures, event listeners, and animation frame on unmount.
-- [ ] Preserve mouse parallax behavior and make it no-op when the stream-node disables pointer input.
+- [x] Recreate fullscreen canvas scene from `Web 1.0 Radio Scene.dc.html` in React + Three.js, not by embedding the prototype runtime.
+- [x] Implement loading overlay matching `web1radio.exe` behavior until Three.js scene reports ready.
+- [x] Implement scene elements from the mock: gradient sky, water shader, checker floor, temple, rotating CD jewel case, album texture/nameplate, clouds, lighting.
+- [x] Use React effects only to synchronize with external systems; every effect that starts listeners, animation frames, textures, or renderers must return cleanup.
+- [x] Handle `webglcontextlost` by preventing default and stopping the frame loop.
+- [x] Handle `webglcontextrestored` by rebuilding renderer resources.
+- [x] Cap renderer pixel ratio as in the mock and resize renderer/camera on container changes.
+- [x] Dispose renderer, geometries, materials, textures, event listeners, and animation frame on unmount.
+- [x] Preserve mouse parallax behavior and make it no-op when the stream-node disables pointer input (via the `pointerEnabled` seam; wiring to the stream-node's real signal lands with stream-node integration).
 
 ### Phase F3 — web-stage overlays and live data
 

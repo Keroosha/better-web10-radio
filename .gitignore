@@ -6,7 +6,7 @@ TestResults/
 *.user
 .env
 .env.*
-!.env.example
+!.defaults.env
 # Created by https://www.toptal.com/developers/gitignore/api/node,aspnetcore,rider
 # Edit at https://www.toptal.com/developers/gitignore?templates=node,aspnetcore,rider
 
@@ -498,3 +498,4 @@ fabric.properties
 .idea/caches/build_file_checksums.ser
 
 # End of https://www.toptal.com/developers/gitignore/api/node,aspnetcore,rider
+.storage/

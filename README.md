@@ -52,6 +52,8 @@ S3 scanner обходит `ListObjectsV2` page-by-page, renews the fenced scan l
 
 `compose.yaml` разворачивает PostgreSQL + migrator + API + `frontend` (nginx со stage на `/` и admin на `/admin/`, проксирует `/api`). Это Development vertical-slice env (`WEB10_DEV__FIXTURES_ENABLED=true`). Все еще отсутствует реальный `stream-node` (phase B5) и optional observability collector (OTLP export best-effort; без коллектора API остается healthy). Пока B5 не готов, поток можно сымитировать локально скриптом `scripts/fake-stream-node.py`, который шлет `live` heartbeats и продвигает очередь через lease/completion — стадия покажет LIVE.
 
+Вся конфигурация живет в `.defaults.env` (committed рабочие defaults) и грузится через `env_file`, поэтому стек работает «из коробки» без всякой подготовки. Чтобы что-то переопределить (реальный bot token, admin password, RTMP key), создайте локальный `.env` (gitignored) только с нужными ключами — он перекрывает defaults; секреты вынесены в отдельный SECRETS-блок в `.defaults.env`. Admin password обязан быть 12–256 символов (короткие значения вроде `admin` валят startup).
+
 Из repository root выполните bounded smoke. Cleanup trap удаляет containers, network и volumes и при success, и при ошибке; отдельный `sleep` не нужен:
 
 ```sh
@@ -66,7 +68,7 @@ docker compose up --build --wait --wait-timeout 120 api
 curl -fsS http://localhost:8080/health/live
 curl -sS -w '\nHTTP %{http_code}\n' http://localhost:8080/health/ready
 curl -fsS -c /tmp/web10-admin.cookie -H 'Content-Type: application/json' \
-  -d '{"username":"admin","password":"compose-smoke-admin-password"}' \
+  -d '{"username":"admin","password":"admin-password"}' \
   http://localhost:8080/api/v0/admin/auth/login
 curl -fsS -b /tmp/web10-admin.cookie \
   http://localhost:8080/api/v0/admin/social-links

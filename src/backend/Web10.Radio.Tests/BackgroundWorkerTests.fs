@@ -220,7 +220,8 @@ module BackgroundWorkerTests =
               WebhookSecret = "test-webhook-secret"
               ChannelIdOrUsername = "@web10_test"
               RequestPriceStars = 100
-              SayPriceStars = 50 }
+              SayPriceStars = 50
+              UpdateMode = Web10.Radio.Telegram.TelegramUpdateMode.Webhook }
           Stream =
             { RtmpUrl = Uri("rtmp://localhost/live")
               RtmpKey = "test-rtmp-key"
@@ -233,9 +234,13 @@ module BackgroundWorkerTests =
               S3Region = "us-east-1"
               S3ServiceUrl = None
               S3ForcePathStyle = false }
-          Admin = { Token = "test-admin-token" }
+          Admin =
+            { Username = "worker-test-admin"
+              Password = "worker-test-admin-password-1234567890" }
           Otel = { ExporterOtlpEndpoint = Uri("http://localhost:4317") }
-          DataProtection = { KeyRingPath = "/tmp/web10-radio-tests-keys" } }
+          DevelopmentFixturesEnabled = false
+          DataProtection = { KeyRingPath = "/tmp/web10-radio-tests-keys" }
+        }
 
     let private assertOkTrue description result =
         match result with
@@ -246,6 +251,7 @@ module BackgroundWorkerTests =
         match DomainEventEnvelope.create generator clock eventType "web10.radio.tests" None None payload with
         | Ok value -> value
         | Error error -> Assert.Fail(sprintf "Expected a valid %s test envelope, but got %A." (DomainEventType.toString eventType) error); Unchecked.defaultof<_>
+
 
 
     [<Test>]
@@ -426,6 +432,113 @@ WHERE "Id" = @QueueItemId;""",
                 Assert.That(reader.GetString(1), Is.EqualTo("Claimed"), "The next ordered item must advance only after authoritative completion.")
                 Assert.That(reader.GetInt64(2), Is.EqualTo(1L))
                 Assert.That(reader.GetInt64(3), Is.EqualTo(1L))
+            })
+
+    [<Test>]
+    let ``idle playback refill claims the playlist immediately and leaves queued request priority ahead of another refill`` () =
+        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
+            task {
+                let nowUtc = DateTimeOffset(2026, 7, 10, 17, 30, 0, TimeSpan.Zero)
+                let playlistId = newId ()
+                let playlistItemId = newId ()
+                let playlistTrackId = newId ()
+                let requestId = newId ()
+                let requestQueueItemId = newId ()
+                let adminQueueItemId = newId ()
+                let generator = idGenerator ()
+                let clock = clockAt nowUtc
+                use dataSource = NpgsqlDataSource.Create(connectionString)
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+
+                use setup =
+                    new NpgsqlCommand(
+                        """INSERT INTO "Tracks" ("Id", "Title", "Artist", "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc")
+VALUES (@TrackId, 'Playlist track', 'Worker', false, @NowUtc, @NowUtc);
+INSERT INTO "Playlists" ("Id", "Name", "IsActive", "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc")
+VALUES (@PlaylistId, 'Worker refill', true, false, @NowUtc, @NowUtc);
+INSERT INTO "PlaylistItems" ("Id", "PlaylistId", "TrackId", "Position", "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc")
+VALUES (@PlaylistItemId, @PlaylistId, @TrackId, 0, false, @NowUtc, @NowUtc);""",
+                        connection
+                    )
+
+                for name, value in
+                    [ "TrackId", box playlistTrackId
+                      "PlaylistId", box playlistId
+                      "PlaylistItemId", box playlistItemId
+                      "NowUtc", box nowUtc ] do
+                    setup.Parameters.AddWithValue(name, value) |> ignore
+
+                let! _ = setup.ExecuteNonQueryAsync()
+                let playback = PlaybackProgramHostedService(dataSource, generator, clock, NullLogger<PlaybackProgramHostedService>.Instance)
+                let! filledAndClaimed = playback.ProcessOneQueueItemAsync(CancellationToken.None)
+                assertOkTrue "an idle playlist refill followed by its immediate claim" filledAndClaimed
+
+                use firstAssertion =
+                    new NpgsqlCommand(
+                        """SELECT "Status", "PlaylistItemId"
+FROM "PlaybackQueue"
+WHERE "Source" = 'playlist' AND "IsDeleted" = false;""",
+                        connection
+                    )
+
+                use! firstReader = firstAssertion.ExecuteReaderAsync()
+                let! hasPlaylistClaim = firstReader.ReadAsync()
+                Assert.That(hasPlaylistClaim, Is.True, "An idle active playlist must generate a queue item without waiting for another worker cycle.")
+                Assert.That(firstReader.GetString(0), Is.EqualTo("Claimed"), "The refill must be claimed in the same worker invocation.")
+                Assert.That(firstReader.GetGuid(1), Is.EqualTo(playlistItemId))
+                do! firstReader.CloseAsync()
+
+                use finishPlaylistClaim =
+                    new NpgsqlCommand(
+                        "UPDATE \"PlaybackQueue\" SET \"Status\" = 'Played', \"FinishedAtUtc\" = @FinishedAtUtc WHERE \"Source\" = 'playlist' AND \"IsDeleted\" = false;",
+                        connection
+                    )
+
+                finishPlaylistClaim.Parameters.AddWithValue("FinishedAtUtc", nowUtc.AddSeconds(1.0)) |> ignore
+                let! _ = finishPlaylistClaim.ExecuteNonQueryAsync()
+
+                use prioritySetup =
+                    new NpgsqlCommand(
+                        """INSERT INTO "TrackRequests" ("Id", "Query", "MatchedTrackId", "Status", "RequestedAtUtc", "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc")
+VALUES (@RequestId, 'Priority request', @TrackId, 'Paid', @NowUtc, false, @NowUtc, @NowUtc);
+INSERT INTO "PlaybackQueue" ("Id", "TrackId", "TrackRequestId", "Source", "Status", "Priority", "RequestedAtUtc", "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc")
+VALUES (@AdminQueueItemId, @TrackId, NULL, 'admin', 'Queued', 100, @AdminRequestedAtUtc, false, @NowUtc, @NowUtc),
+       (@RequestQueueItemId, @TrackId, @RequestId, 'request', 'Queued', 200, @RequestRequestedAtUtc, false, @NowUtc, @NowUtc);""",
+                        connection
+                    )
+
+                for name, value in
+                    [ "RequestId", box requestId
+                      "TrackId", box playlistTrackId
+                      "AdminQueueItemId", box adminQueueItemId
+                      "RequestQueueItemId", box requestQueueItemId
+                      "NowUtc", box nowUtc
+                      "AdminRequestedAtUtc", box (nowUtc.AddSeconds(2.0))
+                      "RequestRequestedAtUtc", box (nowUtc.AddSeconds(3.0)) ] do
+                    prioritySetup.Parameters.AddWithValue(name, value) |> ignore
+
+                let! _ = prioritySetup.ExecuteNonQueryAsync()
+                let! claimedPriority = playback.ProcessOneQueueItemAsync(CancellationToken.None)
+                assertOkTrue "the queued request ahead of lower-priority admin and playlist work" claimedPriority
+
+                use priorityAssertion =
+                    new NpgsqlCommand(
+                        """SELECT
+    (SELECT "Status" FROM "PlaybackQueue" WHERE "Id" = @RequestQueueItemId),
+    (SELECT "Status" FROM "PlaybackQueue" WHERE "Id" = @AdminQueueItemId),
+    (SELECT count(*) FROM "PlaybackQueue" WHERE "Source" = 'playlist' AND "IsDeleted" = false);""",
+                        connection
+                    )
+
+                priorityAssertion.Parameters.AddWithValue("RequestQueueItemId", requestQueueItemId) |> ignore
+                priorityAssertion.Parameters.AddWithValue("AdminQueueItemId", adminQueueItemId) |> ignore
+                use! priorityReader = priorityAssertion.ExecuteReaderAsync()
+                let! hasPriorityRow = priorityReader.ReadAsync()
+                Assert.That(hasPriorityRow, Is.True)
+                Assert.That(priorityReader.GetString(0), Is.EqualTo("Claimed"), "A queued paid request must win before another playlist refill.")
+                Assert.That(priorityReader.GetString(1), Is.EqualTo("Queued"), "The lower-priority admin queue item must remain available after the request claim.")
+                Assert.That(priorityReader.GetInt64(2), Is.EqualTo(1L), "Existing queued work must suppress a second generated playlist item.")
             })
 
     [<Test>]
@@ -809,6 +922,102 @@ ORDER BY "Payload"->>'storagePath';""",
                     Assert.That(root.GetProperty("storagePath").GetString(), Is.EqualTo(storagePath))
                     Assert.That(root.GetProperty("trackId").GetGuid(), Is.EqualTo(trackId))
                     Assert.That(root.GetProperty("trackFileId").GetGuid(), Is.EqualTo(trackFileId))
+            })
+
+    [<Test>]
+    let ``scan discovered count advances only for a newly unique active track file`` () =
+        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
+            task {
+                let nowUtc = DateTimeOffset(2026, 7, 10, 19, 30, 0, TimeSpan.Zero)
+                let jobId = newId ()
+                let storageBackendId = newId ()
+                let existingTrackId = newId ()
+                let existingTrackFileId = newId ()
+                use dataSource = NpgsqlDataSource.Create(connectionString)
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+
+                use setup =
+                    new NpgsqlCommand(
+                        """INSERT INTO "StorageBackends" ("Id", "Name", "Type", "S3Bucket", "IsEnabled", "IsDeleted")
+VALUES (@StorageBackendId, 'count-s3', 'S3', 'count-radio-bucket', true, false);
+INSERT INTO "LibraryScanJobs" ("Id", "StorageBackendId", "Status", "RequestedAtUtc", "CreatedAtUtc", "UpdatedAtUtc", "IsDeleted")
+VALUES (@JobId, @StorageBackendId, 'Queued', @NowUtc, @NowUtc, @NowUtc, false);
+INSERT INTO "Tracks" ("Id", "Title", "Artist", "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc")
+VALUES (@ExistingTrackId, 'Existing', 'Artist', false, @NowUtc, @NowUtc);
+INSERT INTO "TrackFiles" ("Id", "TrackId", "StorageBackendId", "StoragePath", "IsCached", "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc")
+VALUES (@ExistingTrackFileId, @ExistingTrackId, @StorageBackendId, 'existing/Artist - Existing.mp3', false, false, @NowUtc, @NowUtc);""",
+                        connection
+                    )
+
+                for name, value in
+                    [ "JobId", box jobId
+                      "StorageBackendId", box storageBackendId
+                      "ExistingTrackId", box existingTrackId
+                      "ExistingTrackFileId", box existingTrackFileId
+                      "NowUtc", box nowUtc ] do
+                    setup.Parameters.AddWithValue(name, value) |> ignore
+
+                let! _ = setup.ExecuteNonQueryAsync()
+                let enumerator =
+                    PagedS3Enumerator(
+                        [ [ { Key = "existing/Artist - Existing.mp3"; SizeBytes = 101L }
+                            { Key = "new/Artist - Newly Discovered.flac"; SizeBytes = 202L } ] ]
+                    )
+
+                let generator = idGenerator ()
+                let clock = clockAt nowUtc
+                let scanner =
+                    LibraryScanHostedService(
+                        dataSource,
+                        generator,
+                        clock,
+                        testOptions connectionString S3 "" "count-radio-bucket",
+                        enumerator :> IS3ObjectEnumerator,
+                        NullLogger<LibraryScanHostedService>.Instance
+                    )
+
+                let lifetime = TestApplicationLifetime()
+                let dispatcher =
+                    DomainEventDispatcher(
+                        dataSource,
+                        generator,
+                        clock,
+                        NoopTelegramWorkflow() :> ITelegramBotWorkflow,
+                        StreamNodeHeartbeatState(),
+                        NoopPlaybackWorkflow() :> IPlaybackQueueWorkflow,
+                        scanner :> ILibraryScanWorkflow,
+                        lifetime :> IHostApplicationLifetime,
+                        NullLogger<DomainEventDispatcher>.Instance
+                    )
+                    :> IDomainEventDispatcher
+
+                let requested = envelope generator clock LibraryScanRequested (sprintf "{\"libraryScanJobId\":\"%O\"}" jobId)
+                let! dispatched = dispatcher.DispatchAsync requested CancellationToken.None
+
+                match dispatched with
+                | Ok () -> ()
+                | actual -> Assert.Fail(sprintf "The scan request must process its queued job, but got %A." actual)
+
+                use assertion =
+                    new NpgsqlCommand(
+                        """SELECT
+    (SELECT "DiscoveredCount" FROM "LibraryScanJobs" WHERE "Id" = @JobId),
+    (SELECT count(*) FROM "TrackFiles" WHERE "StorageBackendId" = @StorageBackendId AND "StoragePath" = 'existing/Artist - Existing.mp3' AND "IsDeleted" = false),
+    (SELECT count(*) FROM "TrackFiles" WHERE "StorageBackendId" = @StorageBackendId AND "StoragePath" = 'new/Artist - Newly Discovered.flac' AND "IsDeleted" = false),
+    (SELECT count(*) FROM "OutboxEvents" WHERE "EventType" = 'TrackDiscovered' AND "IsDeleted" = false);""",
+                        connection
+                    )
+
+                assertion.Parameters.AddWithValue("JobId", jobId) |> ignore
+                assertion.Parameters.AddWithValue("StorageBackendId", storageBackendId) |> ignore
+                use! reader = assertion.ExecuteReaderAsync()
+                let! hasRow = reader.ReadAsync()
+                Assert.That(hasRow, Is.True)
+                Assert.That(reader.GetInt32(0), Is.EqualTo(1), "Only the newly inserted active TrackFile may advance the scan's discovered count.")
+                Assert.That(reader.GetInt64(1), Is.EqualTo(1L), "An already-active storage path must not create another TrackFile.")
+                Assert.That(reader.GetInt64(2), Is.EqualTo(1L), "The novel storage path must be persisted once.")
+                Assert.That(reader.GetInt64(3), Is.EqualTo(1L), "Only the newly persisted TrackFile may publish TrackDiscovered.")
             })
 
     [<Test>]

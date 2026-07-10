@@ -1,41 +1,118 @@
-import type { ReactElement } from 'react';
+import { useEffect, useState, type FormEvent, type ReactElement } from 'react';
 
-import { formatStars, getDonationGoal, type DonationGoal } from '@web10/shared';
+import { ApiError, formatStars, getDonationGoal, updateDonationGoal, type DonationGoal } from '@web10/shared';
 
 import { useApiResource } from '../../shared/lib/useApiResource';
 import { ResourceView } from '../../shared/ui/ResourceView';
 
 const loadDonationGoal = (): Promise<DonationGoal> => getDonationGoal();
 
-/**
- * Donation goal — read-only. `GET /api/v0/admin/donation-goal` is implemented; the `PUT`
- * is still `501 admin.contract_unpinned`, so editing is disabled until the backend pins
- * the request body (F4 follow-up).
- */
+/** Updates the active donation goal without changing its accumulated progress. */
 export function DonationGoalPage(): ReactElement {
   const resource = useApiResource(loadDonationGoal);
+  const [title, setTitle] = useState('');
+  const [goalStars, setGoalStars] = useState('');
+  const [savedGoal, setSavedGoal] = useState<DonationGoal | null>(null);
+  const [saveError, setSaveError] = useState<Error | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
+
+  useEffect(() => {
+    if (resource.status === 'ready') {
+      setTitle(resource.data.title);
+      setGoalStars(String(resource.data.goalStars));
+    }
+  }, [resource]);
+
+  const saveGoal = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
+    event.preventDefault();
+    if (isSaving) {
+      return;
+    }
+
+    const normalizedTitle = title.trim();
+    const parsedGoalStars = Number(goalStars);
+    if (normalizedTitle.length === 0 || normalizedTitle.length > 120) {
+      setSaveError(new Error('Goal title must contain 1–120 characters.'));
+      return;
+    }
+    if (
+      !/^\d+$/.test(goalStars) ||
+      !Number.isSafeInteger(parsedGoalStars) ||
+      parsedGoalStars < 1 ||
+      parsedGoalStars > 2_147_483_647
+    ) {
+      setSaveError(new Error('Goal in Stars must be a positive integer.'));
+      return;
+    }
+
+    setIsSaving(true);
+    setSaveError(null);
+    setSavedGoal(null);
+    try {
+      const updatedGoal = await updateDonationGoal({ title: normalizedTitle, goalStars: parsedGoalStars });
+      setSavedGoal(updatedGoal);
+      setTitle(updatedGoal.title);
+      setGoalStars(String(updatedGoal.goalStars));
+    } catch (cause) {
+      setSaveError(cause instanceof Error ? cause : new Error('Unable to save donation goal.'));
+    } finally {
+      setIsSaving(false);
+    }
+  };
 
   return (
     <section>
       <h2 style={{ fontSize: '16px' }}>Donation goal</h2>
-      <p style={{ fontSize: '12px', opacity: 0.7 }}>
-        Read-only — editing (PUT) lands once the backend pins the admin contract.
-      </p>
       <ResourceView resource={resource}>
-        {(goal) => (
-          <div style={{ maxWidth: '420px' }}>
-            <p style={{ fontWeight: 600 }}>{goal.title}</p>
-            <p>
-              {formatStars(goal.raisedStars)} / {formatStars(goal.goalStars)} ⭐
-            </p>
-            <p style={{ opacity: 0.7 }}>
-              Top donator:{' '}
-              {goal.topDonator === null
-                ? '—'
-                : `${goal.topDonator.displayName} (${formatStars(goal.topDonator.amountStars)} ⭐)`}
-            </p>
-          </div>
-        )}
+        {(loadedGoal) => {
+          const displayedGoal = savedGoal ?? loadedGoal;
+          return (
+            <div style={{ maxWidth: '420px' }}>
+              <p>
+                {formatStars(displayedGoal.raisedStars)} / {formatStars(displayedGoal.goalStars)} ⭐
+              </p>
+              <p style={{ opacity: 0.7 }}>
+                Top donator:{' '}
+                {displayedGoal.topDonator === null
+                  ? '—'
+                  : `${displayedGoal.topDonator.displayName} (${formatStars(displayedGoal.topDonator.amountStars)} ⭐)`}
+              </p>
+              <form onSubmit={saveGoal} noValidate>
+                <label htmlFor="goal-title" style={{ display: 'block', marginTop: '12px' }}>
+                  Goal title
+                </label>
+                <input
+                  id="goal-title"
+                  value={title}
+                  onChange={(event) => setTitle(event.currentTarget.value)}
+                  disabled={isSaving}
+                  maxLength={120}
+                />
+                <label htmlFor="goal-stars" style={{ display: 'block', marginTop: '8px' }}>
+                  Goal in Stars
+                </label>
+                <input
+                  id="goal-stars"
+                  type="number"
+                  min="1"
+                  step="1"
+                  value={goalStars}
+                  onChange={(event) => setGoalStars(event.currentTarget.value)}
+                  disabled={isSaving}
+                />
+                <button type="submit" disabled={isSaving} style={{ display: 'block', marginTop: '12px' }}>
+                  {isSaving ? 'Saving…' : 'Save goal'}
+                </button>
+              </form>
+              {saveError !== null ? (
+                <p role="alert" style={{ color: '#b00020' }}>
+                  {saveError instanceof ApiError && saveError.code !== null ? saveError.code : saveError.message}
+                </p>
+              ) : null}
+              {savedGoal !== null ? <p>Saved</p> : null}
+            </div>
+          );
+        }}
       </ResourceView>
     </section>
   );

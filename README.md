@@ -7,7 +7,7 @@ Web10.Radio — планируемая круглосуточная Telegram-cha
 Backend scaffold уже есть в `src/backend/`:
 
 - `Web10.Radio.API` — ASP.NET/F# host со startup config validation, B4 `/api/v0/*` routes, durable Telegram workflows, Stars payment state machine и health endpoints.
-- `Web10.Radio.Database` — PostgreSQL options, FluentMigrator migrations through `202607100003`, `pg_trgm` search indexes, ADO.NET transaction/session helpers и repositories.
+- `Web10.Radio.Database` — PostgreSQL options, FluentMigrator migrations through `202607100004` (включая `FrontendBlockers`: `AdminUsers`/`AdminSessions`, stream-node control state), `pg_trgm` search indexes, ADO.NET transaction/session helpers и repositories.
 - `Web10.Radio.Migrator` — отдельное one-shot migration app/container.
 - `Web10.Radio.Telegram` — Funogram inbound adapter и единственная typed outbound bot boundary.
 - `Web10.Radio.Tests` — NUnit + Testcontainers PostgreSQL integration tests для API, Telegram commands/callbacks, Stars payments, migrations, outbox и moderation.
@@ -38,7 +38,7 @@ Backend scaffold уже есть в `src/backend/`:
 
 ## Backend configuration contract
 
-`WEB10_ADMIN__TOKEN` обязателен при запуске API и используется в точном заголовке `Authorization: Bearer <WEB10_ADMIN__TOKEN>` для admin routes. Отдельный `WEB10_STREAM__CALLBACK_TOKEN` защищает stream-node lease/completion callbacks; оба bearer secrets допускают только letters, digits, underscore и hyphen и не переиспользуют RTMP key. Compose содержит только тестовые non-production values. Для Local default storage задаются `WEB10_STORAGE__TYPE=Local` и `WEB10_STORAGE__LOCAL_ROOT`; S3 bucket/region/service URL и true force-path-style не задаются, а explicit `S3_FORCE_PATH_STYLE=false` допустим.
+Admin routes используют session auth (не bearer): `WEB10_ADMIN__USERNAME` и `WEB10_ADMIN__PASSWORD` задают bootstrap admin, который создается/обновляется при старте. `POST /api/v0/admin/auth/login` устанавливает `HttpOnly` cookie `web10_admin_session`, а каждый mutating admin request требует заголовок `X-CSRF-Token` из ответа login. Отдельный `WEB10_STREAM__CALLBACK_TOKEN` защищает stream-node lease/completion callbacks (bearer secret 24+ символов из [A-Za-z0-9_-], не переиспользует RTMP key). `WEB10_TELEGRAM__UPDATE_MODE=Webhook|LongPolling` выбирает способ приема Telegram updates; MVP использует `LongPolling`, чтобы бот принимал `/say` и Stars без публичного webhook. Compose содержит только тестовые non-production values. Для Local default storage задаются `WEB10_STORAGE__TYPE=Local` и `WEB10_STORAGE__LOCAL_ROOT`; S3 bucket/region/service URL и true force-path-style не задаются, а explicit `S3_FORCE_PATH_STYLE=false` допустим.
 
 Telegram request/say prices обязательны и не имеют runtime defaults: `WEB10_TELEGRAM__REQUEST_PRICE_STARS` и `WEB10_TELEGRAM__SAY_PRICE_STARS` должны быть positive invariant `Int32`. `compose.yaml` задает smoke/deployment values `100` и `50`; те же значения управляют localized copy, persisted order/message amount, pre-checkout validation и Telegram `LabeledPrice`.
 
@@ -50,7 +50,7 @@ S3 scanner обходит `ListObjectsV2` page-by-page, renews the fenced scan l
 
 ## Backend Compose smoke
 
-`compose.yaml` — текущий infrastructure smoke path для PostgreSQL + migrator + API. Это еще не полный v0 stack: frontend, stream-node и optional observability collector остаются в следующих checklist phases.
+`compose.yaml` разворачивает PostgreSQL + migrator + API + `frontend` (nginx со stage на `/` и admin на `/admin/`, проксирует `/api`). Это Development vertical-slice env (`WEB10_DEV__FIXTURES_ENABLED=true`). Все еще отсутствует реальный `stream-node` (phase B5) и optional observability collector (OTLP export best-effort; без коллектора API остается healthy). Пока B5 не готов, поток можно сымитировать локально скриптом `scripts/fake-stream-node.py`, который шлет `live` heartbeats и продвигает очередь через lease/completion — стадия покажет LIVE.
 
 Из repository root выполните bounded smoke. Cleanup trap удаляет containers, network и volumes и при success, и при ошибке; отдельный `sleep` не нужен:
 
@@ -65,12 +65,14 @@ docker compose up --build --wait --wait-timeout 120 api
 
 curl -fsS http://localhost:8080/health/live
 curl -sS -w '\nHTTP %{http_code}\n' http://localhost:8080/health/ready
-curl -fsS \
-  -H 'Authorization: Bearer compose-smoke-admin-token-1234567890' \
+curl -fsS -c /tmp/web10-admin.cookie -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"compose-smoke-admin-password"}' \
+  http://localhost:8080/api/v0/admin/auth/login
+curl -fsS -b /tmp/web10-admin.cookie \
   http://localhost:8080/api/v0/admin/social-links
 
 docker compose exec -T postgres \
-  psql -v ON_ERROR_STOP=1 -U web10 -d web10 -tAc 'SELECT "Version" FROM "VersionInfo" WHERE "Version" IN (202607080001, 202607100001, 202607100002, 202607100003) ORDER BY "Version";'
+  psql -v ON_ERROR_STOP=1 -U web10 -d web10 -tAc 'SELECT "Version" FROM "VersionInfo" WHERE "Version" IN (202607080001, 202607100001, 202607100002, 202607100003, 202607100004) ORDER BY "Version";'
 docker compose exec -T postgres \
   psql -v ON_ERROR_STOP=1 -U web10 -d web10 -tAc "SELECT 1 / ((count(*) = 1)::int) FROM pg_extension WHERE extname = 'pg_trgm';"
 docker compose exec -T postgres \
@@ -85,13 +87,14 @@ docker compose exec -T postgres \
 - `migrator` — exited with code `0`.
 - `api` — `healthy` на `http://localhost:8080`.
 
-`/health/live` возвращает HTTP 200. Compose использует intentionally invalid Telegram token, поэтому operational `getMe` probe в `/health/ready` возвращает HTTP 503 с overall `Unhealthy`; это ожидаемо для smoke-config и доказывает, что configured-only token больше не считается рабочей зависимостью. При валидном production token checks `api`, `postgresql`, `storage`, `telegram-adapter` должны быть `Healthy`, а отсутствующий stream-node heartbeat остается `Degraded`. Authenticated admin request возвращает HTTP 200 и JSON array. Migration query выводит четыре примененные migration, а следующие assertions возвращают `1` только при установленном `pg_trgm` и всех пяти B4 indexes:
+`/health/live` возвращает HTTP 200. Compose использует intentionally invalid Telegram token, поэтому operational `getMe` probe в `/health/ready` возвращает HTTP 503 с overall `Unhealthy`; это ожидаемо для smoke-config и доказывает, что configured-only token больше не считается рабочей зависимостью. При валидном production token checks `api`, `postgresql`, `storage`, `telegram-adapter` должны быть `Healthy`, а отсутствующий stream-node heartbeat остается `Degraded`. Authenticated admin request (после login) возвращает HTTP 200 и JSON array. Migration query выводит пять примененных migration, а следующие assertions возвращают `1` только при установленном `pg_trgm` и всех пяти B4 indexes:
 
 ```text
 202607080001
 202607100001
 202607100002
 202607100003
+202607100004
 ```
 
 API image заранее создает `/var/lib/web10/storage` и `/var/lib/web10/data-protection` с ownership runtime UID `1654`; fresh named volumes наследуют эти права, поэтому startup writeability validation работает без запуска chiseled container от root.

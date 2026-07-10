@@ -119,11 +119,39 @@ FROM "Payments" WHERE "Id" = @Id AND "IsDeleted" = false;""",
             return if isNull value then failwithf "Expected active %s %O to exist." tableName id else string value
         }
 
+    let private insertActiveDonationGoal connection goalId title raisedStars goalStars =
+        execute
+            connection
+            """INSERT INTO "DonationGoals" ("Id", "Title", "GoalStars", "RaisedStars", "IsActive", "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc")
+VALUES (@Id, @Title, @GoalStars, @RaisedStars, true, false, @At, @At);"""
+            (fun command ->
+                command.Parameters.AddWithValue("Id", goalId) |> ignore
+                command.Parameters.AddWithValue("Title", title) |> ignore
+                command.Parameters.AddWithValue("GoalStars", goalStars) |> ignore
+                command.Parameters.AddWithValue("RaisedStars", raisedStars) |> ignore
+                command.Parameters.AddWithValue("At", atUtc) |> ignore)
+
+    let private loadDonationGoal dataSource =
+        task {
+            let! result = PlayerStateReadModel.loadDonationGoal dataSource CancellationToken.None
+
+            match result with
+            | Ok goal -> return goal
+            | Error error -> return failwithf "Expected donation projection to load, but got %A." error
+        }
+
     let private createOrder dataSource order =
         DatabaseSession.withTransactionResult
             dataSource
             (fun connection transaction cancellationToken ->
                 PaymentRepository.createOrderInTransaction connection transaction order cancellationToken)
+            CancellationToken.None
+
+    let private getOrder dataSource paymentId =
+        DatabaseSession.withTransactionResult
+            dataSource
+            (fun connection transaction cancellationToken ->
+                PaymentRepository.tryGetOrderInTransaction connection transaction paymentId cancellationToken)
             CancellationToken.None
 
     let private validatePreCheckout dataSource telegramUserId currency amountStars invoicePayload =
@@ -193,14 +221,24 @@ FROM "Payments" WHERE "Id" = @Id AND "IsDeleted" = false;""",
         | Ok(CompletePaymentOutcome.Rejected "telegram charge id is already assigned") -> ()
         | actual -> Assert.Fail(sprintf "Expected the unique charge constraint to map to its terminal rejection, but got %A." actual)
 
-    let private paymentOrder paymentId telegramUserId purpose purposeEntityId amountStars invoicePayload =
+    let private paymentOrder paymentId telegramUserId purpose purposeEntityId amountStars invoicePayload payerDisplayName =
         { Id = paymentId
           TelegramUserId = telegramUserId
           Purpose = purpose
           PurposeEntityId = purposeEntityId
           AmountStars = amountStars
           InvoicePayload = invoicePayload
+          PayerDisplayName = payerDisplayName
           CreatedAtUtc = atUtc }
+
+    let private createAndCompleteDonation dataSource paymentId telegramUserId amountStars invoicePayload payerDisplayName chargeId paidAtUtc =
+        task {
+            let order = paymentOrder paymentId telegramUserId PaymentPurpose.Donation None amountStars invoicePayload payerDisplayName
+            let! created = createOrder dataSource order
+            assertOrderCreated order created
+            let! completion = PaymentRepository.completePayment dataSource paymentId telegramUserId chargeId amountStars "XTR" paidAtUtc CancellationToken.None
+            assertCompleted paymentId PaymentPurpose.Donation None false completion
+        }
 
     [<Test>]
     let ``createOrderInTransaction writes the fixed Stars transport contract and preserves idempotency distinctions`` () =
@@ -211,8 +249,8 @@ FROM "Payments" WHERE "Id" = @Id AND "IsDeleted" = false;""",
                 do! connection.OpenAsync()
 
                 let paymentId = newId ()
-                let order = paymentOrder paymentId 42001L PaymentPurpose.Donation None 73 "donation-order-1"
-                let mismatchedOrder = { order with AmountStars = 74 }
+                let order = paymentOrder paymentId 42001L PaymentPurpose.Donation None 73 "donation-order-1" (Some "Payment order snapshot")
+                let mismatchedOrder = { order with PayerDisplayName = Some "Replacement snapshot" }
 
                 let! created = createOrder dataSource order
                 let! replay = createOrder dataSource order
@@ -221,6 +259,7 @@ FROM "Payments" WHERE "Id" = @Id AND "IsDeleted" = false;""",
                 assertOrderCreated order created
                 assertOrderAlreadyApplied order replay
                 assertOrderRejected mismatch
+                let! persisted = getOrder dataSource paymentId
 
                 let! userId, purpose, entityId, amount, currency, providerToken, payload, status, chargeId, paidAtUtc = readPayment connection paymentId
                 Assert.That(userId, Is.EqualTo(42001L))
@@ -230,6 +269,9 @@ FROM "Payments" WHERE "Id" = @Id AND "IsDeleted" = false;""",
                 Assert.That(currency, Is.EqualTo("XTR"))
                 Assert.That(providerToken, Is.EqualTo(""))
                 Assert.That(payload, Is.EqualTo("donation-order-1"))
+                match persisted with
+                | Ok(Some persistedOrder) -> Assert.That(persistedOrder.PayerDisplayName, Is.EqualTo(Some "Payment order snapshot"))
+                | actual -> Assert.Fail(sprintf "Expected the persisted payment order, but got %A." actual)
                 Assert.That(status, Is.EqualTo("InvoiceCreated"))
                 Assert.That(Option.isNone chargeId, Is.True)
                 Assert.That(Option.isNone paidAtUtc, Is.True)
@@ -249,7 +291,7 @@ FROM "Payments" WHERE "Id" = @Id AND "IsDeleted" = false;""",
                 let amount = 51
                 let payload = "say-precheckout-valid"
                 do! insertSay connection sayId userId amount atUtc
-                let order = paymentOrder paymentId userId PaymentPurpose.Say (Some sayId) amount payload
+                let order = paymentOrder paymentId userId PaymentPurpose.Say (Some sayId) amount payload (Some "Pre-checkout payer")
                 let! created = createOrder dataSource order
                 assertOrderCreated order created
 
@@ -285,7 +327,7 @@ FROM "Payments" WHERE "Id" = @Id AND "IsDeleted" = false;""",
                 let amount = 52
                 let payload = "say-precheckout-invalid"
                 do! insertSay connection sayId userId amount atUtc
-                let order = paymentOrder paymentId userId PaymentPurpose.Say (Some sayId) amount payload
+                let order = paymentOrder paymentId userId PaymentPurpose.Say (Some sayId) amount payload (Some "Invalid pre-checkout payer")
                 let! created = createOrder dataSource order
                 assertOrderCreated order created
 
@@ -336,7 +378,7 @@ FROM "Payments" WHERE "Id" = @Id AND "IsDeleted" = false;""",
                     let paymentId = newId ()
                     let chargeId = sprintf "say-charge-%s" moderationStatus
                     do! insertSay connection sayId userId amount atUtc
-                    let order = paymentOrder paymentId userId PaymentPurpose.Say (Some sayId) amount (sprintf "say-%s" moderationStatus)
+                    let order = paymentOrder paymentId userId PaymentPurpose.Say (Some sayId) amount (sprintf "say-%s" moderationStatus) (Some "Say payer")
                     let! created = createOrder dataSource order
                     assertOrderCreated order created
 
@@ -359,7 +401,7 @@ FROM "Payments" WHERE "Id" = @Id AND "IsDeleted" = false;""",
                 let mismatchPaymentId = newId ()
                 let acceptedChargeId = "say-charge-accepted"
                 do! insertSay connection mismatchSayId userId amount atUtc
-                let mismatchOrder = paymentOrder mismatchPaymentId userId PaymentPurpose.Say (Some mismatchSayId) amount "say-mismatch"
+                let mismatchOrder = paymentOrder mismatchPaymentId userId PaymentPurpose.Say (Some mismatchSayId) amount "say-mismatch" (Some "Say mismatch payer")
                 let! mismatchOrderCreated = createOrder dataSource mismatchOrder
                 assertOrderCreated mismatchOrder mismatchOrderCreated
                 let! accepted = PaymentRepository.completePayment dataSource mismatchPaymentId userId acceptedChargeId amount "XTR" (atUtc.AddMinutes(2.0)) CancellationToken.None
@@ -401,7 +443,7 @@ FROM "Payments" WHERE "Id" = @Id AND "IsDeleted" = false;""",
                 let chargeId = "request-charge-1"
                 let paidAtUtc = atUtc.AddMinutes(2.0)
                 do! insertTrackRequest connection requestId trackId userId atUtc
-                let order = paymentOrder paymentId userId PaymentPurpose.Request (Some requestId) amount "request-payment"
+                let order = paymentOrder paymentId userId PaymentPurpose.Request (Some requestId) amount "request-payment" (Some "Request payer")
                 let! created = createOrder dataSource order
                 assertOrderCreated order created
 
@@ -443,9 +485,9 @@ WHERE "Id" = @PaymentId AND "TrackId" = @TrackId AND "TrackRequestId" = @Request
                 let firstPaymentId = newId ()
                 let conflictingPaymentId = newId ()
                 let laterPaymentId = newId ()
-                let firstOrder = paymentOrder firstPaymentId userId PaymentPurpose.Donation None amount "charge-owner"
-                let conflictingOrder = paymentOrder conflictingPaymentId userId PaymentPurpose.Donation None amount "charge-conflict"
-                let laterOrder = paymentOrder laterPaymentId userId PaymentPurpose.Donation None amount "charge-later"
+                let firstOrder = paymentOrder firstPaymentId userId PaymentPurpose.Donation None amount "charge-owner" (Some "Charge owner")
+                let conflictingOrder = paymentOrder conflictingPaymentId userId PaymentPurpose.Donation None amount "charge-conflict" (Some "Charge conflict")
+                let laterOrder = paymentOrder laterPaymentId userId PaymentPurpose.Donation None amount "charge-later" (Some "Later charge")
 
                 let! firstCreated = createOrder dataSource firstOrder
                 let! conflictingCreated = createOrder dataSource conflictingOrder
@@ -474,19 +516,26 @@ WHERE "Id" = @PaymentId AND "TrackId" = @TrackId AND "TrackRequestId" = @Request
             })
 
     [<Test>]
-    let ``Donation completion is purpose-neutral and idempotent without a purpose entity`` () =
+    let ``Donation completion reaches Paid without an active goal and replay is a no-op`` () =
         DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
             task {
                 use dataSource = NpgsqlDataSource.Create(connectionString)
                 use connection = new NpgsqlConnection(connectionString)
                 do! connection.OpenAsync()
 
+                let! activeGoalCount =
+                    scalarInt
+                        connection
+                        "SELECT count(*) FROM \"DonationGoals\" WHERE \"IsDeleted\" = false AND \"IsActive\" = true;"
+                        ignore
+                Assert.That(activeGoalCount, Is.Zero)
+
                 let paymentId = newId ()
                 let userId = 42007L
                 let amount = 56
                 let chargeId = "donation-charge-1"
                 let paidAtUtc = atUtc.AddMinutes(2.0)
-                let order = paymentOrder paymentId userId PaymentPurpose.Donation None amount "purpose-neutral-donation"
+                let order = paymentOrder paymentId userId PaymentPurpose.Donation None amount "purpose-neutral-donation" (Some "Donation payer")
                 let! created = createOrder dataSource order
                 assertOrderCreated order created
 
@@ -504,4 +553,96 @@ WHERE "Id" = @PaymentId AND "TrackId" = @TrackId AND "TrackRequestId" = @Request
                 Assert.That(status, Is.EqualTo("Paid"))
                 Assert.That(storedCharge, Is.EqualTo(Some chargeId))
                 Assert.That(storedPaidAtUtc, Is.EqualTo(Some paidAtUtc))
+            })
+
+    [<Test>]
+    let ``first paid Donation raises the active goal once and replay leaves its amount unchanged`` () =
+        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
+            task {
+                use dataSource = NpgsqlDataSource.Create(connectionString)
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+
+                let goalId = newId ()
+                let paymentId = newId ()
+                let userId = 42008L
+                let amount = 57
+                do! insertActiveDonationGoal connection goalId "Payment invariant" 100 1000
+                let order = paymentOrder paymentId userId PaymentPurpose.Donation None amount "goal-increment" (Some "Goal donor")
+                let! created = createOrder dataSource order
+                assertOrderCreated order created
+
+                let! firstCompletion = PaymentRepository.completePayment dataSource paymentId userId "goal-charge" amount "XTR" (atUtc.AddMinutes(2.0)) CancellationToken.None
+                let! replay = PaymentRepository.completePayment dataSource paymentId userId "goal-charge" amount "XTR" (atUtc.AddMinutes(3.0)) CancellationToken.None
+                assertCompleted paymentId PaymentPurpose.Donation None false firstCompletion
+                assertCompleted paymentId PaymentPurpose.Donation None true replay
+
+                let! raisedStars =
+                    scalarInt
+                        connection
+                        "SELECT \"RaisedStars\" FROM \"DonationGoals\" WHERE \"Id\" = @Id AND \"IsDeleted\" = false AND \"IsActive\" = true;"
+                        (fun command -> command.Parameters.AddWithValue("Id", goalId) |> ignore)
+                Assert.That(raisedStars, Is.EqualTo(157))
+            })
+
+
+    [<Test>]
+    let ``recent donation projects the payer snapshot stored with the payment`` () =
+        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
+            task {
+                use dataSource = NpgsqlDataSource.Create(connectionString)
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+
+                do! insertActiveDonationGoal connection (newId ()) "Projection goal" 0 1000
+                let paymentId = newId ()
+                do!
+                    createAndCompleteDonation
+                        dataSource
+                        paymentId
+                        42010L
+                        59
+                        "recent-snapshot"
+                        (Some "Snapshot donor")
+                        "recent-snapshot-charge"
+                        (atUtc.AddMinutes(2.0))
+                let! goal = loadDonationGoal dataSource
+                let recent = goal.Recent |> List.exactlyOne
+                Assert.That(recent.Id, Is.EqualTo(paymentId.ToString("D")))
+                Assert.That(recent.DisplayName, Is.EqualTo("Snapshot donor"))
+                Assert.That(recent.AmountStars, Is.EqualTo(59))
+            })
+
+    [<Test>]
+    let ``top donor totals by Telegram user and resolves a tied winner to its latest nonblank snapshot`` () =
+        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
+            task {
+                use dataSource = NpgsqlDataSource.Create(connectionString)
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+
+                do! insertActiveDonationGoal connection (newId ()) "Top donor goal" 0 1000
+                do! createAndCompleteDonation dataSource (newId ()) 42011L 60 "top-old-name" (Some "Earlier name") "top-charge-1" (atUtc.AddMinutes(1.0))
+                do! createAndCompleteDonation dataSource (newId ()) 42011L 100 "top-latest-name" (Some "Latest name") "top-charge-2" (atUtc.AddMinutes(3.0))
+                do! createAndCompleteDonation dataSource (newId ()) 42011L 1 "top-blank-name" (Some " ") "top-charge-3" (atUtc.AddMinutes(5.0))
+                do! createAndCompleteDonation dataSource (newId ()) 42012L 161 "top-tie" (Some "Tied donor") "top-charge-4" (atUtc.AddMinutes(4.0))
+
+                let! goal = loadDonationGoal dataSource
+                Assert.That(goal.TopDonator.AmountStars, Is.EqualTo(161))
+                Assert.That(goal.TopDonator.DisplayName, Is.EqualTo("Latest name"))
+            })
+
+    [<Test>]
+    let ``top donor without a nonblank payer snapshot is anonymous`` () =
+        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
+            task {
+                use dataSource = NpgsqlDataSource.Create(connectionString)
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+
+                do! insertActiveDonationGoal connection (newId ()) "Anonymous donor goal" 0 1000
+                do! createAndCompleteDonation dataSource (newId ()) 42013L 61 "anonymous-top" None "anonymous-top-charge" (atUtc.AddMinutes(2.0))
+                let! goal = loadDonationGoal dataSource
+                Assert.That(goal.TopDonator.AmountStars, Is.EqualTo(61))
+                Assert.That(goal.TopDonator.DisplayName, Is.EqualTo("anonymous"))
             })

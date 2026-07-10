@@ -63,6 +63,9 @@ ORDER BY table_name;""",
                       "SocialLinks"
                       "LibraryScanJobs"
                       "StreamNodeHeartbeats"
+                      "AdminUsers"
+                      "AdminSessions"
+                      "StreamNodeControlState"
                       "OutboxEvents"
                       "TelegramUpdateInbox" ]
 
@@ -127,6 +130,9 @@ VALUES (@ActiveId, 'Active title', 'Active artist', false),
               "SocialLinks"
               "LibraryScanJobs"
               "StreamNodeHeartbeats"
+              "AdminUsers"
+              "AdminSessions"
+              "StreamNodeControlState"
               "OutboxEvents"
               "TelegramUpdateInbox" ]
 
@@ -322,6 +328,94 @@ ORDER BY index_class.relname;""",
 
             return Set.ofSeq definitions
         }
+    let private readMigration004Columns (connection: NpgsqlConnection) =
+        task {
+            use command =
+                new NpgsqlCommand(
+                    """SELECT table_name, column_name, data_type, is_nullable
+FROM information_schema.columns
+WHERE table_schema = 'public'
+  AND (
+      table_name IN ('AdminUsers', 'AdminSessions', 'StreamNodeControlState')
+      OR (table_name = 'LibraryScanJobs' AND column_name = 'DiscoveredCount')
+      OR (table_name = 'Payments' AND column_name = 'PayerDisplayName')
+  )
+ORDER BY table_name, column_name;""",
+                    connection
+                )
+
+            let! reader = command.ExecuteReaderAsync()
+            use reader = reader
+            let columns = ResizeArray<string * string * string * string>()
+            let mutable hasRow = true
+
+            while hasRow do
+                let! next = reader.ReadAsync()
+                hasRow <- next
+
+                if next then
+                    columns.Add((reader.GetString(0), reader.GetString(1), reader.GetString(2), reader.GetString(3)))
+
+            return Set.ofSeq columns
+        }
+
+    let private readMigration004IndexDefinitions (connection: NpgsqlConnection) =
+        task {
+            use command =
+                new NpgsqlCommand(
+                    """SELECT index_class.relname,
+       table_class.relname,
+       access_method.amname,
+       index_definition.indisunique,
+       (
+           SELECT string_agg(
+               pg_get_indexdef(index_definition.indexrelid, key_position, true),
+               ', ' ORDER BY key_position
+           )
+           FROM generate_series(1, index_definition.indnkeyatts) AS key_position
+       ),
+       COALESCE(pg_get_expr(index_definition.indpred, index_definition.indrelid), '')
+FROM pg_index AS index_definition
+INNER JOIN pg_class AS index_class ON index_class.oid = index_definition.indexrelid
+INNER JOIN pg_class AS table_class ON table_class.oid = index_definition.indrelid
+INNER JOIN pg_namespace AS schema ON schema.oid = index_class.relnamespace
+INNER JOIN pg_am AS access_method ON access_method.oid = index_class.relam
+WHERE schema.nspname = 'public'
+  AND index_class.relname IN (
+      'UX_LibraryScanJobs_Active_DefaultBackend',
+      'UX_LibraryScanJobs_Active_StorageBackend',
+      'UX_Playlists_Active_Singleton',
+      'UX_DonationGoals_Active_Singleton',
+      'UX_AdminUsers_Active_NormalizedUsername',
+      'UX_AdminSessions_Active_TokenHash',
+      'IX_AdminSessions_Active_User_ExpiresAtUtc',
+      'UX_StreamNodeControlState_Active_Singleton'
+  )
+ORDER BY index_class.relname;""",
+                    connection
+                )
+
+            let! reader = command.ExecuteReaderAsync()
+            use reader = reader
+            let definitions = ResizeArray<string * string * string * bool * string * string>()
+            let mutable hasRow = true
+
+            while hasRow do
+                let! next = reader.ReadAsync()
+                hasRow <- next
+
+                if next then
+                    definitions.Add(
+                        ( reader.GetString(0),
+                          reader.GetString(1),
+                          reader.GetString(2),
+                          reader.GetBoolean(3),
+                          reader.GetString(4) |> normalizeCatalogExpression,
+                          reader.GetString(5) |> normalizeCatalogExpression )
+                    )
+
+            return Set.ofSeq definitions
+        }
 
     let private hasPgTrgmExtension (connection: NpgsqlConnection) =
         task {
@@ -362,6 +456,43 @@ ORDER BY index_class.relname;""",
                 | inner -> findMessage inner
 
         findMessage error
+
+    let private postgresException (error: exn) =
+        let rec findPostgresException (current: exn) =
+            match current with
+            | :? PostgresException as postgresError -> Some postgresError
+            | _ ->
+                match current.InnerException with
+                | null -> None
+                | inner -> findPostgresException inner
+
+        findPostgresException error
+
+    let private assertPostgresViolation
+        (expectedSqlState: string)
+        (contract: string)
+        (execute: unit -> System.Threading.Tasks.Task<unit>)
+        =
+        task {
+            let! failure =
+                task {
+                    try
+                        do! execute ()
+                        return None
+                    with error ->
+                        return Some error
+                }
+
+            match failure |> Option.bind postgresException with
+            | Some postgresError ->
+                Assert.That(
+                    postgresError.SqlState,
+                    Is.EqualTo(expectedSqlState),
+                    sprintf "%s must surface PostgreSQL SQLSTATE %s." contract expectedSqlState
+                )
+            | None ->
+                Assert.Fail(sprintf "%s must reject the violating write." contract)
+        }
 
     let private assertB4DuplicatePreflightRejects
         (seedSql: string)
@@ -406,7 +537,8 @@ ORDER BY index_class.relname;""",
 
                 let expectedForeignKeys =
                     Set.ofList
-                        [ "LibraryScanJobs", "LibraryScanJobs_StorageBackendId_fkey", "FOREIGNKEYStorageBackendIdREFERENCESStorageBackendsId"
+                        [ "AdminSessions", "AdminSessions_UserId_fkey", "FOREIGNKEYUserIdREFERENCESAdminUsersId"
+                          "LibraryScanJobs", "LibraryScanJobs_StorageBackendId_fkey", "FOREIGNKEYStorageBackendIdREFERENCESStorageBackendsId"
                           "PlaybackQueue", "PlaybackQueue_PlaylistItemId_fkey", "FOREIGNKEYPlaylistItemIdREFERENCESPlaylistItemsId"
                           "PlaybackQueue", "PlaybackQueue_TrackId_fkey", "FOREIGNKEYTrackIdREFERENCESTracksId"
                           "PlaybackQueue", "PlaybackQueue_TrackRequestId_fkey", "FOREIGNKEYTrackRequestIdREFERENCESTrackRequestsId"
@@ -422,6 +554,7 @@ ORDER BY index_class.relname;""",
                         [ "DonationGoals", "DonationGoals_GoalStars_check", "CHECKGoalStars>0"
                           "DonationGoals", "DonationGoals_RaisedStars_check", "CHECKRaisedStars>=0"
                           "LibraryScanJobs", "CK_LibraryScanJobs_ClaimAttempt_NonNegative", "CHECKClaimAttempt>=0"
+                          "LibraryScanJobs", "CK_LibraryScanJobs_DiscoveredCount_NonNegative", "CHECKDiscoveredCount>=0"
                           "LibraryScanJobs", "LibraryScanJobs_Status_check", "CHECKStatusIN'Queued','Running','Completed','Failed'"
                           "OutboxEvents", "OutboxEvents_Attempts_check", "CHECKAttempts>=0"
                           "OutboxEvents", "OutboxEvents_Status_check", "CHECKStatusIN'Pending','Processing','Processed','Failed'"
@@ -440,6 +573,9 @@ ORDER BY index_class.relname;""",
                           "SocialLinks", "SocialLinks_Position_check", "CHECKPosition>=0"
                           "StorageBackends", "StorageBackends_Type_check", "CHECKTypeIN'Local','S3'"
                           "StreamNodeHeartbeats", "StreamNodeHeartbeats_Status_check", "CHECKStatusIN'Starting','Live','Degraded','Restarting','Failed','Offline'"
+                          "StreamNodeControlState", "CK_StreamNodeControlState_DesiredState", "CHECKDesiredStateIN'Running','Stopped'"
+                          "StreamNodeControlState", "CK_StreamNodeControlState_RestartGeneration_NonNegative", "CHECKRestartGeneration>=0"
+                          "StreamNodeControlState", "CK_StreamNodeControlState_SingletonKey_Primary", "CHECKSingletonKey='primary'"
                           "TrackFiles", "TrackFiles_SizeBytes_check", "CHECKSizeBytesISNULLORSizeBytes>=0"
                           "TrackLinks", "TrackLinks_Kind_check", "CHECKKindIN'bandcamp','soundcloud','youtube','artist','external'"
                           "TrackRequests", "TrackRequests_Status_check", "CHECKStatusIN'NeedsReview','Matched','Rejected','Queued','PaidPending','Paid'"
@@ -458,6 +594,7 @@ ORDER BY index_class.relname;""",
                           "UX_TrackFiles_Active_Backend_StoragePath", "IsDeleted=falseANDStorageBackendIdISNOTNULL"
                           "UX_TrackFiles_Active_NullBackend_StoragePath", "IsDeleted=falseANDStorageBackendIdISNULL"
                           "UX_Playlists_Active_Name", "IsDeleted=false"
+                          "UX_Playlists_Active_Singleton", "IsDeleted=falseANDIsActive=true"
                           "IX_PlaylistItems_Active_PlaylistId", "IsDeleted=false"
                           "UX_PlaylistItems_Active_PlaylistId_Position", "IsDeleted=false"
                           "IX_TrackRequests_Active_Status_RequestedAtUtc", "IsDeleted=false"
@@ -471,12 +608,19 @@ ORDER BY index_class.relname;""",
                           "UX_Payments_Active_PurposeEntity", "IsDeleted=falseANDPurposeEntityIdISNOTNULL"
                           "IX_Payments_Active_Status", "IsDeleted=false"
                           "IX_DonationGoals_Active_IsActive", "IsDeleted=false"
+                          "UX_DonationGoals_Active_Singleton", "IsDeleted=falseANDIsActive=true"
                           "IX_SocialLinks_Active_Position", "IsDeleted=false"
                           "IX_SocialLinks_Active_Featured", "IsDeleted=false"
                           "IX_LibraryScanJobs_Active_Status_RequestedAtUtc", "IsDeleted=false"
                           "IX_LibraryScanJobs_Active_ClaimLease", "IsDeleted=falseANDStatusIN'Queued','Running'"
                           "IX_StreamNodeHeartbeats_Active_HeartbeatAtUtc", "IsDeleted=false"
+                          "UX_LibraryScanJobs_Active_DefaultBackend", "IsDeleted=falseANDStorageBackendIdISNULLANDStatusIN'Queued','Running'"
+                          "UX_LibraryScanJobs_Active_StorageBackend", "IsDeleted=falseANDStorageBackendIdISNOTNULLANDStatusIN'Queued','Running'"
                           "IX_OutboxEvents_Active_Status_NextAttemptAtUtc", "IsDeleted=false"
+                          "UX_StreamNodeControlState_Active_Singleton", "IsDeleted=falseANDSingletonKey='primary'"
+                          "UX_AdminUsers_Active_NormalizedUsername", "IsDeleted=false"
+                          "UX_AdminSessions_Active_TokenHash", "IsDeleted=falseANDRevokedAtUtcISNULL"
+                          "IX_AdminSessions_Active_User_ExpiresAtUtc", "IsDeleted=falseANDRevokedAtUtcISNULL"
                           "IX_OutboxEvents_Active_GlobalOrder", "IsDeleted=falseANDStatus<>'Processed'"
                           "UX_TelegramUpdateInbox_Active_Update_Event", "IsDeleted=false" ]
 
@@ -484,6 +628,67 @@ ORDER BY index_class.relname;""",
                 Assert.That((foreignKeys = expectedForeignKeys), Is.True, sprintf "Foreign-key drift. Expected: %A; actual: %A" expectedForeignKeys foreignKeys)
                 Assert.That((checkConstraints = expectedCheckConstraints), Is.True, sprintf "Check-constraint drift. Expected: %A; actual: %A" expectedCheckConstraints checkConstraints)
                 Assert.That((activeIndexPredicates = expectedActiveIndexPredicates), Is.True, sprintf "Active-index predicate drift. Expected: %A; actual: %A" expectedActiveIndexPredicates activeIndexPredicates)
+            })
+
+    [<Test>]
+    let ``202607100004 installs the exact admin scan and control catalog`` () =
+        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
+            task {
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+                let! columns = readMigration004Columns connection
+                let! indexes = readMigration004IndexDefinitions connection
+
+                let expectedColumns =
+                    Set.ofList
+                        [ "AdminSessions", "CreatedAtUtc", "timestamp with time zone", "NO"
+                          "AdminSessions", "CsrfToken", "text", "NO"
+                          "AdminSessions", "ExpiresAtUtc", "timestamp with time zone", "NO"
+                          "AdminSessions", "Id", "uuid", "NO"
+                          "AdminSessions", "IsDeleted", "boolean", "NO"
+                          "AdminSessions", "RevokedAtUtc", "timestamp with time zone", "YES"
+                          "AdminSessions", "TokenHash", "bytea", "NO"
+                          "AdminSessions", "UpdatedAtUtc", "timestamp with time zone", "NO"
+                          "AdminSessions", "UserId", "uuid", "NO"
+                          "AdminUsers", "CreatedAtUtc", "timestamp with time zone", "NO"
+                          "AdminUsers", "Id", "uuid", "NO"
+                          "AdminUsers", "IsDeleted", "boolean", "NO"
+                          "AdminUsers", "NormalizedUsername", "text", "NO"
+                          "AdminUsers", "PasswordHash", "text", "NO"
+                          "AdminUsers", "UpdatedAtUtc", "timestamp with time zone", "NO"
+                          "AdminUsers", "Username", "text", "NO"
+                          "LibraryScanJobs", "DiscoveredCount", "integer", "NO"
+                          "Payments", "PayerDisplayName", "text", "YES"
+                          "StreamNodeControlState", "CreatedAtUtc", "timestamp with time zone", "NO"
+                          "StreamNodeControlState", "DesiredState", "text", "NO"
+                          "StreamNodeControlState", "Id", "uuid", "NO"
+                          "StreamNodeControlState", "IsDeleted", "boolean", "NO"
+                          "StreamNodeControlState", "RestartGeneration", "integer", "NO"
+                          "StreamNodeControlState", "SingletonKey", "text", "NO"
+                          "StreamNodeControlState", "UpdatedAtUtc", "timestamp with time zone", "NO" ]
+
+                let expectedIndexes =
+                    Set.ofList
+                        [ "IX_AdminSessions_Active_User_ExpiresAtUtc", "AdminSessions", "btree", false, "UserId,ExpiresAtUtc", "IsDeleted=falseANDRevokedAtUtcISNULL"
+                          "UX_AdminSessions_Active_TokenHash", "AdminSessions", "btree", true, "TokenHash", "IsDeleted=falseANDRevokedAtUtcISNULL"
+                          "UX_AdminUsers_Active_NormalizedUsername", "AdminUsers", "btree", true, "NormalizedUsername", "IsDeleted=false"
+                          "UX_DonationGoals_Active_Singleton", "DonationGoals", "btree", true, "IsActive", "IsDeleted=falseANDIsActive=true"
+                          "UX_LibraryScanJobs_Active_DefaultBackend", "LibraryScanJobs", "btree", true, "1", "IsDeleted=falseANDStorageBackendIdISNULLANDStatusIN'Queued','Running'"
+                          "UX_LibraryScanJobs_Active_StorageBackend", "LibraryScanJobs", "btree", true, "StorageBackendId", "IsDeleted=falseANDStorageBackendIdISNOTNULLANDStatusIN'Queued','Running'"
+                          "UX_Playlists_Active_Singleton", "Playlists", "btree", true, "IsActive", "IsDeleted=falseANDIsActive=true"
+                          "UX_StreamNodeControlState_Active_Singleton", "StreamNodeControlState", "btree", true, "SingletonKey", "IsDeleted=falseANDSingletonKey='primary'" ]
+
+                Assert.That(
+                    (columns = expectedColumns),
+                    Is.True,
+                    sprintf "202607100004 column/nullability/type drift. Expected: %A; actual: %A" expectedColumns columns
+                )
+
+                Assert.That(
+                    (indexes = expectedIndexes),
+                    Is.True,
+                    sprintf "202607100004 unique-index key/predicate drift. Expected: %A; actual: %A" expectedIndexes indexes
+                )
             })
 
     [<Test>]
@@ -577,7 +782,7 @@ VALUES ('00000000-0000-0000-0000-000000000302', '00000000-0000-0000-0000-0000000
 
                 Assert.That(
                     List.ofSeq versions,
-                    Is.EqualTo(([ 202607080001L; 202607100001L; 202607100002L; 202607100003L ] : int64 list) :> obj),
+                    Is.EqualTo(([ 202607080001L; 202607100001L; 202607100002L; 202607100003L; 202607100004L ] : int64 list) :> obj),
                     "A full down/up cycle must restore every migration in version order."
                 )
             })
@@ -807,4 +1012,456 @@ VALUES (@QueueItemOneId, @LoserOneId, @TrackRequestOneId, @PlaylistItemOneId, 'p
                 Assert.That(reader.GetInt64(8), Is.EqualTo(2L), "PlaybackQueue rows must be rewired to the winner.")
                 Assert.That(reader.GetInt64(9), Is.EqualTo(2L), "TrackRequests must be rewired to the winner.")
                 Assert.That(reader.GetInt64(10), Is.EqualTo(2L), "Loser Tracks must be soft deleted.")
+            })
+
+    [<Test>]
+    let ``202607100004 retains the oldest active scan per backend and fences later active duplicates`` () =
+        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
+            task {
+                withMigrationRunner connectionString (fun runner -> runner.MigrateDown(202607100003L))
+
+                let backendId = Guid.Parse("00000000-0000-0000-0000-000000000401")
+                let defaultWinnerId = Guid.Parse("00000000-0000-0000-0000-000000000402")
+                let defaultLoserId = Guid.Parse("00000000-0000-0000-0000-000000000403")
+                let backendWinnerId = Guid.Parse("00000000-0000-0000-0000-000000000404")
+                let backendLoserId = Guid.Parse("00000000-0000-0000-0000-000000000405")
+                let requestedAtUtc = DateTimeOffset(2026, 7, 10, 8, 0, 0, TimeSpan.Zero)
+
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+
+                use seed =
+                    new NpgsqlCommand(
+                        """INSERT INTO "StorageBackends" ("Id", "Name", "Type", "S3Bucket", "IsEnabled", "IsDeleted")
+VALUES (@BackendId, 'migration-scan-backend', 'S3', 'migration-bucket', true, false);
+INSERT INTO "LibraryScanJobs" ("Id", "StorageBackendId", "Status", "RequestedAtUtc", "CreatedAtUtc", "UpdatedAtUtc", "IsDeleted")
+VALUES (@DefaultWinnerId, NULL, 'Queued', @DefaultWinnerRequestedAtUtc, @DefaultWinnerRequestedAtUtc, @DefaultWinnerRequestedAtUtc, false),
+       (@DefaultLoserId, NULL, 'Running', @DefaultLoserRequestedAtUtc, @DefaultLoserRequestedAtUtc, @DefaultLoserRequestedAtUtc, false),
+       (@BackendWinnerId, @BackendId, 'Running', @BackendWinnerRequestedAtUtc, @BackendWinnerRequestedAtUtc, @BackendWinnerRequestedAtUtc, false),
+       (@BackendLoserId, @BackendId, 'Queued', @BackendLoserRequestedAtUtc, @BackendLoserRequestedAtUtc, @BackendLoserRequestedAtUtc, false);""",
+                        connection
+                    )
+
+                [ "BackendId", box backendId
+                  "DefaultWinnerId", box defaultWinnerId
+                  "DefaultLoserId", box defaultLoserId
+                  "BackendWinnerId", box backendWinnerId
+                  "BackendLoserId", box backendLoserId
+                  "DefaultWinnerRequestedAtUtc", box requestedAtUtc
+                  "DefaultLoserRequestedAtUtc", box (requestedAtUtc.AddMinutes(1.0))
+                  "BackendWinnerRequestedAtUtc", box (requestedAtUtc.AddMinutes(2.0))
+                  "BackendLoserRequestedAtUtc", box (requestedAtUtc.AddMinutes(3.0)) ]
+                |> List.iter (fun (name, value) -> seed.Parameters.AddWithValue(name, value) |> ignore)
+
+                let! _ = seed.ExecuteNonQueryAsync()
+                withMigrationRunner connectionString (fun runner -> runner.MigrateUp())
+
+                use normalized =
+                    new NpgsqlCommand(
+                        """SELECT "Id", "Status", "FailureReason"
+FROM "LibraryScanJobs"
+WHERE "Id" IN (@DefaultWinnerId, @DefaultLoserId, @BackendWinnerId, @BackendLoserId)
+ORDER BY "Id";""",
+                        connection
+                    )
+
+                [ "DefaultWinnerId", box defaultWinnerId
+                  "DefaultLoserId", box defaultLoserId
+                  "BackendWinnerId", box backendWinnerId
+                  "BackendLoserId", box backendLoserId ]
+                |> List.iter (fun (name, value) -> normalized.Parameters.AddWithValue(name, value) |> ignore)
+
+                let! reader = normalized.ExecuteReaderAsync()
+                use reader = reader
+                let actual = ResizeArray<Guid * string * string option>()
+                let mutable hasRow = true
+
+                while hasRow do
+                    let! next = reader.ReadAsync()
+                    hasRow <- next
+
+                    if next then
+                        actual.Add(
+                            ( reader.GetGuid(0),
+                              reader.GetString(1),
+                              if reader.IsDBNull(2) then None else Some(reader.GetString(2)) )
+                        )
+
+                Assert.That(
+                    Set.ofSeq actual,
+                    Is.EqualTo(
+                        Set.ofList
+                            [ defaultWinnerId, "Queued", None
+                              defaultLoserId, "Failed", Some "superseded by migration"
+                              backendWinnerId, "Running", None
+                              backendLoserId, "Failed", Some "superseded by migration" ]
+                        :> obj
+                    ),
+                    "Migration normalization must retain the oldest active scan in each null/non-null backend partition and fail every later duplicate."
+                )
+                reader.Dispose()
+
+                let insertActiveJob jobId storageBackendId =
+                    task {
+                        use insert =
+                            new NpgsqlCommand(
+                                """INSERT INTO "LibraryScanJobs" ("Id", "StorageBackendId", "Status", "DiscoveredCount", "RequestedAtUtc", "IsDeleted")
+VALUES (@Id, @StorageBackendId, 'Queued', 0, @RequestedAtUtc, false);""",
+                                connection
+                            )
+
+                        insert.Parameters.AddWithValue("Id", jobId) |> ignore
+
+                        match storageBackendId with
+                        | Some value -> insert.Parameters.AddWithValue("StorageBackendId", value) |> ignore
+                        | None -> insert.Parameters.AddWithValue("StorageBackendId", DBNull.Value) |> ignore
+
+                        insert.Parameters.AddWithValue("RequestedAtUtc", requestedAtUtc.AddHours(1.0)) |> ignore
+                        let! _ = insert.ExecuteNonQueryAsync()
+                        return ()
+                    }
+
+                do!
+                    assertPostgresViolation
+                        "23505"
+                        "A second active default-backend LibraryScanJob"
+                        (fun () -> insertActiveJob (Guid.Parse("00000000-0000-0000-0000-000000000406")) None)
+
+                do!
+                    assertPostgresViolation
+                        "23505"
+                        "A second active explicit-backend LibraryScanJob"
+                        (fun () -> insertActiveJob (Guid.Parse("00000000-0000-0000-0000-000000000407")) (Some backendId))
+            })
+
+    [<Test>]
+    let ``202607100004 normalizes playlist and donation singletons before enforcing active uniqueness`` () =
+        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
+            task {
+                withMigrationRunner connectionString (fun runner -> runner.MigrateDown(202607100003L))
+
+                let playlistWinnerId = Guid.Parse("00000000-0000-0000-0000-000000000501")
+                let playlistLoserOneId = Guid.Parse("00000000-0000-0000-0000-000000000502")
+                let playlistLoserTwoId = Guid.Parse("00000000-0000-0000-0000-000000000503")
+                let goalOldId = Guid.Parse("00000000-0000-0000-0000-000000000511")
+                let goalUpdatedWinnerId = Guid.Parse("00000000-0000-0000-0000-000000000512")
+                let goalCreatedWinnerId = Guid.Parse("00000000-0000-0000-0000-000000000513")
+                let goalIdTieWinnerId = Guid.Parse("00000000-0000-0000-0000-000000000514")
+                let timestamp = DateTimeOffset(2026, 7, 10, 9, 0, 0, TimeSpan.Zero)
+
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+
+                use seed =
+                    new NpgsqlCommand(
+                        """INSERT INTO "Playlists" ("Id", "Name", "IsActive", "CreatedAtUtc", "UpdatedAtUtc", "IsDeleted")
+VALUES (@PlaylistWinnerId, 'migration playlist winner', true, @PlaylistWinnerCreatedAtUtc, @PlaylistWinnerCreatedAtUtc, false),
+       (@PlaylistLoserOneId, 'migration playlist loser one', true, @PlaylistLoserOneCreatedAtUtc, @PlaylistLoserOneCreatedAtUtc, false),
+       (@PlaylistLoserTwoId, 'migration playlist loser two', true, @PlaylistLoserTwoCreatedAtUtc, @PlaylistLoserTwoCreatedAtUtc, false);
+INSERT INTO "DonationGoals" ("Id", "Title", "GoalStars", "RaisedStars", "IsActive", "CreatedAtUtc", "UpdatedAtUtc", "IsDeleted")
+VALUES (@GoalOldId, 'migration goal old', 1, 0, true, @GoalOldCreatedAtUtc, @GoalOldUpdatedAtUtc, false),
+       (@GoalUpdatedWinnerId, 'migration goal updated winner', 1, 0, true, @GoalUpdatedWinnerCreatedAtUtc, @GoalUpdatedWinnerUpdatedAtUtc, false),
+       (@GoalCreatedWinnerId, 'migration goal created winner', 1, 0, true, @GoalCreatedWinnerCreatedAtUtc, @GoalCreatedWinnerUpdatedAtUtc, false),
+       (@GoalIdTieWinnerId, 'migration goal id winner', 1, 0, true, @GoalIdTieWinnerCreatedAtUtc, @GoalIdTieWinnerUpdatedAtUtc, false);""",
+                        connection
+                    )
+
+                [ "PlaylistWinnerId", box playlistWinnerId
+                  "PlaylistLoserOneId", box playlistLoserOneId
+                  "PlaylistLoserTwoId", box playlistLoserTwoId
+                  "GoalOldId", box goalOldId
+                  "GoalUpdatedWinnerId", box goalUpdatedWinnerId
+                  "GoalCreatedWinnerId", box goalCreatedWinnerId
+                  "GoalIdTieWinnerId", box goalIdTieWinnerId
+                  "PlaylistWinnerCreatedAtUtc", box timestamp
+                  "PlaylistLoserOneCreatedAtUtc", box (timestamp.AddMinutes(1.0))
+                  "PlaylistLoserTwoCreatedAtUtc", box (timestamp.AddMinutes(2.0))
+                  "GoalOldCreatedAtUtc", box timestamp
+                  "GoalOldUpdatedAtUtc", box timestamp
+                  "GoalUpdatedWinnerCreatedAtUtc", box timestamp
+                  "GoalUpdatedWinnerUpdatedAtUtc", box (timestamp.AddMinutes(1.0))
+                  "GoalCreatedWinnerCreatedAtUtc", box (timestamp.AddMinutes(1.0))
+                  "GoalCreatedWinnerUpdatedAtUtc", box (timestamp.AddMinutes(1.0))
+                  "GoalIdTieWinnerCreatedAtUtc", box (timestamp.AddMinutes(1.0))
+                  "GoalIdTieWinnerUpdatedAtUtc", box (timestamp.AddMinutes(1.0)) ]
+                |> List.iter (fun (name, value) -> seed.Parameters.AddWithValue(name, value) |> ignore)
+
+                let! _ = seed.ExecuteNonQueryAsync()
+                withMigrationRunner connectionString (fun runner -> runner.MigrateUp())
+
+                use normalized =
+                    new NpgsqlCommand(
+                        """SELECT 'playlist', "Id", "IsActive"
+FROM "Playlists"
+WHERE "Id" IN (@PlaylistWinnerId, @PlaylistLoserOneId, @PlaylistLoserTwoId)
+UNION ALL
+SELECT 'goal', "Id", "IsActive"
+FROM "DonationGoals"
+WHERE "Id" IN (@GoalOldId, @GoalUpdatedWinnerId, @GoalCreatedWinnerId, @GoalIdTieWinnerId);""",
+                        connection
+                    )
+
+                [ "PlaylistWinnerId", box playlistWinnerId
+                  "PlaylistLoserOneId", box playlistLoserOneId
+                  "PlaylistLoserTwoId", box playlistLoserTwoId
+                  "GoalOldId", box goalOldId
+                  "GoalUpdatedWinnerId", box goalUpdatedWinnerId
+                  "GoalCreatedWinnerId", box goalCreatedWinnerId
+                  "GoalIdTieWinnerId", box goalIdTieWinnerId ]
+                |> List.iter (fun (name, value) -> normalized.Parameters.AddWithValue(name, value) |> ignore)
+
+                let! reader = normalized.ExecuteReaderAsync()
+                use reader = reader
+                let actual = ResizeArray<string * Guid * bool>()
+                let mutable hasRow = true
+
+                while hasRow do
+                    let! next = reader.ReadAsync()
+                    hasRow <- next
+
+                    if next then
+                        actual.Add((reader.GetString(0), reader.GetGuid(1), reader.GetBoolean(2)))
+
+                Assert.That(
+                    Set.ofSeq actual,
+                    Is.EqualTo(
+                        Set.ofList
+                            [ "playlist", playlistWinnerId, true
+                              "playlist", playlistLoserOneId, false
+                              "playlist", playlistLoserTwoId, false
+                              "goal", goalOldId, false
+                              "goal", goalUpdatedWinnerId, false
+                              "goal", goalCreatedWinnerId, false
+                              "goal", goalIdTieWinnerId, true ]
+                        :> obj
+                    ),
+                    "Migration normalization must retain the oldest active Playlist and the newest DonationGoal by UpdatedAtUtc, CreatedAtUtc, and Id."
+                )
+
+                reader.Dispose()
+
+                let insertActivePlaylist () =
+                    task {
+                        use insert =
+                            new NpgsqlCommand(
+                                """INSERT INTO "Playlists" ("Id", "Name", "IsActive", "CreatedAtUtc", "UpdatedAtUtc", "IsDeleted")
+VALUES ('00000000-0000-0000-0000-000000000504', 'migration playlist uniqueness probe', true, @Timestamp, @Timestamp, false);""",
+                                connection
+                            )
+
+                        insert.Parameters.AddWithValue("Timestamp", timestamp.AddHours(1.0)) |> ignore
+                        let! _ = insert.ExecuteNonQueryAsync()
+                        return ()
+                    }
+
+                let insertActiveGoal () =
+                    task {
+                        use insert =
+                            new NpgsqlCommand(
+                                """INSERT INTO "DonationGoals" ("Id", "Title", "GoalStars", "RaisedStars", "IsActive", "CreatedAtUtc", "UpdatedAtUtc", "IsDeleted")
+VALUES ('00000000-0000-0000-0000-000000000515', 'migration goal uniqueness probe', 1, 0, true, @Timestamp, @Timestamp, false);""",
+                                connection
+                            )
+
+                        insert.Parameters.AddWithValue("Timestamp", timestamp.AddHours(1.0)) |> ignore
+                        let! _ = insert.ExecuteNonQueryAsync()
+                        return ()
+                    }
+
+                do! assertPostgresViolation "23505" "A second active Playlist" insertActivePlaylist
+                do! assertPostgresViolation "23505" "A second active DonationGoal" insertActiveGoal
+            })
+
+    [<Test>]
+    let ``202607100004 enforces active admin session identity and stream-control state invariants`` () =
+        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
+            task {
+                let userId = Guid.Parse("00000000-0000-0000-0000-000000000601")
+                let firstSessionId = Guid.Parse("00000000-0000-0000-0000-000000000602")
+                let controlStateId = Guid.Parse("00000000-0000-0000-0000-000000000603")
+                let paymentId = Guid.Parse("00000000-0000-0000-0000-000000000604")
+                let tokenHash = [| 1uy; 2uy; 3uy; 4uy |]
+                let timestamp = DateTimeOffset(2026, 7, 10, 10, 0, 0, TimeSpan.Zero)
+
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+
+                use seed =
+                    new NpgsqlCommand(
+                        """INSERT INTO "AdminUsers" ("Id", "Username", "NormalizedUsername", "PasswordHash", "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc")
+VALUES (@UserId, 'migration-admin', 'MIGRATION-ADMIN', 'hash', false, @Timestamp, @Timestamp);
+INSERT INTO "AdminSessions" ("Id", "UserId", "TokenHash", "CsrfToken", "ExpiresAtUtc", "RevokedAtUtc", "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc")
+VALUES (@FirstSessionId, @UserId, @TokenHash, 'csrf-token', @ExpiresAtUtc, NULL, false, @Timestamp, @Timestamp);
+INSERT INTO "StreamNodeControlState" ("Id", "SingletonKey", "DesiredState", "RestartGeneration", "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc")
+VALUES (@ControlStateId, 'primary', 'Running', 0, false, @Timestamp, @Timestamp);
+INSERT INTO "Payments" ("Id", "TelegramUserId", "PayerDisplayName", "Purpose", "AmountStars", "TelegramInvoicePayload", "Status", "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc")
+VALUES (@PaymentId, 77, 'migration payer snapshot', 'Donation', 1, 'migration-payer-display-name', 'InvoiceCreated', false, @Timestamp, @Timestamp);""",
+                        connection
+                    )
+
+                [ "UserId", box userId
+                  "FirstSessionId", box firstSessionId
+                  "ControlStateId", box controlStateId
+                  "PaymentId", box paymentId
+                  "TokenHash", box tokenHash
+                  "Timestamp", box timestamp
+                  "ExpiresAtUtc", box (timestamp.AddHours(8.0)) ]
+                |> List.iter (fun (name, value) -> seed.Parameters.AddWithValue(name, value) |> ignore)
+
+                let! _ = seed.ExecuteNonQueryAsync()
+
+                let insertUser id username normalizedUsername isDeleted =
+                    task {
+                        use insert =
+                            new NpgsqlCommand(
+                                """INSERT INTO "AdminUsers" ("Id", "Username", "NormalizedUsername", "PasswordHash", "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc")
+VALUES (@Id, @Username, @NormalizedUsername, 'hash', @IsDeleted, @Timestamp, @Timestamp);""",
+                                connection
+                            )
+
+                        insert.Parameters.AddWithValue("Id", id) |> ignore
+                        insert.Parameters.AddWithValue("Username", username) |> ignore
+                        insert.Parameters.AddWithValue("NormalizedUsername", normalizedUsername) |> ignore
+                        insert.Parameters.AddWithValue("IsDeleted", isDeleted) |> ignore
+                        insert.Parameters.AddWithValue("Timestamp", timestamp.AddMinutes(1.0)) |> ignore
+                        let! _ = insert.ExecuteNonQueryAsync()
+                        return ()
+                    }
+
+                let insertSession id sessionUserId sessionTokenHash =
+                    task {
+                        use insert =
+                            new NpgsqlCommand(
+                                """INSERT INTO "AdminSessions" ("Id", "UserId", "TokenHash", "CsrfToken", "ExpiresAtUtc", "RevokedAtUtc", "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc")
+VALUES (@Id, @UserId, @TokenHash, 'csrf-token', @ExpiresAtUtc, NULL, false, @Timestamp, @Timestamp);""",
+                                connection
+                            )
+
+                        insert.Parameters.AddWithValue("Id", id) |> ignore
+                        insert.Parameters.AddWithValue("UserId", sessionUserId) |> ignore
+                        insert.Parameters.AddWithValue("TokenHash", sessionTokenHash) |> ignore
+                        insert.Parameters.AddWithValue("ExpiresAtUtc", timestamp.AddHours(8.0)) |> ignore
+                        insert.Parameters.AddWithValue("Timestamp", timestamp.AddMinutes(1.0)) |> ignore
+                        let! _ = insert.ExecuteNonQueryAsync()
+                        return ()
+                    }
+
+                do!
+                    assertPostgresViolation
+                        "23505"
+                        "Two active AdminUsers with the same normalized username"
+                        (fun () ->
+                            insertUser
+                                (Guid.Parse("00000000-0000-0000-0000-000000000605"))
+                                "migration-admin-other-case"
+                                "MIGRATION-ADMIN"
+                                false)
+
+                do!
+                    assertPostgresViolation
+                        "23503"
+                        "An AdminSession whose UserId has no AdminUser"
+                        (fun () ->
+                            insertSession
+                                (Guid.Parse("00000000-0000-0000-0000-000000000606"))
+                                (Guid.Parse("00000000-0000-0000-0000-000000000699"))
+                                [| 9uy |])
+
+                do!
+                    assertPostgresViolation
+                        "23505"
+                        "Two active AdminSessions with the same token hash"
+                        (fun () ->
+                            insertSession
+                                (Guid.Parse("00000000-0000-0000-0000-000000000607"))
+                                userId
+                                tokenHash)
+
+                use revoke =
+                    new NpgsqlCommand(
+                        """UPDATE "AdminSessions"
+SET "RevokedAtUtc" = @RevokedAtUtc
+WHERE "Id" = @FirstSessionId;""",
+                        connection
+                    )
+
+                revoke.Parameters.AddWithValue("RevokedAtUtc", timestamp.AddMinutes(2.0)) |> ignore
+                revoke.Parameters.AddWithValue("FirstSessionId", firstSessionId) |> ignore
+                let! _ = revoke.ExecuteNonQueryAsync()
+
+                do!
+                    insertSession
+                        (Guid.Parse("00000000-0000-0000-0000-000000000608"))
+                        userId
+                        tokenHash
+
+                use sessionState =
+                    new NpgsqlCommand(
+                        """SELECT
+    count(*) FILTER (WHERE "RevokedAtUtc" IS NULL AND "IsDeleted" = false),
+    count(*) FILTER (WHERE "RevokedAtUtc" IS NOT NULL AND "IsDeleted" = false),
+    (SELECT "PayerDisplayName" FROM "Payments" WHERE "Id" = @PaymentId)
+FROM "AdminSessions"
+WHERE "UserId" = @UserId;""",
+                        connection
+                    )
+
+                sessionState.Parameters.AddWithValue("PaymentId", paymentId) |> ignore
+                sessionState.Parameters.AddWithValue("UserId", userId) |> ignore
+                let! reader = sessionState.ExecuteReaderAsync()
+                use reader = reader
+                let! hasRow = reader.ReadAsync()
+                Assert.That(hasRow, Is.True, "Session state verification must return one aggregate row.")
+                Assert.That(reader.GetInt64(0), Is.EqualTo(1L), "Revoking a session must release its token hash only for one replacement active session.")
+                Assert.That(reader.GetInt64(1), Is.EqualTo(1L), "The original session must remain auditable as revoked.")
+                Assert.That(reader.GetString(2), Is.EqualTo("migration payer snapshot"), "Payments must retain the payer display-name snapshot.")
+                reader.Dispose()
+
+                use deactivateControlState =
+                    new NpgsqlCommand(
+                        """UPDATE "StreamNodeControlState"
+SET "IsDeleted" = true
+WHERE "Id" = @ControlStateId;""",
+                        connection
+                    )
+
+                deactivateControlState.Parameters.AddWithValue("ControlStateId", controlStateId) |> ignore
+                let! _ = deactivateControlState.ExecuteNonQueryAsync()
+
+                let insertControlState id desiredState restartGeneration =
+                    task {
+                        use insert =
+                            new NpgsqlCommand(
+                                """INSERT INTO "StreamNodeControlState" ("Id", "SingletonKey", "DesiredState", "RestartGeneration", "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc")
+VALUES (@Id, 'primary', @DesiredState, @RestartGeneration, false, @Timestamp, @Timestamp);""",
+                                connection
+                            )
+
+                        insert.Parameters.AddWithValue("Id", id) |> ignore
+                        insert.Parameters.AddWithValue("DesiredState", desiredState) |> ignore
+                        insert.Parameters.AddWithValue("RestartGeneration", restartGeneration) |> ignore
+                        insert.Parameters.AddWithValue("Timestamp", timestamp.AddMinutes(3.0)) |> ignore
+                        let! _ = insert.ExecuteNonQueryAsync()
+                        return ()
+                    }
+
+                do!
+                    assertPostgresViolation
+                        "23514"
+                        "A StreamNodeControlState desired state outside Running|Stopped"
+                        (fun () -> insertControlState (Guid.Parse("00000000-0000-0000-0000-000000000609")) "Paused" 0)
+
+                do!
+                    assertPostgresViolation
+                        "23514"
+                        "A negative StreamNodeControlState restart generation"
+                        (fun () -> insertControlState (Guid.Parse("00000000-0000-0000-0000-000000000610")) "Running" -1)
+
+                do! insertControlState (Guid.Parse("00000000-0000-0000-0000-000000000611")) "Stopped" 2
+
+                do!
+                    assertPostgresViolation
+                        "23505"
+                        "A second active StreamNodeControlState singleton"
+                        (fun () -> insertControlState (Guid.Parse("00000000-0000-0000-0000-000000000612")) "Running" 3)
             })

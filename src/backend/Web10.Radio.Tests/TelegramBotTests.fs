@@ -91,6 +91,10 @@ module TelegramBotTests =
                 preCheckouts.Add { QueryId = queryId; ErrorMessage = errorMessage }
                 Task.FromResult preCheckoutResult
 
+            member _.GetUpdatesAsync(_offset, _timeoutSeconds, _) = Task.FromResult(Ok [||])
+
+            member _.DeleteWebhookAsync(_dropPendingUpdates, _) = Task.FromResult(Ok())
+
     type private CapturingLogger(entries: ConcurrentQueue<string>) =
         interface ILogger with
             member _.BeginScope<'TState>(_state: 'TState) : IDisposable = null
@@ -111,7 +115,8 @@ module TelegramBotTests =
           WebhookSecret = "test-webhook-secret"
           ChannelIdOrUsername = "@web10_test"
           RequestPriceStars = requestPrice
-          SayPriceStars = sayPrice }
+          SayPriceStars = sayPrice
+          UpdateMode = TelegramUpdateMode.Webhook }
 
     let private createWorkflow (connectionString: string) requestPrice sayPrice client adapter logger =
         let dataSource = NpgsqlDataSource.Create(connectionString)
@@ -137,12 +142,12 @@ module TelegramBotTests =
           CausationId = None
           PayloadJson = payloadJson }
 
-    let private interactionPayload updateId chatId userId languageCode command argument query text =
+    let private interactionPayloadWithDisplayName updateId chatId userId displayName languageCode command argument query text =
         JsonSerializer.Serialize(
             {| telegramUpdateId = updateId
                chatId = chatId
                telegramUserId = userId
-               displayName = "Test user"
+               displayName = displayName |> Option.toObj
                languageCode = languageCode |> Option.toObj
                command = command
                argument = argument |> Option.toObj
@@ -151,11 +156,26 @@ module TelegramBotTests =
                text = text |}
         )
 
+    let private interactionPayload updateId chatId userId languageCode command argument query text =
+        interactionPayloadWithDisplayName updateId chatId userId (Some "Test user") languageCode command argument query text
+
     let private callbackPayload updateId chatId userId languageCode queryId callbackData =
         JsonSerializer.Serialize(
             {| telegramUpdateId = updateId
                chatId = match chatId with | Some value -> Nullable value | None -> Nullable()
                telegramUserId = userId
+               languageCode = languageCode |> Option.toObj
+               callbackQueryId = queryId
+               rawCallbackData = callbackData
+               isPrivateChat = true |}
+        )
+
+    let private callbackPayloadWithDisplayName updateId chatId userId displayName languageCode queryId callbackData =
+        JsonSerializer.Serialize(
+            {| telegramUpdateId = updateId
+               chatId = match chatId with | Some value -> Nullable value | None -> Nullable()
+               telegramUserId = userId
+               displayName = displayName |> Option.toObj
                languageCode = languageCode |> Option.toObj
                callbackQueryId = queryId
                rawCallbackData = callbackData
@@ -513,4 +533,91 @@ VALUES (@DeletedLink, @TrackId, 'external', 'https://deleted.example', true, tru
                 Assert.That(logs, Does.Not.Contain "\"paymentId\"")
                 Assert.That(logs, Does.Not.Contain "\"providerToken\"")
                 Assert.That(logs, Does.Not.Contain "Публикация сообщения на экране Web10.Radio.")
+            })
+
+    [<Test>]
+    let ``request callback actor and say message preserve distinct payer display-name snapshots in payment orders`` () =
+        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
+            task {
+                let trackId = Guid.Parse("70000000-0000-0000-0000-000000000001")
+                let requestId = Guid.Parse("70000000-0000-0000-0000-000000000002")
+                let sayId = Guid.Parse("70000000-0000-0000-0000-000000000003")
+                let userId = 700L
+                let requestMessageSnapshot = "Request message snapshot"
+                let callbackActorSnapshot = "Callback actor snapshot"
+                let sayMessageSnapshot = "Say message snapshot"
+                do! seedTrack connectionString trackId requestMessageSnapshot "Snapshot artist" false
+
+                let client = CapturingTelegramClient()
+                let adapter = TestAdapterState()
+                let dataSource, workflow = createWorkflow connectionString 100 50 client adapter NullLogger<TelegramBotWorkflow>.Instance
+                use dataSource = dataSource
+
+                let requestPayload =
+                    interactionPayloadWithDisplayName
+                        1L
+                        userId
+                        userId
+                        (Some requestMessageSnapshot)
+                        (Some "en")
+                        "/request"
+                        None
+                        requestMessageSnapshot
+                        ""
+
+                let! requested = workflow.HandleInteractionAsync(envelope requestId TrackRequested requestPayload, CancellationToken.None)
+                assertOk "matched request with its message snapshot" requested
+
+                let confirmation =
+                    match TelegramCallback.encode (TelegramCallback.RequestConfirm requestId) with
+                    | Ok value -> value
+                    | Error error -> Assert.Fail(sprintf "%A" error); String.Empty
+
+                let confirmationPayload =
+                    callbackPayloadWithDisplayName
+                        2L
+                        (Some userId)
+                        userId
+                        (Some callbackActorSnapshot)
+                        (Some "en")
+                        "snapshot-confirmation"
+                        confirmation
+
+                let! confirmed =
+                    workflow.HandleInteractionAsync(
+                        envelope (Guid.Parse("70000000-0000-0000-0000-000000000004")) TelegramCallbackReceived confirmationPayload,
+                        CancellationToken.None
+                    )
+
+                assertOk "request confirmation with the callback actor snapshot" confirmed
+
+                let sayPayload =
+                    interactionPayloadWithDisplayName
+                        3L
+                        userId
+                        userId
+                        (Some sayMessageSnapshot)
+                        (Some "en")
+                        "/say"
+                        None
+                        ""
+                        "persist this display name with the payment"
+
+                let! said = workflow.HandleInteractionAsync(envelope sayId SayMessageSubmitted sayPayload, CancellationToken.None)
+                assertOk "say payment with its message snapshot" said
+
+                let! requestPayerDisplayName =
+                    scalarString
+                        connectionString
+                        "SELECT \"PayerDisplayName\" FROM \"Payments\" WHERE \"Purpose\" = 'Request' AND \"PurposeEntityId\" = @Id AND \"IsDeleted\" = false;"
+                        [ "Id", box requestId ]
+
+                let! sayPayerDisplayName =
+                    scalarString
+                        connectionString
+                        "SELECT \"PayerDisplayName\" FROM \"Payments\" WHERE \"Purpose\" = 'Say' AND \"PurposeEntityId\" = @Id AND \"IsDeleted\" = false;"
+                        [ "Id", box sayId ]
+
+                Assert.That(requestPayerDisplayName, Is.EqualTo(callbackActorSnapshot), "The request payment must snapshot the confirming callback actor, not the earlier request message identity.")
+                Assert.That(sayPayerDisplayName, Is.EqualTo(sayMessageSnapshot), "The say payment must snapshot the submitted message actor.")
             })

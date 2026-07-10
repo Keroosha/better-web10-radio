@@ -1,53 +1,244 @@
-import type { ReactElement } from 'react';
+import { useEffect, useRef, useState, type FormEvent, type ReactElement } from 'react';
 
-import { getSocialLinks, type SocialLink } from '@web10/shared';
+import {
+  ApiError,
+  getSocialLinks,
+  replaceSocialLinks,
+  SocialKindSchema,
+  type SocialKind,
+  type SocialLink,
+} from '@web10/shared';
 
 import { useApiResource } from '../../shared/lib/useApiResource';
 import { ResourceView } from '../../shared/ui/ResourceView';
 
 const loadSocialLinks = (): Promise<SocialLink[]> => getSocialLinks();
+const socialKinds: readonly SocialKind[] = ['telegram', 'youtube', 'instagram', 'discord', 'external'];
 
-/**
- * Social links — read-only. `GET /api/v0/admin/social-links` is implemented; the `PUT`
- * is still `501 admin.contract_unpinned`, so editing is disabled until the backend pins
- * the request body (F4 follow-up).
- */
+type SocialLinkReplacement = Parameters<typeof replaceSocialLinks>[0][number];
+
+interface SocialLinkDraft {
+  readonly draftKey: string;
+  readonly label: string;
+  readonly id: string | null;
+  readonly kind: SocialKind;
+  readonly name: string;
+  readonly handle: string;
+  readonly url: string;
+  readonly glyph: string;
+  readonly color: string;
+  readonly qrImageUrl: string;
+  readonly isFeatured: boolean;
+}
+
+function draftFromLink(link: SocialLink, draftKey: string): SocialLinkDraft {
+  return {
+    draftKey,
+    label: link.name || 'social link',
+    id: link.id,
+    kind: link.kind,
+    name: link.name,
+    handle: link.handle ?? '',
+    url: link.url,
+    glyph: link.glyph ?? '',
+    color: link.color ?? '',
+    qrImageUrl: link.qrImageUrl ?? '',
+    isFeatured: link.isFeatured,
+  };
+}
+
+function newDraft(draftKey: string): SocialLinkDraft {
+  return {
+    draftKey,
+    label: 'new social link',
+    id: null,
+    kind: 'external',
+    name: '',
+    handle: '',
+    url: '',
+    glyph: '',
+    color: '',
+    qrImageUrl: '',
+    isFeatured: false,
+  };
+}
+
+/** Maintains the complete, ordered replace-all social-link collection. */
 export function SocialLinksPage(): ReactElement {
   const resource = useApiResource(loadSocialLinks);
+  const [drafts, setDrafts] = useState<SocialLinkDraft[]>([]);
+  const [savedLinks, setSavedLinks] = useState<SocialLink[] | null>(null);
+  const [saveError, setSaveError] = useState<Error | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
+  const nextDraftKey = useRef(0);
+
+  useEffect(() => {
+    if (resource.status === 'ready') {
+      setDrafts(resource.data.map((link, index) => draftFromLink(link, `existing-${link.id}-${index}`)));
+    }
+  }, [resource]);
+
+  const updateDraft = (draftKey: string, update: Partial<Omit<SocialLinkDraft, 'draftKey' | 'label'>>): void => {
+    setDrafts((currentDrafts) =>
+      currentDrafts.map((draft) => (draft.draftKey === draftKey ? { ...draft, ...update } : draft)),
+    );
+  };
+
+  const moveDraft = (draftKey: string, direction: -1 | 1): void => {
+    setDrafts((currentDrafts) => {
+      const index = currentDrafts.findIndex((draft) => draft.draftKey === draftKey);
+      const targetIndex = index + direction;
+      if (index < 0 || targetIndex < 0 || targetIndex >= currentDrafts.length) {
+        return currentDrafts;
+      }
+      const reordered = [...currentDrafts];
+      const movingDraft = reordered[index];
+      const targetDraft = reordered[targetIndex];
+      if (movingDraft === undefined || targetDraft === undefined) {
+        return currentDrafts;
+      }
+      reordered[index] = targetDraft;
+      reordered[targetIndex] = movingDraft;
+      return reordered;
+    });
+  };
+
+  const saveLinks = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
+    event.preventDefault();
+    if (isSaving) {
+      return;
+    }
+    if (drafts.length > 50) {
+      setSaveError(new Error('At most 50 social links may be saved.'));
+      return;
+    }
+
+    const replacement: SocialLinkReplacement[] = [];
+    for (const draft of drafts) {
+      const name = draft.name.trim();
+      const url = draft.url.trim();
+      const color = draft.color.trim();
+      if (name.length === 0 || name.length > 120) {
+        setSaveError(new Error('Each social link needs a name containing 1–120 characters.'));
+        return;
+      }
+      let parsedUrl: URL;
+      try {
+        parsedUrl = new URL(url);
+      } catch {
+        setSaveError(new Error('Each social link URL must be an absolute http or https URL.'));
+        return;
+      }
+      if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+        setSaveError(new Error('Each social link URL must be an absolute http or https URL.'));
+        return;
+      }
+      if (color.length > 0 && !/^#[0-9a-fA-F]{6}$/.test(color)) {
+        setSaveError(new Error('Color must be #RRGGBB when supplied.'));
+        return;
+      }
+      replacement.push({
+        id: draft.id,
+        kind: draft.kind,
+        name,
+        handle: draft.handle.trim() || null,
+        url: parsedUrl.href,
+        glyph: draft.glyph.trim() || null,
+        color: color || null,
+        qrImageUrl: draft.qrImageUrl.trim() || null,
+        isFeatured: draft.isFeatured,
+      });
+    }
+
+    setIsSaving(true);
+    setSaveError(null);
+    setSavedLinks(null);
+    try {
+      const canonicalLinks = await replaceSocialLinks(replacement);
+      setSavedLinks(canonicalLinks);
+      setDrafts(canonicalLinks.map((link, index) => draftFromLink(link, `existing-${link.id}-${index}`)));
+    } catch (cause) {
+      setSaveError(cause instanceof Error ? cause : new Error('Unable to save social links.'));
+    } finally {
+      setIsSaving(false);
+    }
+  };
 
   return (
     <section>
       <h2 style={{ fontSize: '16px' }}>Social links</h2>
-      <p style={{ fontSize: '12px', opacity: 0.7 }}>
-        Read-only — editing (PUT) lands once the backend pins the admin contract.
-      </p>
       <ResourceView resource={resource}>
-        {(links) =>
-          links.length === 0 ? (
-            <p style={{ opacity: 0.7 }}>No social links configured.</p>
-          ) : (
-            <table style={{ borderCollapse: 'collapse', width: '100%', maxWidth: '640px' }}>
-              <thead>
-                <tr style={{ textAlign: 'left', borderBottom: '2px solid #ddd' }}>
-                  <th style={{ padding: '6px' }}>Kind</th>
-                  <th style={{ padding: '6px' }}>Name</th>
-                  <th style={{ padding: '6px' }}>Handle</th>
-                  <th style={{ padding: '6px' }}>Featured</th>
-                </tr>
-              </thead>
-              <tbody>
-                {links.map((link) => (
-                  <tr key={link.id} style={{ borderBottom: '1px solid #eee' }}>
-                    <td style={{ padding: '6px' }}>{link.kind}</td>
-                    <td style={{ padding: '6px' }}>{link.name}</td>
-                    <td style={{ padding: '6px' }}>{link.handle}</td>
-                    <td style={{ padding: '6px' }}>{link.isFeatured ? '★' : ''}</td>
+        {(loadedLinks) => (
+          <form onSubmit={saveLinks} style={{ maxWidth: '900px' }}>
+            {loadedLinks.length === 0 && drafts.length === 0 ? (
+              <p style={{ opacity: 0.7 }}>No social links configured.</p>
+            ) : null}
+            {drafts.length > 0 ? (
+              <table style={{ borderCollapse: 'collapse', width: '100%' }}>
+                <thead>
+                  <tr style={{ textAlign: 'left', borderBottom: '2px solid #ddd' }}>
+                    <th style={{ padding: '6px' }}>Kind</th>
+                    <th style={{ padding: '6px' }}>Details</th>
+                    <th style={{ padding: '6px' }}>Order</th>
+                    <th style={{ padding: '6px' }}>Actions</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          )
-        }
+                </thead>
+                <tbody>
+                  {drafts.map((draft, index) => (
+                    <tr key={draft.draftKey} style={{ borderBottom: '1px solid #eee', verticalAlign: 'top' }}>
+                      <td style={{ padding: '6px' }}>
+                        <label htmlFor={`kind-${draft.draftKey}`}>Kind for {draft.label}</label>
+                        <select
+                          id={`kind-${draft.draftKey}`}
+                          value={draft.kind}
+                          onChange={(event) => {
+                            const parsedKind = SocialKindSchema.safeParse(event.currentTarget.value);
+                            if (parsedKind.success) {
+                              updateDraft(draft.draftKey, { kind: parsedKind.data });
+                            }
+                          }}
+                          disabled={isSaving}
+                        >
+                          {socialKinds.map((kind) => <option key={kind} value={kind}>{kind}</option>)}
+                        </select>
+                      </td>
+                      <td style={{ padding: '6px' }}>
+                        <p>{draft.name}</p>
+                        <label htmlFor={`name-${draft.draftKey}`}>Name for {draft.label}</label>
+                        <input id={`name-${draft.draftKey}`} value={draft.name} onChange={(event) => updateDraft(draft.draftKey, { name: event.currentTarget.value })} disabled={isSaving} />
+                        <label htmlFor={`handle-${draft.draftKey}`}>Handle for {draft.label}</label>
+                        <input id={`handle-${draft.draftKey}`} value={draft.handle} onChange={(event) => updateDraft(draft.draftKey, { handle: event.currentTarget.value })} disabled={isSaving} />
+                        <label htmlFor={`url-${draft.draftKey}`}>URL for {draft.label}</label>
+                        <input id={`url-${draft.draftKey}`} value={draft.url} onChange={(event) => updateDraft(draft.draftKey, { url: event.currentTarget.value })} disabled={isSaving} />
+                        <label htmlFor={`glyph-${draft.draftKey}`}>Glyph for {draft.label}</label>
+                        <input id={`glyph-${draft.draftKey}`} value={draft.glyph} onChange={(event) => updateDraft(draft.draftKey, { glyph: event.currentTarget.value })} disabled={isSaving} />
+                        <label htmlFor={`color-${draft.draftKey}`}>Color for {draft.label}</label>
+                        <input id={`color-${draft.draftKey}`} value={draft.color} onChange={(event) => updateDraft(draft.draftKey, { color: event.currentTarget.value })} disabled={isSaving} />
+                        <label htmlFor={`qr-${draft.draftKey}`}>QR image URL for {draft.label}</label>
+                        <input id={`qr-${draft.draftKey}`} value={draft.qrImageUrl} onChange={(event) => updateDraft(draft.draftKey, { qrImageUrl: event.currentTarget.value })} disabled={isSaving} />
+                        <label htmlFor={`featured-${draft.draftKey}`}>
+                          <input id={`featured-${draft.draftKey}`} type="checkbox" checked={draft.isFeatured} onChange={(event) => updateDraft(draft.draftKey, { isFeatured: event.currentTarget.checked })} disabled={isSaving} />
+                          Featured
+                        </label>
+                      </td>
+                      <td style={{ padding: '6px' }}>
+                        <button type="button" aria-label={`Move ${draft.label} up`} onClick={() => moveDraft(draft.draftKey, -1)} disabled={isSaving || index === 0}>↑</button>
+                        <button type="button" aria-label={`Move ${draft.label} down`} onClick={() => moveDraft(draft.draftKey, 1)} disabled={isSaving || index === drafts.length - 1}>↓</button>
+                      </td>
+                      <td style={{ padding: '6px' }}>
+                        <button type="button" aria-label={`Remove ${draft.label}`} onClick={() => setDrafts((currentDrafts) => currentDrafts.filter((currentDraft) => currentDraft.draftKey !== draft.draftKey))} disabled={isSaving}>Remove</button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ) : null}
+            <button type="button" onClick={() => { const draftKey = `new-${nextDraftKey.current}`; nextDraftKey.current += 1; setDrafts((currentDrafts) => [...currentDrafts, newDraft(draftKey)]); }} disabled={isSaving || drafts.length >= 50} style={{ marginTop: '12px' }}>Add social link</button>
+            <button type="submit" disabled={isSaving} style={{ marginLeft: '8px' }}>{isSaving ? 'Saving…' : 'Save social links'}</button>
+            {saveError !== null ? <p role="alert" style={{ color: '#b00020' }}>{saveError instanceof ApiError && saveError.code !== null ? saveError.code : saveError.message}</p> : null}
+            {savedLinks !== null ? <p>Saved</p> : null}
+          </form>
+        )}
       </ResourceView>
     </section>
   );

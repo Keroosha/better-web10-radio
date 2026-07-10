@@ -55,16 +55,16 @@ module TelegramCommandRepository =
 
     let private activeOrderForPurpose (connection: NpgsqlConnection) (transaction: NpgsqlTransaction) (purpose: string) (entityId: Guid) (cancellationToken: CancellationToken) =
         task {
-            use command = new NpgsqlCommand("SELECT \"Id\", \"TelegramUserId\", \"AmountStars\", \"TelegramInvoicePayload\" FROM \"Payments\" WHERE \"Purpose\" = @Purpose AND \"PurposeEntityId\" = @EntityId AND \"IsDeleted\" = false FOR UPDATE;", connection, transaction)
+            use command = new NpgsqlCommand("SELECT \"Id\", \"TelegramUserId\", \"AmountStars\", \"TelegramInvoicePayload\", \"PayerDisplayName\" FROM \"Payments\" WHERE \"Purpose\" = @Purpose AND \"PurposeEntityId\" = @EntityId AND \"IsDeleted\" = false FOR UPDATE;", connection, transaction)
             command.Parameters.AddWithValue("Purpose", purpose) |> ignore
             command.Parameters.AddWithValue("EntityId", entityId) |> ignore
             use! reader = command.ExecuteReaderAsync(cancellationToken)
             let! found = reader.ReadAsync(cancellationToken)
-            return if found then Some(reader.GetGuid 0, reader.GetInt64 1, reader.GetInt32 2, reader.GetString 3) else None
+            return if found then Some(reader.GetGuid 0, reader.GetInt64 1, reader.GetInt32 2, reader.GetString 3, if reader.IsDBNull 4 then None else Some(reader.GetString 4)) else None
         }
 
-    let private orderFromExisting purpose entityId (id, userId, amount, payload) =
-        { Id = id; TelegramUserId = userId; Purpose = purpose; PurposeEntityId = Some entityId; AmountStars = amount; InvoicePayload = payload; CreatedAtUtc = DateTimeOffset.MinValue }
+    let private orderFromExisting purpose entityId (id, userId, amount, payload, payerDisplayName) =
+        { Id = id; TelegramUserId = userId; Purpose = purpose; PurposeEntityId = Some entityId; AmountStars = amount; InvoicePayload = payload; PayerDisplayName = payerDisplayName; CreatedAtUtc = DateTimeOffset.MinValue }
 
     let tryGetActiveOrderForPurposeInTransaction
         (connection: NpgsqlConnection)

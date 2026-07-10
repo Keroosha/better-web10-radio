@@ -12,7 +12,11 @@
     <Compile Include="Migrations\DurableWorkflowFencing.fs" />
     <Compile Include="Migrations\TrackDuplicateCleanup.fs" />
     <Compile Include="Migrations\TelegramBotPayments.fs" />
+    <Compile Include="Migrations\FrontendBlockers.fs" />
     <Compile Include="Repositories\RepositoryError.fs" />
+    <Compile Include="Repositories\AdminIdentityRepository.fs" />
+    <Compile Include="Repositories\AdminContentRepository.fs" />
+    <Compile Include="Repositories\StreamNodeControlRepository.fs" />
     <Compile Include="Repositories\TrackRepository.fs" />
     <Compile Include="Repositories\OutboxEventRepository.fs" />
     <Compile Include="Repositories\TelegramUpdateInboxRepository.fs" />

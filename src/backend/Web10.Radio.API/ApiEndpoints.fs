@@ -23,19 +23,14 @@ open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Options
 open Microsoft.Extensions.Primitives
+open Microsoft.Extensions.Hosting
 open Npgsql
 open Web10.Radio.Database
 open Web10.Radio.Database.Repositories
 open Web10.Radio.Telegram
 
 [<RequireQualifiedAccess>]
-module AdminAuthentication =
-    [<Literal>]
-    let SchemeName = "Web10AdminBearer"
-
-    [<Literal>]
-    let PolicyName = "Web10Admin"
-
+module ApiSecurity =
     let fixedTimeEqualsUtf8 (expected: string) (actual: string) =
         let hash value =
             value
@@ -44,58 +39,6 @@ module AdminAuthentication =
             |> SHA256.HashData
 
         CryptographicOperations.FixedTimeEquals(hash expected, hash actual)
-
-type AdminBearerAuthenticationHandler
-    (
-        options: IOptionsMonitor<AuthenticationSchemeOptions>,
-        loggerFactory: ILoggerFactory,
-        encoder: UrlEncoder,
-        adminOptions: AdminOptions,
-        contextAccessor: IHttpContextAccessor
-    ) =
-    inherit AuthenticationHandler<AuthenticationSchemeOptions>(options, loggerFactory, encoder)
-
-    override this.HandleAuthenticateAsync() =
-        let mutable values = StringValues()
-
-        let result =
-            if not (this.Request.Headers.TryGetValue("Authorization", &values)) || values.Count <> 1 then
-                AuthenticateResult.NoResult()
-            else
-                let authorization = values[0]
-                let prefix = "Bearer "
-
-                if isNull authorization
-                   || authorization.Contains(',', StringComparison.Ordinal)
-                   || not (authorization.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) then
-                    AuthenticateResult.Fail("A single bearer admin token is required.")
-                else
-                    let suppliedToken = authorization.Substring(prefix.Length)
-
-                    if String.IsNullOrEmpty suppliedToken || not (AdminAuthentication.fixedTimeEqualsUtf8 adminOptions.Token suppliedToken) then
-                        AuthenticateResult.Fail("The bearer admin token is invalid.")
-                    else
-                        let identity = ClaimsIdentity([| Claim(ClaimTypes.NameIdentifier, "admin") |], this.Scheme.Name)
-                        let principal = ClaimsPrincipal(identity)
-                        AuthenticateResult.Success(AuthenticationTicket(principal, this.Scheme.Name))
-
-        Task.FromResult(result)
-
-    override this.HandleChallengeAsync(properties) =
-        task {
-            let context = contextAccessor.HttpContext
-            context.Response.Headers.WWWAuthenticate <- "Bearer"
-
-            do!
-                ApiProblems.write
-                    context
-                    StatusCodes.Status401Unauthorized
-                    "admin.auth.required"
-                    "Admin authentication required"
-                    "A valid bearer admin token is required."
-        }
-        :> Task
-
 [<RequireQualifiedAccess>]
 module StreamNodeAuthentication =
     [<Literal>]
@@ -132,7 +75,7 @@ type StreamNodeBearerAuthenticationHandler
                     let suppliedToken = authorization.Substring(prefix.Length)
 
                     if String.IsNullOrEmpty suppliedToken
-                       || not (AdminAuthentication.fixedTimeEqualsUtf8 streamOptions.CallbackToken suppliedToken) then
+                       || not (ApiSecurity.fixedTimeEqualsUtf8 streamOptions.CallbackToken suppliedToken) then
                         AuthenticateResult.Fail("The bearer stream-node token is invalid.")
                     else
                         let identity = ClaimsIdentity([| Claim(ClaimTypes.NameIdentifier, "stream-node") |], this.Scheme.Name)
@@ -279,25 +222,42 @@ type private PlayerEvents(dataSource: NpgsqlDataSource, clock: IClock, delay: IP
 
             PlayerEventsEnumerator(dataSource, clock, delay, cancellationToken) :> IAsyncEnumerator<SseItem<JsonElement>>
 
+/// Result of routing a single parsed Telegram update through the shared ingestion path.
+/// Both the webhook endpoint and the long-polling worker consume this: the webhook maps
+/// it to an HTTP status, the worker maps it to logging + offset-advance decisions.
+type TelegramUpdateProcessingOutcome =
+    | TelegramUpdateAccepted
+    | TelegramUpdateRejected of message: string
+    | TelegramPreCheckoutUnavailable of error: BackgroundWorkerError
+    | TelegramIngestFailed of error: BackgroundWorkerError
+
 [<RequireQualifiedAccess>]
 module ApiEndpoints =
-    let addApiServices (adminOptions: AdminOptions) (streamOptions: StreamOptions) (services: IServiceCollection) : IServiceCollection =
-        services.AddSingleton<AdminOptions>(adminOptions) |> ignore
-        services.AddSingleton<StreamOptions>(streamOptions) |> ignore
-        services.AddSingleton<IPlayerEventsDelay, PlayerEventsDelay>() |> ignore
+    let addApiServices
+        (adminOptions: AdminOptions)
+        (developmentFixturesEnabled: bool)
+        (streamOptions: StreamOptions)
+        (services: IServiceCollection)
+        : IServiceCollection =
+        services
+        |> AdminIdentityComposition.addAdminIdentityServices adminOptions developmentFixturesEnabled
+        |> ignore
         services.AddHttpContextAccessor() |> ignore
 
+        services.AddSingleton<StreamOptions>(streamOptions) |> ignore
+        services.AddSingleton<IPlayerEventsDelay, PlayerEventsDelay>() |> ignore
+
         services
-            .AddAuthentication(AdminAuthentication.SchemeName)
-            .AddScheme<AuthenticationSchemeOptions, AdminBearerAuthenticationHandler>(AdminAuthentication.SchemeName, ignore)
+            .AddAuthentication(AdminSessionAuthentication.SchemeName)
+            .AddScheme<AuthenticationSchemeOptions, AdminSessionAuthenticationHandler>(AdminSessionAuthentication.SchemeName, ignore)
             .AddScheme<AuthenticationSchemeOptions, StreamNodeBearerAuthenticationHandler>(StreamNodeAuthentication.SchemeName, ignore)
         |> ignore
 
         services.AddAuthorization(fun authorizationOptions ->
             authorizationOptions.AddPolicy(
-                AdminAuthentication.PolicyName,
+                AdminSessionAuthentication.PolicyName,
                 fun policy ->
-                    policy.AddAuthenticationSchemes(AdminAuthentication.SchemeName) |> ignore
+                    policy.AddAuthenticationSchemes(AdminSessionAuthentication.SchemeName) |> ignore
                     policy.RequireAuthenticatedUser() |> ignore
             )
 
@@ -365,13 +325,6 @@ module ApiEndpoints =
             "Stream unavailable"
             "Stream is offline"
 
-    let private adminContractUnpinned context =
-        ApiProblems.write
-            context
-            StatusCodes.Status501NotImplemented
-            "admin.contract_unpinned"
-            "Admin contract not pinned"
-            "This admin route is listed in SPEC but its request/response body is not pinned yet."
 
     let private playerState (context: HttpContext) =
         task {
@@ -728,6 +681,151 @@ module ApiEndpoints =
             return if total > maximumBytes then None else Some total
         }
 
+    type private BoundedJsonBody =
+        | BodyTooLarge
+        | BodyInvalid
+        | BodyParsed of JsonElement
+
+    let private readJsonBody maximumBytes (context: HttpContext) =
+        task {
+            if context.Request.ContentLength.HasValue && context.Request.ContentLength.Value > int64 maximumBytes then
+                return BodyTooLarge
+            else
+                let buffer = ArrayPool<byte>.Shared.Rent(maximumBytes + 1)
+
+                use _bufferLease =
+                    { new IDisposable with
+                        member _.Dispose() = ArrayPool<byte>.Shared.Return(buffer, clearArray = true) }
+
+                let! length = readBoundedBody maximumBytes context buffer
+
+                match length with
+                | None -> return BodyTooLarge
+                | Some bodyLength ->
+                    try
+                        use document = JsonDocument.Parse(buffer.AsMemory(0, bodyLength))
+                        return BodyParsed(document.RootElement.Clone())
+                    with :? JsonException ->
+                        return BodyInvalid
+        }
+
+    let private hasExactProperties (expected: Set<string>) (root: JsonElement) =
+        root.ValueKind = JsonValueKind.Object
+        && (root.EnumerateObject() |> Seq.map _.Name |> Set.ofSeq) = expected
+
+    let private tryProperty (name: string) (root: JsonElement) =
+        let mutable value = Unchecked.defaultof<JsonElement>
+        if root.TryGetProperty(name, &value) then Some value else None
+
+    let private tryString (name: string) (root: JsonElement) =
+        match tryProperty name root with
+        | Some value when value.ValueKind = JsonValueKind.String ->
+            let text = value.GetString()
+            if isNull text then None else Some text
+        | _ -> None
+
+    let private tryNullableString (name: string) (root: JsonElement) =
+        match tryProperty name root with
+        | Some value when value.ValueKind = JsonValueKind.Null -> Some None
+        | Some value when value.ValueKind = JsonValueKind.String ->
+            let text = value.GetString()
+            if isNull text then None else Some(Some text)
+        | _ -> None
+
+    let private tryPositiveGuid (value: string) =
+        let mutable parsed = Guid.Empty
+        if Guid.TryParse(value, &parsed) && parsed <> Guid.Empty then Some parsed else None
+
+    let private writeRequestTooLarge context =
+        ApiProblems.write context StatusCodes.Status413PayloadTooLarge "request.too_large" "Request body too large" "Request body exceeds the maximum allowed size."
+
+    let private writeRepositoryFailure context =
+        ApiProblems.write context StatusCodes.Status500InternalServerError "repository.write_failed" "Repository write failed" "The requested change could not be persisted."
+
+    let private writeDomainProblem context status code title message =
+        ApiProblems.write context status code title message
+
+    let private parseGuidRoute routeValue (context: HttpContext) =
+        match context.Request.RouteValues[routeValue] with
+        | null -> None
+        | value -> tryPositiveGuid (string value)
+
+    let private toScanStatusDto (job: LibraryScanJobStatusRecord) : LibraryScanStatusDto =
+        { ScanJobId = job.Id.ToString("D")
+          Status = job.Status.ToLowerInvariant()
+          DiscoveredCount = job.DiscoveredCount
+          RequestedAtUtc = ApiTime.toIsoUtc job.RequestedAtUtc
+          StartedAtUtc = job.StartedAtUtc |> Option.map ApiTime.toIsoUtc |> Option.defaultValue null
+          FinishedAtUtc = job.FinishedAtUtc |> Option.map ApiTime.toIsoUtc |> Option.defaultValue null
+          FailureReason = job.FailureReason |> Option.defaultValue null }
+
+    let private toTrackDto (track: AdminTrack) : AdminTrackDto =
+        { Id = track.Id.ToString("D")
+          Title = track.Title
+          Artist = track.Artist
+          Album = track.Album
+          DurationMs = max 0 track.DurationMs
+          HasCachedFile = track.HasCachedFile }
+
+    let private toPlaylistDto (playlist: PlaylistSummary) : PlaylistSummaryDto =
+        { Id = playlist.Id.ToString("D")
+          Name = playlist.Name
+          Description = playlist.Description |> Option.defaultValue null
+          IsActive = playlist.IsActive
+          ItemCount = max 0 playlist.ItemCount }
+
+    let private toPlaylistItemDto (item: PlaylistItem) : PlaylistItemDto =
+        { Id = item.Id.ToString("D")
+          TrackId = item.TrackId.ToString("D")
+          Title = item.Title
+          Artist = item.Artist
+          Position = max 0 item.Position }
+
+    let private toControlDto (state: StreamNodeControlState) : StreamNodeControlDto =
+        { DesiredState = match state.DesiredState with | Running -> "running" | Stopped -> "stopped"
+          RestartGeneration = max 0 state.RestartGeneration }
+
+    /// Classify a parsed Telegram update and route it through the shared ingestion path
+    /// (synchronous pre-checkout workflow, or durable-event inbox deduped by (updateId, eventType)).
+    /// Reused verbatim by the webhook endpoint and the long-polling worker so payment/command
+    /// handling never forks. Records adapter-state progress/errors as a side effect.
+    let processTelegramUpdate (services: IServiceProvider) (update: Update) (cancellationToken: CancellationToken) : Task<TelegramUpdateProcessingOutcome> =
+        task {
+            let state = services.GetRequiredService<ITelegramAdapterState>()
+
+            match mapTelegramUpdate update with
+            | Error message ->
+                state.RecordError("request.invalid")
+                return TelegramUpdateRejected message
+            | Ok Ignored ->
+                state.RecordUpdate(update.UpdateId)
+                return TelegramUpdateAccepted
+            | Ok(PreCheckout preCheckout) ->
+                let workflow = services.GetRequiredService<ITelegramPreCheckoutWorkflow>()
+                let! result = workflow.HandleAsync preCheckout cancellationToken
+
+                match result with
+                | Ok() ->
+                    state.RecordUpdate(update.UpdateId)
+                    return TelegramUpdateAccepted
+                | Error error ->
+                    state.RecordError("telegram.pre_checkout_unavailable")
+                    return TelegramPreCheckoutUnavailable error
+            | Ok(DurableEvent event) ->
+                let ingestor = services.GetRequiredService<ITelegramUpdateEventIngestor>()
+
+                let! ingestResult =
+                    ingestor.TryIngestAsync update.UpdateId event.EventType "Web10.Radio.Telegram" event.PayloadJson cancellationToken
+
+                match ingestResult with
+                | Ok _ ->
+                    state.RecordUpdate(update.UpdateId)
+                    return TelegramUpdateAccepted
+                | Error error ->
+                    state.RecordError("telegram.webhook.ingest_failed")
+                    return TelegramIngestFailed error
+        }
+
     let private telegramWebhook (context: HttpContext) =
         task {
             let telegramOptions = context.RequestServices.GetRequiredService<TelegramOptions>()
@@ -745,7 +843,7 @@ module ApiEndpoints =
                         "Exactly one Telegram webhook secret token header is required."
 
                 return StatusCodes.Status401Unauthorized
-            | Some suppliedSecret when not (AdminAuthentication.fixedTimeEqualsUtf8 telegramOptions.WebhookSecret suppliedSecret) ->
+            | Some suppliedSecret when not (ApiSecurity.fixedTimeEqualsUtf8 telegramOptions.WebhookSecret suppliedSecret) ->
                 state.RecordError("telegram.webhook.secret_invalid")
                 do!
                     ApiProblems.write
@@ -800,66 +898,35 @@ module ApiEndpoints =
                                 do! ApiProblems.write context StatusCodes.Status400BadRequest "request.invalid" "Invalid request" message
                                 return StatusCodes.Status400BadRequest
                             | Ok update ->
-                                match mapTelegramUpdate update with
-                                | Error message ->
-                                    state.RecordError("request.invalid")
+                                let! outcome = processTelegramUpdate context.RequestServices update context.RequestAborted
+
+                                match outcome with
+                                | TelegramUpdateAccepted ->
+                                    context.Response.StatusCode <- StatusCodes.Status204NoContent
+                                    return StatusCodes.Status204NoContent
+                                | TelegramUpdateRejected message ->
                                     do! ApiProblems.write context StatusCodes.Status400BadRequest "request.invalid" "Invalid request" message
                                     return StatusCodes.Status400BadRequest
-                                | Ok mappedUpdate ->
-                                    match mappedUpdate with
-                                    | Ignored ->
-                                        state.RecordUpdate(update.UpdateId)
-                                        context.Response.StatusCode <- StatusCodes.Status204NoContent
-                                        return StatusCodes.Status204NoContent
-                                    | PreCheckout preCheckout ->
-                                        let workflow = context.RequestServices.GetRequiredService<ITelegramPreCheckoutWorkflow>()
-                                        let! result = workflow.HandleAsync preCheckout context.RequestAborted
+                                | TelegramPreCheckoutUnavailable error ->
+                                    do!
+                                        ApiProblems.write
+                                            context
+                                            StatusCodes.Status503ServiceUnavailable
+                                            "telegram.pre_checkout_unavailable"
+                                            "Telegram pre-checkout unavailable"
+                                            (BackgroundWorkerError.toMessage error)
 
-                                        match result with
-                                        | Ok () ->
-                                            state.RecordUpdate(update.UpdateId)
-                                            context.Response.StatusCode <- StatusCodes.Status204NoContent
-                                            return StatusCodes.Status204NoContent
-                                        | Error error ->
-                                            state.RecordError("telegram.pre_checkout_unavailable")
+                                    return StatusCodes.Status503ServiceUnavailable
+                                | TelegramIngestFailed error ->
+                                    do!
+                                        ApiProblems.write
+                                            context
+                                            StatusCodes.Status500InternalServerError
+                                            "telegram.webhook.ingest_failed"
+                                            "Telegram webhook failed"
+                                            (BackgroundWorkerError.toMessage error)
 
-                                            do!
-                                                ApiProblems.write
-                                                    context
-                                                    StatusCodes.Status503ServiceUnavailable
-                                                    "telegram.pre_checkout_unavailable"
-                                                    "Telegram pre-checkout unavailable"
-                                                    (BackgroundWorkerError.toMessage error)
-
-                                            return StatusCodes.Status503ServiceUnavailable
-                                    | DurableEvent event ->
-                                        let ingestor = context.RequestServices.GetRequiredService<ITelegramUpdateEventIngestor>()
-
-                                        let! ingestResult =
-                                            ingestor.TryIngestAsync
-                                                update.UpdateId
-                                                event.EventType
-                                                "Web10.Radio.Telegram"
-                                                event.PayloadJson
-                                                context.RequestAborted
-
-                                        match ingestResult with
-                                        | Ok _ ->
-                                            state.RecordUpdate(update.UpdateId)
-                                            context.Response.StatusCode <- StatusCodes.Status204NoContent
-                                            return StatusCodes.Status204NoContent
-                                        | Error error ->
-                                            state.RecordError("telegram.webhook.ingest_failed")
-
-                                            do!
-                                                ApiProblems.write
-                                                    context
-                                                    StatusCodes.Status500InternalServerError
-                                                    "telegram.webhook.ingest_failed"
-                                                    "Telegram webhook failed"
-                                                    (BackgroundWorkerError.toMessage error)
-
-                                            return StatusCodes.Status500InternalServerError
+                                    return StatusCodes.Status500InternalServerError
                     with error ->
                         state.RecordError("telegram.webhook.unhandled")
                         return raise error
@@ -1321,11 +1388,809 @@ module ApiEndpoints =
                     do! sayRequestInvalid context
                     return StatusCodes.Status400BadRequest
         }
+    let private adminAuthInvalid context =
+        writeDomainProblem context StatusCodes.Status400BadRequest "admin.auth.request_invalid" "Invalid admin authentication request" "The login request body is invalid."
 
-    let private adminPlaceholder (context: HttpContext) =
+    let private adminCredentialsInvalid context =
+        let problem: ProblemDetailsDto =
+            { Type = "https://web10.radio/problems/admin-auth-invalid-credentials"
+              Title = "Invalid admin credentials"
+              Status = StatusCodes.Status401Unauthorized
+              TraceId = String.Empty
+              Code = "admin.auth.invalid_credentials"
+              Message = "The supplied username or password is invalid." }
+        ApiJson.write context StatusCodes.Status401Unauthorized ApiJson.ProblemContentType problem
+
+    let private sessionToken (context: HttpContext) =
+        match context.Request.Cookies.TryGetValue(AdminSessionAuthentication.CookieName) with
+        | true, value when not (String.IsNullOrWhiteSpace value) -> Some value
+        | _ -> None
+
+    let private activeAdminSession (context: HttpContext) =
         task {
-            do! adminContractUnpinned context
-            return StatusCodes.Status501NotImplemented
+            match sessionToken context with
+            | None -> return Ok None
+            | Some token ->
+                let identity = context.RequestServices.GetRequiredService<AdminIdentityService>()
+                return! identity.TryGetActiveSessionAsync token context.RequestAborted
+        }
+
+    let private adminLogin (context: HttpContext) =
+        task {
+            match! readJsonBody 4096 context with
+            | BodyTooLarge ->
+                do! writeRequestTooLarge context
+                return StatusCodes.Status413PayloadTooLarge
+            | BodyInvalid ->
+                do! adminAuthInvalid context
+                return StatusCodes.Status400BadRequest
+            | BodyParsed root when not (hasExactProperties (Set.ofList [ "username"; "password" ]) root) ->
+                do! adminAuthInvalid context
+                return StatusCodes.Status400BadRequest
+            | BodyParsed root ->
+                match tryString "username" root, tryString "password" root with
+                | Some username, Some password when username.Trim().Length >= 1 && username.Trim().Length <= 64 && password.Length >= 12 && password.Length <= 256 ->
+                    let identity = context.RequestServices.GetRequiredService<AdminIdentityService>()
+                    let! result = identity.LoginAsync username password context.RequestAborted
+                    match result with
+                    | Error _ ->
+                        do! writeRepositoryFailure context
+                        return StatusCodes.Status500InternalServerError
+                    | Ok AdminLoginOutcome.InvalidCredentials ->
+                        do! adminCredentialsInvalid context
+                        return StatusCodes.Status401Unauthorized
+                    | Ok(AdminLoginOutcome.Authenticated login) ->
+                        let maxAge = int AdminSessionAuthentication.SessionLifetime.TotalSeconds
+                        context.Response.Headers["Set-Cookie"] <- StringValues(sprintf "%s=%s; Max-Age=%d; Path=/api/v0/admin; HttpOnly; SameSite=Strict" AdminSessionAuthentication.CookieName login.SessionToken maxAge)
+                        do! writeOk context { Username = login.Username; CsrfToken = login.CsrfToken; DevelopmentFixturesEnabled = login.DevelopmentFixturesEnabled }
+                        return StatusCodes.Status200OK
+                | _ ->
+                    do! adminAuthInvalid context
+                    return StatusCodes.Status400BadRequest
+        }
+
+    let private adminSession (context: HttpContext) =
+        task {
+            match! activeAdminSession context with
+            | Error _ ->
+                do! writeRepositoryFailure context
+                return StatusCodes.Status500InternalServerError
+            | Ok None ->
+                do! writeDomainProblem context StatusCodes.Status401Unauthorized "admin.auth.required" "Admin authentication required" "An active admin session is required."
+                return StatusCodes.Status401Unauthorized
+            | Ok(Some active) ->
+                do! writeOk context { Username = active.Username; CsrfToken = active.Session.CsrfToken; DevelopmentFixturesEnabled = active.DevelopmentFixturesEnabled }
+                return StatusCodes.Status200OK
+        }
+
+    let private csrfInvalid context =
+        writeDomainProblem context StatusCodes.Status403Forbidden "admin.auth.csrf_invalid" "Invalid CSRF token" "A valid X-CSRF-Token header is required."
+
+    let private csrfProtected (handler: ApiRouteHandler) (context: HttpContext) =
+        task {
+            match! activeAdminSession context with
+            | Error _ ->
+                do! writeRepositoryFailure context
+                return StatusCodes.Status500InternalServerError
+            | Ok None ->
+                do! writeDomainProblem context StatusCodes.Status401Unauthorized "admin.auth.required" "Admin authentication required" "An active admin session is required."
+                return StatusCodes.Status401Unauthorized
+            | Ok(Some active) ->
+                let mutable values = StringValues()
+                let identity = context.RequestServices.GetRequiredService<AdminIdentityService>()
+                let valid = context.Request.Headers.TryGetValue("X-CSRF-Token", &values) && values.Count = 1 && not (String.IsNullOrWhiteSpace values[0]) && identity.CsrfMatches active.Session values[0]
+                if valid then
+                    return! handler context
+                else
+                    do! csrfInvalid context
+                    return StatusCodes.Status403Forbidden
+        }
+
+    let private adminLogout (context: HttpContext) =
+        task {
+            match! readJsonBody 4096 context with
+            | BodyParsed root when isExactEmptyJsonObject root ->
+                match! activeAdminSession context with
+                | Error _ ->
+                    do! writeRepositoryFailure context
+                    return StatusCodes.Status500InternalServerError
+                | Ok None ->
+                    do! writeDomainProblem context StatusCodes.Status401Unauthorized "admin.auth.required" "Admin authentication required" "An active admin session is required."
+                    return StatusCodes.Status401Unauthorized
+                | Ok(Some active) ->
+                    let identity = context.RequestServices.GetRequiredService<AdminIdentityService>()
+                    let! revoked = identity.RevokeSessionAsync active.Session.Id context.RequestAborted
+                    match revoked with
+                    | Error _ ->
+                        do! writeRepositoryFailure context
+                        return StatusCodes.Status500InternalServerError
+                    | Ok _ ->
+                        context.Response.Headers["Set-Cookie"] <- StringValues(sprintf "%s=; Max-Age=0; Path=/api/v0/admin; HttpOnly; SameSite=Strict" AdminSessionAuthentication.CookieName)
+                        context.Response.StatusCode <- StatusCodes.Status204NoContent
+                        return StatusCodes.Status204NoContent
+            | BodyTooLarge ->
+                do! writeRequestTooLarge context
+                return StatusCodes.Status413PayloadTooLarge
+            | _ ->
+                do! adminAuthInvalid context
+                return StatusCodes.Status400BadRequest
+        }
+
+    let private publishEvent (context: HttpContext) (eventType: DomainEventType) (producer: string) (payload: string) : Task<bool> =
+        task {
+            let idGenerator = context.RequestServices.GetRequiredService<IIdGenerator>()
+            let clock = context.RequestServices.GetRequiredService<IClock>()
+            match DomainEventEnvelope.create idGenerator clock eventType producer None None payload with
+            | Error _ -> return false
+            | Ok envelope ->
+                let publisher = context.RequestServices.GetRequiredService<IDomainEventPublisher>()
+                let! result = publisher.PublishDurableAsync envelope context.RequestAborted
+                return Result.isOk result
+        }
+    let private libraryScan (context: HttpContext) =
+        task {
+            match! readJsonBody (16 * 1024) context with
+            | BodyTooLarge ->
+                do! writeRequestTooLarge context
+                return StatusCodes.Status413PayloadTooLarge
+            | BodyInvalid ->
+                do! writeDomainProblem context StatusCodes.Status400BadRequest "library.scan.request_invalid" "Invalid library scan request" "The scan request body is invalid."
+                return StatusCodes.Status400BadRequest
+            | BodyParsed root ->
+                let backendId =
+                    if isExactEmptyJsonObject root then Some None
+                    elif hasExactProperties (Set.ofList [ "storageBackendId" ]) root then tryString "storageBackendId" root |> Option.bind tryPositiveGuid |> Option.map Some
+                    else None
+                match backendId with
+                | None ->
+                    do! writeDomainProblem context StatusCodes.Status400BadRequest "library.scan.request_invalid" "Invalid library scan request" "The scan request body is invalid."
+                    return StatusCodes.Status400BadRequest
+                | Some storageBackendId ->
+                    let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+                    let clock = context.RequestServices.GetRequiredService<IClock>()
+                    let ids = context.RequestServices.GetRequiredService<IIdGenerator>()
+                    let! result = LibraryScanRepository.createOrGetActiveJob source (ids.NewId()) storageBackendId clock.UtcNow context.RequestAborted
+                    match result with
+                    | Error _ ->
+                        do! writeRepositoryFailure context
+                        return StatusCodes.Status500InternalServerError
+                    | Ok StorageBackendNotFound ->
+                        do! writeDomainProblem context StatusCodes.Status404NotFound "storage.backend_not_found" "Storage backend not found" "The requested storage backend is unavailable."
+                        return StatusCodes.Status404NotFound
+                    | Ok(Existing job) ->
+                        do! ApiJson.write context StatusCodes.Status202Accepted ApiJson.JsonContentType { ScanJobId = job.Id.ToString("D") }
+                        return StatusCodes.Status202Accepted
+                    | Ok(Created job) ->
+                        let payload = JsonSerializer.Serialize({| libraryScanJobId = job.Id.ToString("D") |}, ApiJson.options)
+                        let! published = publishEvent context DomainEventType.LibraryScanRequested "Web10.Radio.API.Admin" payload
+                        if published then
+                            do! ApiJson.write context StatusCodes.Status202Accepted ApiJson.JsonContentType { ScanJobId = job.Id.ToString("D") }
+                            return StatusCodes.Status202Accepted
+                        else
+                            do! writeRepositoryFailure context
+                            return StatusCodes.Status500InternalServerError
+        }
+
+    let private libraryScanStatus (context: HttpContext) =
+        task {
+            match parseGuidRoute "scanJobId" context with
+            | None ->
+                do! writeDomainProblem context StatusCodes.Status404NotFound "library.scan_not_found" "Library scan not found" "The scan job does not exist."
+                return StatusCodes.Status404NotFound
+            | Some jobId ->
+                let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+                let! result = LibraryScanRepository.getJobStatus source jobId context.RequestAborted
+                match result with
+                | Error _ ->
+                    do! repositoryReadFailed context
+                    return StatusCodes.Status500InternalServerError
+                | Ok None ->
+                    do! writeDomainProblem context StatusCodes.Status404NotFound "library.scan_not_found" "Library scan not found" "The scan job does not exist."
+                    return StatusCodes.Status404NotFound
+                | Ok(Some job) ->
+                    do! writeOk context (toScanStatusDto job)
+                    return StatusCodes.Status200OK
+        }
+
+    let private adminTracks (context: HttpContext) =
+        task {
+            let query = if context.Request.Query.ContainsKey("query") then context.Request.Query["query"].ToString() else String.Empty
+            let limitText = if context.Request.Query.ContainsKey("limit") then context.Request.Query["limit"].ToString() else "100"
+            let mutable limit = 0
+            if query.Length > 200 || not (Int32.TryParse(limitText, &limit)) || limit < 1 || limit > 100 then
+                do! writeDomainProblem context StatusCodes.Status400BadRequest "track.request_invalid" "Invalid track request" "The track query or limit is invalid."
+                return StatusCodes.Status400BadRequest
+            else
+                let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+                let! result = AdminContentRepository.listActiveTracks source query limit context.RequestAborted
+                match result with
+                | Error _ ->
+                    do! repositoryReadFailed context
+                    return StatusCodes.Status500InternalServerError
+                | Ok tracks ->
+                    do! writeOk context (tracks |> List.map toTrackDto)
+                    return StatusCodes.Status200OK
+        }
+
+    let private adminQueueTrack (context: HttpContext) =
+        task {
+            match! readJsonBody (16 * 1024) context with
+            | BodyTooLarge ->
+                do! writeRequestTooLarge context
+                return StatusCodes.Status413PayloadTooLarge
+            | BodyParsed root when hasExactProperties (Set.ofList [ "trackId" ]) root ->
+                match tryString "trackId" root |> Option.bind tryPositiveGuid with
+                | None ->
+                    do! writeDomainProblem context StatusCodes.Status400BadRequest "playback.request_invalid" "Invalid playback request" "The track identifier is invalid."
+                    return StatusCodes.Status400BadRequest
+                | Some trackId ->
+                    let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+                    let clock = context.RequestServices.GetRequiredService<IClock>()
+                    let ids = context.RequestServices.GetRequiredService<IIdGenerator>()
+                    let! result = AdminContentRepository.enqueueAdminTrack source { Id = ids.NewId(); TrackId = trackId; RequestedAtUtc = clock.UtcNow } context.RequestAborted
+                    match result with
+                    | Error _ ->
+                        do! writeRepositoryFailure context
+                        return StatusCodes.Status500InternalServerError
+                    | Ok AdminContentMutation.NotFound ->
+                        do! writeDomainProblem context StatusCodes.Status404NotFound "playback.not_found" "Track not found" "The requested track is unavailable."
+                        return StatusCodes.Status404NotFound
+                    | Ok AdminContentMutation.Conflict ->
+                        do! writeDomainProblem context StatusCodes.Status409Conflict "playback.conflict" "Playback conflict" "The track could not be queued."
+                        return StatusCodes.Status409Conflict
+                    | Ok(AdminContentMutation.Applied item) ->
+                        do! ApiJson.write context StatusCodes.Status202Accepted ApiJson.JsonContentType { QueueItemId = item.Id.ToString("D") }
+                        return StatusCodes.Status202Accepted
+            | _ ->
+                do! writeDomainProblem context StatusCodes.Status400BadRequest "playback.request_invalid" "Invalid playback request" "The playback request body is invalid."
+                return StatusCodes.Status400BadRequest
+        }
+    let private streamHeartbeat (context: HttpContext) =
+        task {
+            match! readJsonBody PlaybackCallbackMaxBodyBytes context with
+            | BodyTooLarge ->
+                do! writeRequestTooLarge context
+                return StatusCodes.Status413PayloadTooLarge
+            | BodyParsed root when hasExactProperties (Set.ofList [ "status"; "failureReason"; "metadata" ]) root ->
+                let status = tryString "status" root |> Option.bind (function | "starting" -> Some "Starting" | "live" -> Some "Live" | "degraded" -> Some "Degraded" | "restarting" -> Some "Restarting" | "failed" -> Some "Failed" | "offline" -> Some "Offline" | _ -> None)
+                let reason = tryNullableString "failureReason" root
+                let validNullableNonNegativeInteger name metadata =
+                    match tryProperty name metadata with
+                    | Some value when value.ValueKind = JsonValueKind.Null -> true
+                    | Some value when value.ValueKind = JsonValueKind.Number -> let mutable parsed = 0 in value.TryGetInt32(&parsed) && parsed >= 0
+                    | _ -> false
+                let validNullableGuid metadata =
+                    match tryProperty "activeQueueItemId" metadata with
+                    | Some value when value.ValueKind = JsonValueKind.Null -> true
+                    | Some value when value.ValueKind = JsonValueKind.String -> value.GetString() |> tryPositiveGuid |> Option.isSome
+                    | _ -> false
+                match status, reason, tryProperty "metadata" root with
+                | Some persistedStatus, Some failureReason, Some metadata when hasExactProperties (Set.ofList [ "bitrateKbps"; "restartAttempt"; "activeQueueItemId" ]) metadata && validNullableNonNegativeInteger "bitrateKbps" metadata && validNullableNonNegativeInteger "restartAttempt" metadata && validNullableGuid metadata ->
+                    let payload = JsonSerializer.Serialize({| status = persistedStatus; failureReason = failureReason |> Option.defaultValue null; metadata = metadata |}, ApiJson.options)
+                    let! published = publishEvent context DomainEventType.StreamNodeHeartbeatReceived "Web10.Radio.StreamNode" payload
+                    if published then
+                        context.Response.StatusCode <- StatusCodes.Status204NoContent
+                        return StatusCodes.Status204NoContent
+                    else
+                        do! writeRepositoryFailure context
+                        return StatusCodes.Status500InternalServerError
+                | _ ->
+                    do! writeDomainProblem context StatusCodes.Status400BadRequest "stream-node.heartbeat.invalid" "Invalid stream-node heartbeat" "The heartbeat payload is invalid."
+                    return StatusCodes.Status400BadRequest
+            | _ ->
+                do! writeDomainProblem context StatusCodes.Status400BadRequest "stream-node.heartbeat.invalid" "Invalid stream-node heartbeat" "The heartbeat payload is invalid."
+                return StatusCodes.Status400BadRequest
+        }
+
+    let private currentPlaybackAssignment (context: HttpContext) =
+        task {
+            let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+            let! result = PlaybackQueueRepository.getCurrentAssignment source context.RequestAborted
+            match result with
+            | Error _ ->
+                do! repositoryReadFailed context
+                return StatusCodes.Status500InternalServerError
+            | Ok None -> context.Response.StatusCode <- StatusCodes.Status204NoContent; return StatusCodes.Status204NoContent
+            | Ok(Some assignment) ->
+                let dto: CurrentPlaybackAssignmentDto = { QueueItemId = assignment.QueueItemId.ToString("D"); ClaimOwner = assignment.ClaimOwner.ToString("D"); ClaimAttempt = assignment.ClaimAttempt; TrackId = assignment.TrackId.ToString("D"); CachePath = assignment.CachePath; ContentType = assignment.ContentType; Title = assignment.Title; Artist = assignment.Artist; DurationMs = max 0 assignment.DurationMs }
+                do! writeOk context dto
+                return StatusCodes.Status200OK
+        }
+
+    let private streamNodeControl (context: HttpContext) =
+        task {
+            let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+            let ids = context.RequestServices.GetRequiredService<IIdGenerator>()
+            let clock = context.RequestServices.GetRequiredService<IClock>()
+            let! result = StreamNodeControlRepository.getOrCreate source (ids.NewId()) clock.UtcNow context.RequestAborted
+            match result with
+            | Error _ ->
+                do! repositoryReadFailed context
+                return StatusCodes.Status500InternalServerError
+            | Ok state ->
+                do! writeOk context (toControlDto state)
+                return StatusCodes.Status200OK
+        }
+
+    let private adminStreamControl operation (context: HttpContext) =
+        task {
+            match! readJsonBody (16 * 1024) context with
+            | BodyParsed root when isExactEmptyJsonObject root ->
+                let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+                let ids = context.RequestServices.GetRequiredService<IIdGenerator>()
+                let clock = context.RequestServices.GetRequiredService<IClock>()
+                let! initialized = StreamNodeControlRepository.getOrCreate source (ids.NewId()) clock.UtcNow context.RequestAborted
+                let! result =
+                    match initialized, operation with
+                    | Error error, _ -> Task.FromResult(Error error)
+                    | Ok _, "start" -> StreamNodeControlRepository.setDesiredState source Running clock.UtcNow context.RequestAborted
+                    | Ok _, "stop" -> StreamNodeControlRepository.setDesiredState source Stopped clock.UtcNow context.RequestAborted
+                    | Ok _, _ -> StreamNodeControlRepository.restart source clock.UtcNow context.RequestAborted
+                match result with
+                | Error _ ->
+                    do! writeRepositoryFailure context
+                    return StatusCodes.Status500InternalServerError
+                | Ok state ->
+                    do! ApiJson.write context StatusCodes.Status202Accepted ApiJson.JsonContentType (toControlDto state)
+                    return StatusCodes.Status202Accepted
+            | BodyTooLarge ->
+                do! writeRequestTooLarge context
+                return StatusCodes.Status413PayloadTooLarge
+            | _ ->
+                do! writeDomainProblem context StatusCodes.Status400BadRequest "stream-node.control.request_invalid" "Invalid stream-node control request" "The control request body must be an empty object."
+                return StatusCodes.Status400BadRequest
+        }
+
+    let private adminStreamStatus (context: HttpContext) =
+        task {
+            let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+            let ids = context.RequestServices.GetRequiredService<IIdGenerator>()
+            let clock = context.RequestServices.GetRequiredService<IClock>()
+            let! control = StreamNodeControlRepository.getOrCreate source (ids.NewId()) clock.UtcNow context.RequestAborted
+            let! snapshot = PlayerStateReadModel.loadSnapshot source clock context.RequestAborted
+            match control, snapshot with
+            | Ok state, Ok player ->
+                let fresh = player.Stream.Status <> "offline"
+                let controlDto = toControlDto state
+                let dto: StreamNodeStatusDto =
+                    { Status = player.Stream.Status
+                      DesiredState = controlDto.DesiredState
+                      LastHeartbeatUtc = (if fresh then player.Stream.StartedAtUtc else null)
+                      FailureReason = (if fresh then player.Stream.OfflineReason else null)
+                      BitrateKbps = (if fresh then player.Stream.BitrateKbps else 0)
+                      RestartGeneration = controlDto.RestartGeneration }
+                do! writeOk context dto
+                return StatusCodes.Status200OK
+            | _ ->
+                do! repositoryReadFailed context
+                return StatusCodes.Status500InternalServerError
+        }
+    let private adminDonationGoalUpdate (context: HttpContext) =
+        task {
+            match! readJsonBody (16 * 1024) context with
+            | BodyTooLarge ->
+                do! writeRequestTooLarge context
+                return StatusCodes.Status413PayloadTooLarge
+            | BodyParsed root when hasExactProperties (Set.ofList [ "title"; "goalStars" ]) root ->
+                match tryString "title" root, tryProperty "goalStars" root with
+                | Some title, Some starsElement when starsElement.ValueKind = JsonValueKind.Number ->
+                    let trimmed = title.Trim()
+                    let mutable stars = 0
+                    if trimmed.Length < 1 || trimmed.Length > 120 || not (starsElement.TryGetInt32(&stars)) || stars < 1 then
+                        do! writeDomainProblem context StatusCodes.Status400BadRequest "donation.goal.request_invalid" "Invalid donation goal request" "The donation goal body is invalid."
+                        return StatusCodes.Status400BadRequest
+                    else
+                        let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+                        let ids = context.RequestServices.GetRequiredService<IIdGenerator>()
+                        let clock = context.RequestServices.GetRequiredService<IClock>()
+                        let! result = AdminContentRepository.upsertDonationGoal source { Id = ids.NewId(); Title = trimmed; GoalStars = stars; UpdatedAtUtc = clock.UtcNow } context.RequestAborted
+                        match result with
+                        | Error _ ->
+                            do! writeRepositoryFailure context
+                            return StatusCodes.Status500InternalServerError
+                        | Ok _ ->
+                            let payload = JsonSerializer.Serialize({| title = trimmed; goalStars = stars |}, ApiJson.options)
+                            let! published = publishEvent context DomainEventType.AdminGoalChanged "Web10.Radio.API.Admin" payload
+                            if not published then
+                                do! writeRepositoryFailure context
+                                return StatusCodes.Status500InternalServerError
+                            else
+                                let! goal = PlayerStateReadModel.loadDonationGoal source context.RequestAborted
+                                match goal with
+                                | Ok dto ->
+                                    do! writeOk context dto
+                                    return StatusCodes.Status200OK
+                                | Error _ ->
+                                    do! repositoryReadFailed context
+                                    return StatusCodes.Status500InternalServerError
+                | _ ->
+                    do! writeDomainProblem context StatusCodes.Status400BadRequest "donation.goal.request_invalid" "Invalid donation goal request" "The donation goal body is invalid."
+                    return StatusCodes.Status400BadRequest
+            | _ ->
+                do! writeDomainProblem context StatusCodes.Status400BadRequest "donation.goal.request_invalid" "Invalid donation goal request" "The donation goal body is invalid."
+                return StatusCodes.Status400BadRequest
+        }
+
+    let private socialKinds = Set.ofList [ "telegram"; "youtube"; "instagram"; "discord"; "external" ]
+
+    let private parseSocialReplacement (ids: IIdGenerator) (element: JsonElement) =
+        if not (hasExactProperties (Set.ofList [ "id"; "kind"; "name"; "handle"; "url"; "glyph"; "color"; "qrImageUrl"; "isFeatured" ]) element) then None
+        else
+            match tryProperty "id" element, tryString "kind" element, tryString "name" element, tryNullableString "handle" element, tryString "url" element, tryNullableString "glyph" element, tryNullableString "color" element, tryNullableString "qrImageUrl" element, tryProperty "isFeatured" element with
+            | Some idElement, Some kind, Some name, Some handle, Some url, Some glyph, Some color, Some qrImageUrl, Some featured when idElement.ValueKind = JsonValueKind.Null || idElement.ValueKind = JsonValueKind.String ->
+                let id = if idElement.ValueKind = JsonValueKind.Null then Some(ids.NewId()) else idElement.GetString() |> tryPositiveGuid
+                let parsedUrl = match Uri.TryCreate(url, UriKind.Absolute) with | true, uri when uri.Scheme = Uri.UriSchemeHttp || uri.Scheme = Uri.UriSchemeHttps -> Some uri | _ -> None
+                let colorValid = color |> Option.forall (fun value -> value.Length = 7 && value.[0] = '#' && value |> Seq.skip 1 |> Seq.forall Uri.IsHexDigit)
+                if id.IsNone || not (socialKinds.Contains kind) || name.Trim().Length < 1 || not colorValid || parsedUrl.IsNone || featured.ValueKind <> JsonValueKind.True && featured.ValueKind <> JsonValueKind.False then None
+                else Some { Id = id.Value; Kind = kind; Name = name.Trim(); Handle = handle |> Option.map _.Trim(); Url = parsedUrl.Value.AbsoluteUri; Glyph = glyph; Color = color; QrImageUrl = qrImageUrl; IsFeatured = featured.GetBoolean() }
+            | _ -> None
+
+    let private adminSocialLinksUpdate (context: HttpContext) =
+        task {
+            match! readJsonBody (64 * 1024) context with
+            | BodyTooLarge ->
+                do! writeRequestTooLarge context
+                return StatusCodes.Status413PayloadTooLarge
+            | BodyParsed root when root.ValueKind = JsonValueKind.Array && root.GetArrayLength() <= 50 ->
+                let ids = context.RequestServices.GetRequiredService<IIdGenerator>()
+                let parsed = root.EnumerateArray() |> Seq.map (parseSocialReplacement ids) |> Seq.toList
+                if parsed |> List.exists Option.isNone then
+                    do! writeDomainProblem context StatusCodes.Status400BadRequest "social-links.request_invalid" "Invalid social links request" "The social links body is invalid."
+                    return StatusCodes.Status400BadRequest
+                else
+                    let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+                    let clock = context.RequestServices.GetRequiredService<IClock>()
+                    let! result = AdminContentRepository.replaceSocialLinks source (parsed |> List.choose id) clock.UtcNow context.RequestAborted
+                    match result with
+                    | Error _ ->
+                        do! writeRepositoryFailure context
+                        return StatusCodes.Status500InternalServerError
+                    | Ok AdminContentMutation.NotFound ->
+                        do! writeDomainProblem context StatusCodes.Status404NotFound "social-links.not_found" "Social link not found" "A referenced social link does not exist."
+                        return StatusCodes.Status404NotFound
+                    | Ok AdminContentMutation.Conflict ->
+                        do! writeDomainProblem context StatusCodes.Status409Conflict "social-links.conflict" "Social links conflict" "The social links replacement conflicts with current state."
+                        return StatusCodes.Status409Conflict
+                    | Ok(AdminContentMutation.Applied links) ->
+                        let! published = publishEvent context DomainEventType.SocialLinkChanged "Web10.Radio.API.Admin" (JsonSerializer.Serialize({| count = List.length links |}, ApiJson.options))
+                        if not published then
+                            do! writeRepositoryFailure context
+                            return StatusCodes.Status500InternalServerError
+                        else
+                            do! writeOk context (links |> List.map (fun (link: SocialLink) -> ({ Id = link.Id.ToString("D"); Kind = link.Kind; Name = link.Name; Handle = link.Handle; Url = link.Url; Glyph = link.Glyph; Color = link.Color; QrImageUrl = link.QrImageUrl; IsFeatured = link.IsFeatured } : SocialLinkDto)))
+                            return StatusCodes.Status200OK
+            | _ ->
+                do! writeDomainProblem context StatusCodes.Status400BadRequest "social-links.request_invalid" "Invalid social links request" "The social links body is invalid."
+                return StatusCodes.Status400BadRequest
+        }
+    let private parsePlaylistBody root =
+        if not (hasExactProperties (Set.ofList [ "name"; "description"; "isActive" ]) root) then None
+        else
+            match tryString "name" root, tryNullableString "description" root, tryProperty "isActive" root with
+            | Some name, Some description, Some active when active.ValueKind = JsonValueKind.True || active.ValueKind = JsonValueKind.False ->
+                let trimmed = name.Trim()
+                let normalizedDescription = description |> Option.map _.Trim()
+                if trimmed.Length < 1 || trimmed.Length > 120 || normalizedDescription |> Option.exists (fun text -> text.Length > 1000) then None
+                else Some(trimmed, normalizedDescription, active.GetBoolean())
+            | _ -> None
+
+    let private adminPlaylists (context: HttpContext) =
+        task {
+            let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+            let! result = AdminContentRepository.listPlaylists source context.RequestAborted
+            match result with
+            | Error _ ->
+                do! repositoryReadFailed context
+                return StatusCodes.Status500InternalServerError
+            | Ok playlists ->
+                do! writeOk context (playlists |> List.map toPlaylistDto)
+                return StatusCodes.Status200OK
+        }
+
+    let private createPlaylist (context: HttpContext) =
+        task {
+            match! readJsonBody (16 * 1024) context with
+            | BodyTooLarge ->
+                do! writeRequestTooLarge context
+                return StatusCodes.Status413PayloadTooLarge
+            | BodyParsed root ->
+                match parsePlaylistBody root with
+                | None ->
+                    do! writeDomainProblem context StatusCodes.Status400BadRequest "playlist.request_invalid" "Invalid playlist request" "The playlist body is invalid."
+                    return StatusCodes.Status400BadRequest
+                | Some(name, description, active) ->
+                    let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+                    let ids = context.RequestServices.GetRequiredService<IIdGenerator>()
+                    let clock = context.RequestServices.GetRequiredService<IClock>()
+                    let now = clock.UtcNow
+                    let! result = AdminContentRepository.createPlaylist source { Id = ids.NewId(); Name = name; Description = description; IsActive = active; CreatedAtUtc = now; UpdatedAtUtc = now } context.RequestAborted
+                    match result with
+                    | Error _ ->
+                        do! writeRepositoryFailure context
+                        return StatusCodes.Status500InternalServerError
+                    | Ok AdminContentMutation.NotFound ->
+                        do! writeDomainProblem context StatusCodes.Status404NotFound "playlist.not_found" "Playlist not found" "The playlist does not exist."
+                        return StatusCodes.Status404NotFound
+                    | Ok AdminContentMutation.Conflict ->
+                        do! writeDomainProblem context StatusCodes.Status409Conflict "playlist.conflict" "Playlist conflict" "The playlist conflicts with current state."
+                        return StatusCodes.Status409Conflict
+                    | Ok(AdminContentMutation.Applied playlist) ->
+                        do! ApiJson.write context StatusCodes.Status201Created ApiJson.JsonContentType (toPlaylistDto playlist)
+                        return StatusCodes.Status201Created
+            | _ ->
+                do! writeDomainProblem context StatusCodes.Status400BadRequest "playlist.request_invalid" "Invalid playlist request" "The playlist body is invalid."
+                return StatusCodes.Status400BadRequest
+        }
+
+    let private updatePlaylist (context: HttpContext) =
+        task {
+            match parseGuidRoute "playlistId" context, (readJsonBody (16 * 1024) context) with
+            | None, _ ->
+                do! writeDomainProblem context StatusCodes.Status404NotFound "playlist.not_found" "Playlist not found" "The playlist does not exist."
+                return StatusCodes.Status404NotFound
+            | Some playlistId, bodyTask ->
+                match! bodyTask with
+                | BodyTooLarge ->
+                    do! writeRequestTooLarge context
+                    return StatusCodes.Status413PayloadTooLarge
+                | BodyParsed root ->
+                    match parsePlaylistBody root with
+                    | None ->
+                        do! writeDomainProblem context StatusCodes.Status400BadRequest "playlist.request_invalid" "Invalid playlist request" "The playlist body is invalid."
+                        return StatusCodes.Status400BadRequest
+                    | Some(name, description, active) ->
+                        let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+                        let clock = context.RequestServices.GetRequiredService<IClock>()
+                        let! result = AdminContentRepository.updatePlaylist source playlistId { Name = name; Description = description; IsActive = active; UpdatedAtUtc = clock.UtcNow } context.RequestAborted
+                        match result with
+                        | Error _ ->
+                            do! writeRepositoryFailure context
+                            return StatusCodes.Status500InternalServerError
+                        | Ok AdminContentMutation.NotFound ->
+                            do! writeDomainProblem context StatusCodes.Status404NotFound "playlist.not_found" "Playlist not found" "The playlist does not exist."
+                            return StatusCodes.Status404NotFound
+                        | Ok AdminContentMutation.Conflict ->
+                            do! writeDomainProblem context StatusCodes.Status409Conflict "playlist.conflict" "Playlist conflict" "The playlist conflicts with current state."
+                            return StatusCodes.Status409Conflict
+                        | Ok(AdminContentMutation.Applied playlist) ->
+                            do! writeOk context (toPlaylistDto playlist)
+                            return StatusCodes.Status200OK
+                | _ ->
+                    do! writeDomainProblem context StatusCodes.Status400BadRequest "playlist.request_invalid" "Invalid playlist request" "The playlist body is invalid."
+                    return StatusCodes.Status400BadRequest
+        }
+
+    let private playlistItems (context: HttpContext) =
+        task {
+            match parseGuidRoute "playlistId" context with
+            | None ->
+                do! writeDomainProblem context StatusCodes.Status404NotFound "playlist.not_found" "Playlist not found" "The playlist does not exist."
+                return StatusCodes.Status404NotFound
+            | Some playlistId ->
+                let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+                let! result = AdminContentRepository.listPlaylistItems source playlistId context.RequestAborted
+                match result with
+                | Error _ ->
+                    do! repositoryReadFailed context
+                    return StatusCodes.Status500InternalServerError
+                | Ok items ->
+                    do! writeOk context (items |> List.map toPlaylistItemDto)
+                    return StatusCodes.Status200OK
+        }
+
+    let private createPlaylistItem (context: HttpContext) =
+        task {
+            match parseGuidRoute "playlistId" context with
+            | None ->
+                do! writeDomainProblem context StatusCodes.Status404NotFound "playlist.not_found" "Playlist not found" "The playlist does not exist."
+                return StatusCodes.Status404NotFound
+            | Some playlistId ->
+                match! readJsonBody (16 * 1024) context with
+                | BodyTooLarge ->
+                    do! writeRequestTooLarge context
+                    return StatusCodes.Status413PayloadTooLarge
+                | BodyParsed root when hasExactProperties (Set.ofList [ "trackId" ]) root ->
+                    match tryString "trackId" root |> Option.bind tryPositiveGuid with
+                    | None ->
+                        do! writeDomainProblem context StatusCodes.Status400BadRequest "playlist.request_invalid" "Invalid playlist request" "The playlist item body is invalid."
+                        return StatusCodes.Status400BadRequest
+                    | Some trackId ->
+                        let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+                        let ids = context.RequestServices.GetRequiredService<IIdGenerator>()
+                        let clock = context.RequestServices.GetRequiredService<IClock>()
+                        let! result = AdminContentRepository.createPlaylistItem source playlistId { Id = ids.NewId(); TrackId = trackId; CreatedAtUtc = clock.UtcNow } context.RequestAborted
+                        match result with
+                        | Error _ ->
+                            do! writeRepositoryFailure context
+                            return StatusCodes.Status500InternalServerError
+                        | Ok AdminContentMutation.NotFound ->
+                            do! writeDomainProblem context StatusCodes.Status404NotFound "playlist.not_found" "Playlist not found" "The playlist or track does not exist."
+                            return StatusCodes.Status404NotFound
+                        | Ok AdminContentMutation.Conflict ->
+                            do! writeDomainProblem context StatusCodes.Status409Conflict "playlist.conflict" "Playlist conflict" "The playlist conflicts with current state."
+                            return StatusCodes.Status409Conflict
+                        | Ok(AdminContentMutation.Applied item) ->
+                            do! ApiJson.write context StatusCodes.Status201Created ApiJson.JsonContentType (toPlaylistItemDto item)
+                            return StatusCodes.Status201Created
+                | _ ->
+                    do! writeDomainProblem context StatusCodes.Status400BadRequest "playlist.request_invalid" "Invalid playlist request" "The playlist item body is invalid."
+                    return StatusCodes.Status400BadRequest
+        }
+    let private replacePlaylistItems (context: HttpContext) =
+        task {
+            match parseGuidRoute "playlistId" context with
+            | None ->
+                do! writeDomainProblem context StatusCodes.Status404NotFound "playlist.not_found" "Playlist not found" "The playlist does not exist."
+                return StatusCodes.Status404NotFound
+            | Some playlistId ->
+                match! readJsonBody (64 * 1024) context with
+                | BodyTooLarge ->
+                    do! writeRequestTooLarge context
+                    return StatusCodes.Status413PayloadTooLarge
+                | BodyParsed root when hasExactProperties (Set.ofList [ "items" ]) root ->
+                    match tryProperty "items" root with
+                    | Some items when items.ValueKind = JsonValueKind.Array ->
+                        let ids = context.RequestServices.GetRequiredService<IIdGenerator>()
+                        let parsed =
+                            items.EnumerateArray()
+                            |> Seq.map (fun item ->
+                                if hasExactProperties (Set.ofList [ "id"; "trackId" ]) item then
+                                    match tryProperty "id" item, tryString "trackId" item |> Option.bind tryPositiveGuid with
+                                    | Some id, Some trackId when id.ValueKind = JsonValueKind.Null -> Some { Id = ids.NewId(); TrackId = trackId }
+                                    | Some id, Some trackId when id.ValueKind = JsonValueKind.String -> id.GetString() |> tryPositiveGuid |> Option.map (fun itemId -> { Id = itemId; TrackId = trackId })
+                                    | _ -> None
+                                else None)
+                            |> Seq.toList
+                        if parsed |> List.exists Option.isNone then
+                            do! writeDomainProblem context StatusCodes.Status400BadRequest "playlist.request_invalid" "Invalid playlist request" "The playlist items body is invalid."
+                            return StatusCodes.Status400BadRequest
+                        else
+                            let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+                            let clock = context.RequestServices.GetRequiredService<IClock>()
+                            let! result = AdminContentRepository.replacePlaylistItems source playlistId (parsed |> List.choose id) clock.UtcNow context.RequestAborted
+                            match result with
+                            | Error _ ->
+                                do! writeRepositoryFailure context
+                                return StatusCodes.Status500InternalServerError
+                            | Ok AdminContentMutation.NotFound ->
+                                do! writeDomainProblem context StatusCodes.Status404NotFound "playlist.not_found" "Playlist not found" "The playlist or item does not exist."
+                                return StatusCodes.Status404NotFound
+                            | Ok AdminContentMutation.Conflict ->
+                                do! writeDomainProblem context StatusCodes.Status409Conflict "playlist.conflict" "Playlist conflict" "The playlist conflicts with current state."
+                                return StatusCodes.Status409Conflict
+                            | Ok(AdminContentMutation.Applied values) ->
+                                do! writeOk context (values |> List.map toPlaylistItemDto)
+                                return StatusCodes.Status200OK
+                    | _ ->
+                        do! writeDomainProblem context StatusCodes.Status400BadRequest "playlist.request_invalid" "Invalid playlist request" "The playlist items body is invalid."
+                        return StatusCodes.Status400BadRequest
+                | _ ->
+                    do! writeDomainProblem context StatusCodes.Status400BadRequest "playlist.request_invalid" "Invalid playlist request" "The playlist items body is invalid."
+                    return StatusCodes.Status400BadRequest
+        }
+
+    let private defaultStorageDto (options: StorageOptions) =
+        match options.Type with
+        | Local -> { Type = "local"; LocalRoot = options.LocalRoot; S3Bucket = null; S3Region = null; S3ServiceUrl = null; S3ForcePathStyle = false }
+        | S3 -> { Type = "s3"; LocalRoot = null; S3Bucket = options.S3Bucket; S3Region = options.S3Region; S3ServiceUrl = options.S3ServiceUrl |> Option.map _.AbsoluteUri |> Option.defaultValue null; S3ForcePathStyle = options.S3ForcePathStyle }
+
+    let private toAdditionalStorageDto (backend: AdditionalStorageBackend) : AdditionalStorageBackendDto =
+        { Id = backend.Id.ToString("D"); Name = backend.Name; Type = backend.Type.ToLowerInvariant(); LocalRoot = backend.LocalRoot |> Option.defaultValue null; S3Bucket = backend.S3Bucket |> Option.defaultValue null; IsEnabled = backend.IsEnabled }
+
+    let private adminStorage (context: HttpContext) =
+        task {
+            let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+            let options = context.RequestServices.GetRequiredService<StorageOptions>()
+            let! result = AdminContentRepository.listAdditionalStorageBackends source context.RequestAborted
+            match result with
+            | Error _ ->
+                do! repositoryReadFailed context
+                return StatusCodes.Status500InternalServerError
+            | Ok backends ->
+                do! writeOk context { DefaultBackend = defaultStorageDto options; AdditionalBackends = backends |> List.map toAdditionalStorageDto }
+                return StatusCodes.Status200OK
+        }
+
+    let private adminStorageUpdate (context: HttpContext) =
+        task {
+            match! readJsonBody (64 * 1024) context with
+            | BodyTooLarge ->
+                do! writeRequestTooLarge context
+                return StatusCodes.Status413PayloadTooLarge
+            | BodyParsed root when hasExactProperties (Set.ofList [ "additionalBackends" ]) root ->
+                match tryProperty "additionalBackends" root with
+                | Some array when array.ValueKind = JsonValueKind.Array && array.GetArrayLength() <= 20 ->
+                    let ids = context.RequestServices.GetRequiredService<IIdGenerator>()
+                    let parsed =
+                        array.EnumerateArray()
+                        |> Seq.map (fun item ->
+                            if not (hasExactProperties (Set.ofList [ "id"; "name"; "type"; "localRoot"; "s3Bucket"; "isEnabled" ]) item) then None
+                            else
+                                match tryProperty "id" item, tryString "name" item, tryString "type" item, tryNullableString "localRoot" item, tryNullableString "s3Bucket" item, tryProperty "isEnabled" item with
+                                | Some id, Some name, Some storageType, Some localRoot, Some bucket, Some enabled when (id.ValueKind = JsonValueKind.Null || id.ValueKind = JsonValueKind.String) && (enabled.ValueKind = JsonValueKind.True || enabled.ValueKind = JsonValueKind.False) ->
+                                    let backendId = if id.ValueKind = JsonValueKind.Null then Some(ids.NewId()) else id.GetString() |> tryPositiveGuid
+                                    let valid = name.Trim().Length >= 1 && ((storageType = "local" && localRoot |> Option.exists Path.IsPathFullyQualified && bucket.IsNone) || (storageType = "s3" && bucket |> Option.exists (fun text -> text.Trim().Length > 0) && localRoot.IsNone))
+                                    if backendId.IsSome && valid then
+                                        let replacement: AdditionalStorageBackendReplacement =
+                                            { Id = backendId.Value
+                                              Name = name.Trim()
+                                              Type = (if storageType = "local" then "Local" else "S3")
+                                              LocalRoot = localRoot |> Option.map _.Trim()
+                                              S3Bucket = bucket |> Option.map _.Trim()
+                                              IsEnabled = enabled.GetBoolean() }
+                                        Some replacement
+                                    else None
+                                | _ -> None)
+                        |> Seq.toList
+                    if parsed |> List.exists Option.isNone then
+                        do! writeDomainProblem context StatusCodes.Status400BadRequest "storage.request_invalid" "Invalid storage request" "The storage body is invalid."
+                        return StatusCodes.Status400BadRequest
+                    else
+                        let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+                        let options = context.RequestServices.GetRequiredService<StorageOptions>()
+                        let clock = context.RequestServices.GetRequiredService<IClock>()
+                        let! result = AdminContentRepository.replaceAdditionalStorageBackends source (parsed |> List.choose id) clock.UtcNow context.RequestAborted
+                        match result with
+                        | Error _ ->
+                            do! writeRepositoryFailure context
+                            return StatusCodes.Status500InternalServerError
+                        | Ok AdminContentMutation.NotFound ->
+                            do! writeDomainProblem context StatusCodes.Status404NotFound "storage.not_found" "Storage backend not found" "A referenced storage backend does not exist."
+                            return StatusCodes.Status404NotFound
+                        | Ok AdminContentMutation.Conflict ->
+                            do! writeDomainProblem context StatusCodes.Status409Conflict "storage.conflict" "Storage conflict" "The storage replacement conflicts with current state."
+                            return StatusCodes.Status409Conflict
+                        | Ok(AdminContentMutation.Applied backends) ->
+                            do! writeOk context { DefaultBackend = defaultStorageDto options; AdditionalBackends = backends |> List.map toAdditionalStorageDto }
+                            return StatusCodes.Status200OK
+                | _ ->
+                    do! writeDomainProblem context StatusCodes.Status400BadRequest "storage.request_invalid" "Invalid storage request" "The storage body is invalid."
+                    return StatusCodes.Status400BadRequest
+            | _ ->
+                do! writeDomainProblem context StatusCodes.Status400BadRequest "storage.request_invalid" "Invalid storage request" "The storage body is invalid."
+                return StatusCodes.Status400BadRequest
+        }
+    let private developmentFixtureInvalid context =
+        writeDomainProblem
+            context
+            StatusCodes.Status400BadRequest
+            "dev.fixture.invalid"
+            "Invalid development fixture request"
+            "The development fixture body is invalid."
+
+    let private createPaidVerticalSliceFixture (context: HttpContext) =
+        task {
+            match! readJsonBody (16 * 1024) context with
+            | BodyParsed root when hasExactProperties (Set.ofList [ "fixtureKey" ]) root ->
+                match tryString "fixtureKey" root with
+                | Some fixtureKey when fixtureKey.Trim().Length >= 1 && fixtureKey.Trim().Length <= 64 ->
+                    let options = context.RequestServices.GetRequiredService<Web10Options>()
+                    let dataSource = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+                    let idGenerator = context.RequestServices.GetRequiredService<IIdGenerator>()
+                    let clock = context.RequestServices.GetRequiredService<IClock>()
+
+                    let! result =
+                        DevelopmentFixtures.createPaidVerticalSlice
+                            dataSource
+                            idGenerator
+                            clock
+                            options.Telegram.SayPriceStars
+                            (fixtureKey.Trim())
+                            context.RequestAborted
+
+                    match result with
+                    | Ok fixture ->
+                        do! writeOk context fixture
+                        return StatusCodes.Status200OK
+                    | Error _ ->
+                        do! writeRepositoryFailure context
+                        return StatusCodes.Status500InternalServerError
+                | _ ->
+                    do! developmentFixtureInvalid context
+                    return StatusCodes.Status400BadRequest
+            | _ ->
+                do! developmentFixtureInvalid context
+                return StatusCodes.Status400BadRequest
         }
 
     let mapApiV0Endpoints (app: WebApplication) : unit =
@@ -1335,31 +2200,51 @@ module ApiEndpoints =
         map app logger "GET" "/api/v0/player/stream" "/api/v0/player/stream" playerStream
         map app logger "GET" "/api/v0/player/song" "/api/v0/player/song" playerSong
         map app logger "GET" "/api/v0/player/health" "/api/v0/player/health" playerHealth
-
         map app logger "POST" "/api/v0/telegram/webhook" "/api/v0/telegram/webhook" telegramWebhook
         map app logger "GET" "/api/v0/telegram/health" "/api/v0/telegram/health" telegramHealth
 
         let streamNode = app.MapGroup("/api/v0/stream-node")
         streamNode.RequireAuthorization(StreamNodeAuthentication.PolicyName) |> ignore
+        map streamNode logger "POST" "/heartbeat" "/api/v0/stream-node/heartbeat" streamHeartbeat
+        map streamNode logger "GET" "/playback/current" "/api/v0/stream-node/playback/current" currentPlaybackAssignment
+        map streamNode logger "GET" "/control" "/api/v0/stream-node/control" streamNodeControl
         map streamNode logger "POST" "/playback/{queueItemId}/lease" "/api/v0/stream-node/playback/{queueItemId}/lease" playbackLease
         map streamNode logger "POST" "/playback/{queueItemId}/completion" "/api/v0/stream-node/playback/{queueItemId}/completion" playbackCompletion
 
+        map app logger "POST" "/api/v0/admin/auth/login" "/api/v0/admin/auth/login" adminLogin
         let admin = app.MapGroup("/api/v0/admin")
-        admin.RequireAuthorization(AdminAuthentication.PolicyName) |> ignore
+        admin.RequireAuthorization(AdminSessionAuthentication.PolicyName) |> ignore
+        map admin logger "GET" "/auth/session" "/api/v0/admin/auth/session" adminSession
+        map admin logger "POST" "/auth/logout" "/api/v0/admin/auth/logout" (csrfProtected adminLogout)
+        if app.Environment.IsDevelopment()
+           && String.Equals(app.Configuration["DEV:FIXTURES_ENABLED"], "true", StringComparison.Ordinal) then
+            map
+                admin
+                logger
+                "POST"
+                "/dev/fixtures/paid-vertical-slice"
+                "/api/v0/admin/dev/fixtures/paid-vertical-slice"
+                (csrfProtected createPaidVerticalSliceFixture)
         map admin logger "GET" "/social-links" "/api/v0/admin/social-links" adminSocialLinks
-        map admin logger "PUT" "/social-links" "/api/v0/admin/social-links" adminPlaceholder
+        map admin logger "PUT" "/social-links" "/api/v0/admin/social-links" (csrfProtected adminSocialLinksUpdate)
         map admin logger "GET" "/donation-goal" "/api/v0/admin/donation-goal" adminDonationGoal
-        map admin logger "PUT" "/donation-goal" "/api/v0/admin/donation-goal" adminPlaceholder
-        map admin logger "GET" "/playlists" "/api/v0/admin/playlists" adminPlaceholder
-        map admin logger "POST" "/playlists" "/api/v0/admin/playlists" adminPlaceholder
-        map admin logger "GET" "/playlists/{playlistId}/items" "/api/v0/admin/playlists/{playlistId}/items" adminPlaceholder
-        map admin logger "POST" "/playlists/{playlistId}/items" "/api/v0/admin/playlists/{playlistId}/items" adminPlaceholder
-        map admin logger "PUT" "/playlists/{playlistId}/items" "/api/v0/admin/playlists/{playlistId}/items" adminPlaceholder
+        map admin logger "PUT" "/donation-goal" "/api/v0/admin/donation-goal" (csrfProtected adminDonationGoalUpdate)
+        map admin logger "POST" "/library/scan" "/api/v0/admin/library/scan" (csrfProtected libraryScan)
+        map admin logger "GET" "/library/scan/{scanJobId}" "/api/v0/admin/library/scan/{scanJobId}" libraryScanStatus
+        map admin logger "GET" "/tracks" "/api/v0/admin/tracks" adminTracks
+        map admin logger "POST" "/playback/queue" "/api/v0/admin/playback/queue" (csrfProtected adminQueueTrack)
+        map admin logger "GET" "/playlists" "/api/v0/admin/playlists" adminPlaylists
+        map admin logger "POST" "/playlists" "/api/v0/admin/playlists" (csrfProtected createPlaylist)
+        map admin logger "PUT" "/playlists/{playlistId}" "/api/v0/admin/playlists/{playlistId}" (csrfProtected updatePlaylist)
+        map admin logger "GET" "/playlists/{playlistId}/items" "/api/v0/admin/playlists/{playlistId}/items" playlistItems
+        map admin logger "POST" "/playlists/{playlistId}/items" "/api/v0/admin/playlists/{playlistId}/items" (csrfProtected createPlaylistItem)
+        map admin logger "PUT" "/playlists/{playlistId}/items" "/api/v0/admin/playlists/{playlistId}/items" (csrfProtected replacePlaylistItems)
         map admin logger "GET" "/say-messages" "/api/v0/admin/say-messages" adminSayMessages
-        map admin logger "POST" "/say-messages/{messageId}/approve" "/api/v0/admin/say-messages/{messageId}/approve" approveSayMessage
-        map admin logger "POST" "/say-messages/{messageId}/reject" "/api/v0/admin/say-messages/{messageId}/reject" rejectSayMessage
-        map admin logger "GET" "/storage" "/api/v0/admin/storage" adminPlaceholder
-        map admin logger "PUT" "/storage" "/api/v0/admin/storage" adminPlaceholder
-        map admin logger "POST" "/library/scan" "/api/v0/admin/library/scan" adminPlaceholder
-        map admin logger "GET" "/stream-node/status" "/api/v0/admin/stream-node/status" adminPlaceholder
-        map admin logger "POST" "/stream-node/restart" "/api/v0/admin/stream-node/restart" adminPlaceholder
+        map admin logger "POST" "/say-messages/{messageId}/approve" "/api/v0/admin/say-messages/{messageId}/approve" (csrfProtected approveSayMessage)
+        map admin logger "POST" "/say-messages/{messageId}/reject" "/api/v0/admin/say-messages/{messageId}/reject" (csrfProtected rejectSayMessage)
+        map admin logger "GET" "/storage" "/api/v0/admin/storage" adminStorage
+        map admin logger "PUT" "/storage" "/api/v0/admin/storage" (csrfProtected adminStorageUpdate)
+        map admin logger "GET" "/stream-node/status" "/api/v0/admin/stream-node/status" adminStreamStatus
+        map admin logger "POST" "/stream-node/start" "/api/v0/admin/stream-node/start" (csrfProtected (adminStreamControl "start"))
+        map admin logger "POST" "/stream-node/stop" "/api/v0/admin/stream-node/stop" (csrfProtected (adminStreamControl "stop"))
+        map admin logger "POST" "/stream-node/restart" "/api/v0/admin/stream-node/restart" (csrfProtected (adminStreamControl "restart"))

@@ -25,6 +25,7 @@ type private TelegramCallbackInteraction =
     { TelegramUpdateId: int64
       ChatId: int64 option
       TelegramUserId: int64
+      DisplayName: string option
       LanguageCode: string option
       CallbackQueryId: string
       RawCallbackData: string
@@ -147,6 +148,7 @@ module private TelegramWorkflowJson =
                 { TelegramUpdateId = updateId
                   ChatId = chatId
                   TelegramUserId = userId
+                  DisplayName = optionalString "displayName" root
                   LanguageCode = optionalString "languageCode" root
                   CallbackQueryId = callbackQueryId
                   RawCallbackData = rawCallbackData
@@ -468,6 +470,7 @@ type TelegramBotWorkflow
                                           PurposeEntityId = Some message.Id
                                           AmountStars = options.SayPriceStars
                                           InvoicePayload = paymentId.ToString("D")
+                                          PayerDisplayName = Some message.DisplayName
                                           CreatedAtUtc = clock.UtcNow }
                                     let! created = TelegramCommandRepository.createSayWithPaymentInTransaction connection transaction message options.SayPriceStars order token
                                     match created |> mapRepository with
@@ -588,6 +591,7 @@ type TelegramBotWorkflow
                                           PurposeEntityId = Some requestId
                                           AmountStars = options.RequestPriceStars
                                           InvoicePayload = paymentId.ToString("D")
+                                          PayerDisplayName = callback.DisplayName
                                           CreatedAtUtc = clock.UtcNow }
                                     let! created = TelegramCommandRepository.createRequestPaymentInTransaction connection transaction requestId callback.TelegramUserId order token
                                     match created |> mapRepository with

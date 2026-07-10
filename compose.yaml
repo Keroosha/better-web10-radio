@@ -41,22 +41,29 @@ services:
     ports:
       - "8080:8080"
     environment:
+      # Development vertical-slice env (SPEC §9): fixtures on, session admin, long-poll toggle.
       ASPNETCORE_URLS: http://+:8080
+      ASPNETCORE_ENVIRONMENT: Development
       WEB10_POSTGRES__CONNECTION_STRING: Host=postgres;Port=5432;Database=web10;Username=web10;Password=web10;SSL Mode=Disable;GSS Encryption Mode=Disable
       WEB10_TELEGRAM__BOT_TOKEN: 123456:compose_smoke_token_1234567890
       WEB10_TELEGRAM__WEBHOOK_SECRET: compose-smoke-webhook-secret
       WEB10_TELEGRAM__CHANNEL_ID_OR_USERNAME: "@netscapedidnothingwrong"
       WEB10_TELEGRAM__REQUEST_PRICE_STARS: 100
       WEB10_TELEGRAM__SAY_PRICE_STARS: 50
-      WEB10_ADMIN__TOKEN: compose-smoke-admin-token-1234567890
+      # Webhook keeps the smoke run offline (no external Telegram calls). To receive real
+      # /say + Stars in the e2e session, set LongPolling and a real WEB10_TELEGRAM__BOT_TOKEN.
+      WEB10_TELEGRAM__UPDATE_MODE: Webhook
+      WEB10_ADMIN__USERNAME: admin
+      WEB10_ADMIN__PASSWORD: compose-smoke-admin-password
       WEB10_STREAM__RTMP_URL: rtmps://dc4-1.rtmp.t.me/s/
       WEB10_STREAM__RTMP_KEY: compose-smoke-rtmp-key
-      WEB10_STREAM__STAGE_URL: http://localhost:5173/
+      WEB10_STREAM__STAGE_URL: http://frontend/
       WEB10_STREAM__CALLBACK_TOKEN: compose-smoke-callback-token-1234567890
       WEB10_STORAGE__TYPE: Local
       WEB10_STORAGE__LOCAL_ROOT: /var/lib/web10/storage
       WEB10_OTEL__EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
       WEB10_DATA_PROTECTION__KEY_RING_PATH: /var/lib/web10/data-protection
+      WEB10_DEV__FIXTURES_ENABLED: "true"
     volumes:
       - web10-storage:/var/lib/web10/storage
       - web10-data-protection:/var/lib/web10/data-protection
@@ -66,6 +73,19 @@ services:
       timeout: 5s
       retries: 30
       start_period: 5s
+    restart: unless-stopped
+
+  frontend:
+    image: web10-radio-frontend:local
+    build:
+      context: ./src/frontend
+      dockerfile: Dockerfile
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      # Public stage at http://localhost:8090/ ; admin cabinet at http://localhost:8090/admin/
+      - "8090:80"
     restart: unless-stopped
 
 volumes:

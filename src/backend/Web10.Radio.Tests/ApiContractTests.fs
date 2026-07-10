@@ -8,12 +8,14 @@ open System.Net
 open System.Net.Http
 open System.Text
 open System.Text.Json
+open System.Security.Cryptography
 open System.Threading
 open System.Threading.Tasks
 open Microsoft.AspNetCore.Hosting
 open Microsoft.AspNetCore.Http
 open Microsoft.AspNetCore.Http.Features
 open Microsoft.AspNetCore.Mvc.Testing
+open Microsoft.AspNetCore.Identity
 open Microsoft.Extensions.Configuration
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Logging
@@ -27,7 +29,10 @@ module ApiContractTests =
     let private WebhookSecret = "test-webhook-secret"
 
     [<Literal>]
-    let private AdminToken = "admin-token-Secret_1234567890"
+    let private AdminUsername = "test-admin"
+
+    [<Literal>]
+    let private AdminPassword = "test-admin-password-1234567890"
 
     type private SseEvent =
         { Name: string
@@ -48,7 +53,8 @@ module ApiContractTests =
               "STORAGE:TYPE", "Local"
               "STORAGE:LOCAL_ROOT", Path.Combine(tempRoot, "library")
               "OTEL:EXPORTER_OTLP_ENDPOINT", "http://localhost:4317"
-              "ADMIN:TOKEN", AdminToken
+              "ADMIN:USERNAME", AdminUsername
+              "ADMIN:PASSWORD", AdminPassword
               "DATA_PROTECTION:KEY_RING_PATH", Path.Combine(tempRoot, "keys") ]
 
         let web10Mirrors =
@@ -57,6 +63,10 @@ module ApiContractTests =
 
         strippedPairs @ web10Mirrors
         |> List.map (fun (key, value) -> KeyValuePair<string, string>(key, value))
+
+    type private AdminSession =
+        { Username: string
+          CsrfToken: string }
 
     type private FixedClock(nowUtc: DateTimeOffset) =
         interface Web10.Radio.API.IClock with
@@ -95,6 +105,10 @@ module ApiContractTests =
             member _.AnswerCallbackAsync(_callbackQueryId, _text, _cancellationToken) = ok ()
 
             member _.AnswerPreCheckoutAsync(_preCheckoutQueryId, _errorMessage, _cancellationToken) = ok ()
+
+            member _.GetUpdatesAsync(_offset, _timeoutSeconds, _cancellationToken) = Task.FromResult(Ok [||])
+
+            member _.DeleteWebhookAsync(_dropPendingUpdates, _cancellationToken) = ok ()
 
     type private CapturedLog =
         { Level: LogLevel
@@ -182,7 +196,7 @@ module ApiContractTests =
             task {
                 let tempRoot = Directory.CreateTempSubdirectory("web10-radio-api-tests-")
                 let factory = createFactory connectionString tempRoot.FullName None None None
-                let client = factory.CreateClient()
+                let client = factory.CreateClient(WebApplicationFactoryClientOptions(HandleCookies = true))
 
                 try
                     let! result = work connectionString client
@@ -210,7 +224,7 @@ module ApiContractTests =
                         None
                         (Some(delay :> Web10.Radio.API.IPlayerEventsDelay))
 
-                let client = factory.CreateClient()
+                let client = factory.CreateClient(WebApplicationFactoryClientOptions(HandleCookies = true))
 
                 try
                     return! work connectionString client
@@ -226,7 +240,7 @@ module ApiContractTests =
                 let tempRoot = Directory.CreateTempSubdirectory("web10-radio-api-tests-")
                 let clock = FixedClock(nowUtc) :> Web10.Radio.API.IClock
                 let factory = createFactory connectionString tempRoot.FullName (Some clock) None None
-                let client = factory.CreateClient()
+                let client = factory.CreateClient(WebApplicationFactoryClientOptions(HandleCookies = true))
 
                 try
                     let! result = work connectionString tempRoot.FullName client
@@ -250,7 +264,7 @@ module ApiContractTests =
                         .WithWebHostBuilder(fun builder ->
                             builder.ConfigureServices(fun services -> configureServices services) |> ignore)
 
-                let client = factory.CreateClient()
+                let client = factory.CreateClient(WebApplicationFactoryClientOptions(HandleCookies = true))
 
                 try
                     return! work connectionString tempRoot.FullName factory client
@@ -324,40 +338,23 @@ module ApiContractTests =
             return! client.SendAsync(request)
         }
 
-    let private sendAdminRequest (client: HttpClient) (authorization: string option) (method': HttpMethod) (uri: string) =
+    let private sendAdminRequest (client: HttpClient) (csrfToken: string option) (method': HttpMethod) (uri: string) =
         task {
             use request = new HttpRequestMessage(method', uri)
 
             if method' <> HttpMethod.Get then
                 request.Content <- new StringContent("{}", Encoding.UTF8, "application/json")
 
-            match authorization with
-            | Some value -> request.Headers.TryAddWithoutValidation("Authorization", value) |> ignore
+            match csrfToken with
+            | Some value -> request.Headers.TryAddWithoutValidation("X-CSRF-Token", value) |> ignore
             | None -> ()
 
             return! client.SendAsync(request)
         }
 
-    let private sendAdminRequestWithAuthorizations
-        (client: HttpClient)
-        (authorizations: string list)
-        (method': HttpMethod)
-        (uri: string)
-        =
-        task {
-            use request = new HttpRequestMessage(method', uri)
-
-            if method' <> HttpMethod.Get then
-                request.Content <- new StringContent("{}", Encoding.UTF8, "application/json")
-
-            for authorization in authorizations do
-                request.Headers.TryAddWithoutValidation("Authorization", authorization) |> ignore
-
-            return! client.SendAsync(request)
-        }
     let private sendAdminJson
         (client: HttpClient)
-        (authorization: string option)
+        (csrfToken: string option)
         (uri: string)
         (body: string)
         =
@@ -365,11 +362,51 @@ module ApiContractTests =
             use request = new HttpRequestMessage(HttpMethod.Post, uri)
             request.Content <- new StringContent(body, Encoding.UTF8, "application/json")
 
-            match authorization with
-            | Some value -> request.Headers.TryAddWithoutValidation("Authorization", value) |> ignore
+            match csrfToken with
+            | Some value -> request.Headers.TryAddWithoutValidation("X-CSRF-Token", value) |> ignore
             | None -> ()
 
             return! client.SendAsync(request)
+        }
+
+    let private sendAdminJsonWithMethod
+        (client: HttpClient)
+        (csrfToken: string option)
+        (method': HttpMethod)
+        (uri: string)
+        (body: string)
+        =
+        task {
+            use request = new HttpRequestMessage(method', uri)
+            request.Content <- new StringContent(body, Encoding.UTF8, "application/json")
+
+            match csrfToken with
+            | Some value -> request.Headers.TryAddWithoutValidation("X-CSRF-Token", value) |> ignore
+            | None -> ()
+
+            return! client.SendAsync(request)
+        }
+
+    let private sendAdminLogin (client: HttpClient) username password =
+        task {
+            use request = new HttpRequestMessage(HttpMethod.Post, "/api/v0/admin/auth/login")
+            request.Content <- new StringContent(sprintf "{\"username\":%s,\"password\":%s}" (JsonSerializer.Serialize(username)) (JsonSerializer.Serialize(password)), Encoding.UTF8, "application/json")
+            return! client.SendAsync(request)
+        }
+
+    let private loginAdmin (client: HttpClient) =
+        task {
+            let! response = sendAdminLogin client AdminUsername AdminPassword
+            use response = response
+            Assert.That(response.StatusCode, Is.EqualTo(HttpStatusCode.OK), "The configured bootstrap administrator must establish a session.")
+            let! document = jsonDocument response
+            use document = document
+            let session =
+                { Username = document.RootElement |> stringProperty "username"
+                  CsrfToken = document.RootElement |> stringProperty "csrfToken" }
+            Assert.That(session.Username, Is.EqualTo(AdminUsername))
+            Assert.That(String.IsNullOrWhiteSpace(session.CsrfToken), Is.False, "A successful login must issue a nonempty synchronizer token.")
+            return session
         }
 
     let private sendPlaybackCallback
@@ -474,6 +511,29 @@ WHERE "EventType" = @EventType
             command.Parameters.AddWithValue("EventType", eventType) |> ignore
             let! count = command.ExecuteScalarAsync()
             return Convert.ToInt32(count)
+        }
+
+    let private seedBootstrapAdmin connectionString =
+        task {
+            let nowUtc = DateTimeOffset.UtcNow
+            let user: Web10.Radio.Database.Repositories.AdminUser =
+                { Id = Guid.NewGuid()
+                  Username = AdminUsername
+                  NormalizedUsername = AdminUsername.ToUpperInvariant()
+                  PasswordHash = ""
+                  CreatedAtUtc = nowUtc
+                  UpdatedAtUtc = nowUtc }
+            let passwordHash = PasswordHasher<Web10.Radio.Database.Repositories.AdminUser>().HashPassword(user, AdminPassword)
+            use connection = new NpgsqlConnection(connectionString)
+            do! connection.OpenAsync()
+            use command = new NpgsqlCommand("INSERT INTO \"AdminUsers\" (\"Id\", \"Username\", \"NormalizedUsername\", \"PasswordHash\", \"IsDeleted\", \"CreatedAtUtc\", \"UpdatedAtUtc\") VALUES (@Id, @Username, @NormalizedUsername, @PasswordHash, false, @NowUtc, @NowUtc);", connection)
+            command.Parameters.AddWithValue("Id", user.Id) |> ignore
+            command.Parameters.AddWithValue("Username", user.Username) |> ignore
+            command.Parameters.AddWithValue("NormalizedUsername", user.NormalizedUsername) |> ignore
+            command.Parameters.AddWithValue("PasswordHash", passwordHash) |> ignore
+            command.Parameters.AddWithValue("NowUtc", nowUtc) |> ignore
+            let! _ = command.ExecuteNonQueryAsync()
+            return ()
         }
 
     let private countTrackRequestRows (connectionString: string) (query: string) =
@@ -827,21 +887,25 @@ VALUES (@SayMessageId, 'SSE sender', 'SSE moderation payload', 100, '#e0439a', '
 
 
 
-    let private adminRoutes =
-        [ HttpMethod.Get, "/api/v0/admin/social-links", HttpStatusCode.OK
-          HttpMethod.Put, "/api/v0/admin/social-links", HttpStatusCode.NotImplemented
-          HttpMethod.Get, "/api/v0/admin/donation-goal", HttpStatusCode.OK
-          HttpMethod.Put, "/api/v0/admin/donation-goal", HttpStatusCode.NotImplemented
-          HttpMethod.Get, "/api/v0/admin/playlists", HttpStatusCode.NotImplemented
-          HttpMethod.Post, "/api/v0/admin/playlists", HttpStatusCode.NotImplemented
-          HttpMethod.Get, "/api/v0/admin/playlists/01920000-0000-7000-8000-000000000111/items", HttpStatusCode.NotImplemented
-          HttpMethod.Post, "/api/v0/admin/playlists/01920000-0000-7000-8000-000000000111/items", HttpStatusCode.NotImplemented
-          HttpMethod.Put, "/api/v0/admin/playlists/01920000-0000-7000-8000-000000000111/items", HttpStatusCode.NotImplemented
-          HttpMethod.Get, "/api/v0/admin/storage", HttpStatusCode.NotImplemented
-          HttpMethod.Put, "/api/v0/admin/storage", HttpStatusCode.NotImplemented
-          HttpMethod.Post, "/api/v0/admin/library/scan", HttpStatusCode.NotImplemented
-          HttpMethod.Get, "/api/v0/admin/stream-node/status", HttpStatusCode.NotImplemented
-          HttpMethod.Post, "/api/v0/admin/stream-node/restart", HttpStatusCode.NotImplemented ]
+    let private formerlyPlaceholderAdminRoutes =
+        [ HttpMethod.Post, "/api/v0/admin/library/scan", "{}"
+          HttpMethod.Get, "/api/v0/admin/library/scan/01920000-0000-7000-8000-000000000101", ""
+          HttpMethod.Get, "/api/v0/admin/tracks", ""
+          HttpMethod.Post, "/api/v0/admin/playback/queue", "{\"trackId\":\"01920000-0000-7000-8000-000000000102\"}"
+          HttpMethod.Put, "/api/v0/admin/social-links", "[]"
+          HttpMethod.Put, "/api/v0/admin/donation-goal", "{\"title\":\"Goal\",\"goalStars\":100}"
+          HttpMethod.Get, "/api/v0/admin/playlists", ""
+          HttpMethod.Post, "/api/v0/admin/playlists", "{\"name\":\"Mix\",\"description\":null,\"isActive\":false}"
+          HttpMethod.Put, "/api/v0/admin/playlists/01920000-0000-7000-8000-000000000103", "{\"name\":\"Mix\",\"description\":null,\"isActive\":false}"
+          HttpMethod.Get, "/api/v0/admin/playlists/01920000-0000-7000-8000-000000000103/items", ""
+          HttpMethod.Post, "/api/v0/admin/playlists/01920000-0000-7000-8000-000000000103/items", "{\"trackId\":\"01920000-0000-7000-8000-000000000102\"}"
+          HttpMethod.Put, "/api/v0/admin/playlists/01920000-0000-7000-8000-000000000103/items", "{\"items\":[]}"
+          HttpMethod.Get, "/api/v0/admin/storage", ""
+          HttpMethod.Put, "/api/v0/admin/storage", "{\"additionalBackends\":[]}"
+          HttpMethod.Get, "/api/v0/admin/stream-node/status", ""
+          HttpMethod.Post, "/api/v0/admin/stream-node/start", "{}"
+          HttpMethod.Post, "/api/v0/admin/stream-node/stop", "{}"
+          HttpMethod.Post, "/api/v0/admin/stream-node/restart", "{}" ]
 
     let private outboxPayloadText connectionString eventType =
         task {
@@ -890,60 +954,145 @@ LIMIT 1;""",
         }
 
     [<Test>]
-    let ``every admin route rejects missing wrong and multiple bearer values before its handler`` () =
-        withApiClient (fun connectionString client ->
+    let ``admin login persists only a hashed eight-hour cookie session restores without rotation and logout revokes it`` () =
+        let nowUtc = DateTimeOffset(2026, 7, 10, 15, 0, 0, TimeSpan.Zero)
+
+        withApiClientAt nowUtc (fun connectionString _ client ->
             task {
-                do! seedAdminReadModels connectionString
+                let! login = sendAdminLogin client AdminUsername AdminPassword
+                use login = login
+                Assert.That(login.StatusCode, Is.EqualTo(HttpStatusCode.OK))
+                let! loginDocument = jsonDocument login
+                use loginDocument = loginDocument
+                let csrfToken = loginDocument.RootElement |> stringProperty "csrfToken"
+                Assert.That(loginDocument.RootElement |> stringProperty "username", Is.EqualTo(AdminUsername))
+                let setCookie = login.Headers.GetValues("Set-Cookie") |> Seq.find (fun value -> value.StartsWith("web10_admin_session=", StringComparison.Ordinal))
+                let cookieAttributes =
+                    setCookie.Split(';')
+                    |> Seq.skip 1
+                    |> Seq.map (fun value -> value.Trim().ToLowerInvariant())
+                    |> Set.ofSeq
+                Assert.That(cookieAttributes.Contains("httponly"), Is.True)
+                Assert.That(cookieAttributes.Contains("samesite=strict"), Is.True)
+                Assert.That(cookieAttributes.Contains("path=/api/v0/admin"), Is.True)
+                Assert.That(cookieAttributes.Contains("max-age=28800"), Is.True)
+                Assert.That(cookieAttributes.Contains("secure"), Is.False, "Development permits the localhost HTTP test host.")
+                let token = setCookie.Split(';').[0].Split('=').[1]
+                let tokenHash = SHA256.HashData(Encoding.UTF8.GetBytes(token)) |> Convert.ToHexString |> fun value -> value.ToLowerInvariant()
 
-                let rejectedCredentials =
-                    [ "missing", []
-                      "wrong", [ "Bearer wrong-admin-token-Secret_123456" ]
-                      "multiple", [ sprintf "Bearer %s" AdminToken; "Bearer another-admin-token-Secret_123456" ] ]
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+                use persisted = new NpgsqlCommand("SELECT encode(\"TokenHash\", 'hex'), EXTRACT(EPOCH FROM (\"ExpiresAtUtc\" - \"CreatedAtUtc\"))::bigint FROM \"AdminSessions\" WHERE \"IsDeleted\" = false;", connection)
+                use! persistedReader = persisted.ExecuteReaderAsync()
+                let! found = persistedReader.ReadAsync()
+                Assert.That(found, Is.True)
+                Assert.That(persistedReader.GetString(0), Is.EqualTo(tokenHash), "The bearer cookie value must never be stored as the authentication credential.")
+                Assert.That(persistedReader.GetInt64(1), Is.EqualTo(28800L), "Sessions have a fixed eight-hour lifetime.")
+                do! persistedReader.CloseAsync()
 
-                for method', uri, expectedAuthorizedStatus in adminRoutes do
-                    for credentialName, authorizations in rejectedCredentials do
-                        let! rejected = sendAdminRequestWithAuthorizations client authorizations method' uri
-                        use rejected = rejected
+                let! restored = client.GetAsync("/api/v0/admin/auth/session")
+                use restored = restored
+                Assert.That(restored.StatusCode, Is.EqualTo(HttpStatusCode.OK))
+                Assert.That(restored.Headers.Contains("Set-Cookie"), Is.False, "Session probing must not rotate an opaque session.")
+                let! restoredDocument = jsonDocument restored
+                use restoredDocument = restoredDocument
+                Assert.That(restoredDocument.RootElement |> stringProperty "csrfToken", Is.EqualTo(csrfToken))
 
-                        Assert.That(
-                            rejected.StatusCode,
-                            Is.EqualTo(HttpStatusCode.Unauthorized),
-                            sprintf "%O %s with %s credentials" method' uri credentialName
-                        )
+                use expire = new NpgsqlCommand("UPDATE \"AdminSessions\" SET \"ExpiresAtUtc\" = @ExpiredAtUtc WHERE \"IsDeleted\" = false;", connection)
+                expire.Parameters.AddWithValue("ExpiredAtUtc", nowUtc.AddTicks(-1L)) |> ignore
+                let! _ = expire.ExecuteNonQueryAsync()
+                let! expired = client.GetAsync("/api/v0/admin/auth/session")
+                use expired = expired
+                Assert.That(expired.StatusCode, Is.EqualTo(HttpStatusCode.Unauthorized))
+                do! assertProblemCode "admin.auth.required" expired
 
-                        Assert.That(
-                            rejected.Headers.GetValues("WWW-Authenticate") |> String.concat ",",
-                            Is.EqualTo("Bearer"),
-                            sprintf "%O %s must issue the Bearer challenge for %s credentials" method' uri credentialName
-                        )
-
-                        do! assertProblemCode "admin.auth.required" rejected
-
-                    let! authorized = sendAdminRequest client (Some(sprintf "Bearer %s" AdminToken)) method' uri
-                    use authorized = authorized
-                    Assert.That(authorized.StatusCode, Is.EqualTo(expectedAuthorizedStatus), sprintf "%O %s with valid bearer" method' uri)
+                let! secondSession = loginAdmin client
+                let! logout = sendAdminRequest client (Some secondSession.CsrfToken) HttpMethod.Post "/api/v0/admin/auth/logout"
+                use logout = logout
+                Assert.That(logout.StatusCode, Is.EqualTo(HttpStatusCode.NoContent))
+                Assert.That(logout.Headers.GetValues("Set-Cookie") |> Seq.exists (fun value -> value.Contains("Max-Age=0", StringComparison.Ordinal)), Is.True)
+                use revoked = new NpgsqlCommand("SELECT count(*) FROM \"AdminSessions\" WHERE \"RevokedAtUtc\" IS NOT NULL AND \"IsDeleted\" = false;", connection)
+                let! revokedCount = revoked.ExecuteScalarAsync()
+                Assert.That(Convert.ToInt32(revokedCount), Is.EqualTo(1), "Logout must revoke the active server-side session.")
+                let! afterLogout = client.GetAsync("/api/v0/admin/auth/session")
+                use afterLogout = afterLogout
+                Assert.That(afterLogout.StatusCode, Is.EqualTo(HttpStatusCode.Unauthorized))
             })
+
     [<Test>]
-    let ``say moderation routes require bearer authentication before examining status ids or bodies`` () =
+    let ``admin login keeps invalid credentials indistinguishable and rejects malformed or oversized bodies`` () =
         withApiClient (fun _ client ->
             task {
-                let messageId = Guid.NewGuid().ToString("D")
+                let attempts = [ "missing user", "wrong-password"; "wrong-user", AdminPassword ]
+                let responses = ResizeArray<HttpStatusCode * string * string * string>()
 
-                let rejectedCredentials =
-                    [ "missing", []
-                      "wrong", [ "Bearer wrong-admin-token-Secret_123456" ]
-                      "multiple", [ sprintf "Bearer %s" AdminToken; "Bearer another-admin-token-Secret_123456" ] ]
+                for username, password in attempts do
+                    let! response = sendAdminLogin client username password
+                    use response = response
+                    Assert.That(response.StatusCode, Is.EqualTo(HttpStatusCode.Unauthorized))
+                    let! document = jsonDocument response
+                    use document = document
+                    let problem = document.RootElement
+                    let code = problem |> stringProperty "code"
+                    Assert.That(code, Is.EqualTo("admin.auth.invalid_credentials"))
+                    responses.Add((response.StatusCode, code, problem |> stringProperty "title", problem |> stringProperty "message"))
 
-                for method', uri in
-                    [ HttpMethod.Get, "/api/v0/admin/say-messages?status=pending"
-                      HttpMethod.Post, sprintf "/api/v0/admin/say-messages/%s/approve" messageId
-                      HttpMethod.Post, sprintf "/api/v0/admin/say-messages/%s/reject" messageId ] do
-                    for credentialName, authorizations in rejectedCredentials do
-                        let! response = sendAdminRequestWithAuthorizations client authorizations method' uri
-                        use response = response
-                        Assert.That(response.StatusCode, Is.EqualTo(HttpStatusCode.Unauthorized), sprintf "%s %s" credentialName uri)
-                        Assert.That(response.Headers.GetValues("WWW-Authenticate") |> String.concat ",", Is.EqualTo("Bearer"), uri)
-                        do! assertProblemCode "admin.auth.required" response
+                Assert.That(responses.[0], Is.EqualTo(responses.[1]), "Unknown usernames and wrong passwords must expose the same status and public problem details, excluding per-request trace IDs.")
+
+                for malformed in [ "[]"; "{\"username\":\"admin\",\"password\":\"password-1234\",\"extra\":true}"; "{\"username\":\"   \",\"password\":\"password-1234\"}" ] do
+                    use malformedRequest = new HttpRequestMessage(HttpMethod.Post, "/api/v0/admin/auth/login")
+                    malformedRequest.Content <- new StringContent(malformed, Encoding.UTF8, "application/json")
+                    let! malformedResponse = client.SendAsync(malformedRequest)
+                    use malformedResponse = malformedResponse
+                    Assert.That(malformedResponse.StatusCode, Is.EqualTo(HttpStatusCode.BadRequest))
+                    do! assertProblemCode "admin.auth.request_invalid" malformedResponse
+
+                let oversized = "{\"username\":\"admin\",\"password\":\"" + String.replicate 4096 "x" + "\"}"
+                use oversizedRequest = new HttpRequestMessage(HttpMethod.Post, "/api/v0/admin/auth/login")
+                oversizedRequest.Content <- new StringContent(oversized, Encoding.UTF8, "application/json")
+                let! oversizedResponse = client.SendAsync(oversizedRequest)
+                use oversizedResponse = oversizedResponse
+                Assert.That(oversizedResponse.StatusCode, Is.EqualTo(HttpStatusCode.RequestEntityTooLarge))
+                do! assertProblemCode "request.too_large" oversizedResponse
+            })
+
+    [<Test>]
+    let ``admin session is the only credential and every formerly-placeholder route enforces CSRF before returning a domain response`` () =
+        withApiClient (fun _ client ->
+            task {
+                for method', uri, body in formerlyPlaceholderAdminRoutes do
+                    let! anonymous = sendAdminJsonWithMethod client None method' uri (if body = "" then "{}" else body)
+                    use anonymous = anonymous
+                    Assert.That(anonymous.StatusCode, Is.EqualTo(HttpStatusCode.Unauthorized), sprintf "%O %s must require a session cookie." method' uri)
+                    do! assertProblemCode "admin.auth.required" anonymous
+
+                use bearerRequest = new HttpRequestMessage(HttpMethod.Get, "/api/v0/admin/social-links")
+                bearerRequest.Headers.TryAddWithoutValidation("Authorization", "Bearer legacy-admin-token") |> ignore
+                let! bearer = client.SendAsync(bearerRequest)
+                use bearer = bearer
+                Assert.That(bearer.StatusCode, Is.EqualTo(HttpStatusCode.Unauthorized), "Authorization headers must not provide a bearer compatibility path.")
+                do! assertProblemCode "admin.auth.required" bearer
+
+                let! session = loginAdmin client
+
+                for method', uri, body in formerlyPlaceholderAdminRoutes do
+                    if method' <> HttpMethod.Get then
+                        let! csrfRejected = sendAdminJsonWithMethod client None method' uri body
+                        use csrfRejected = csrfRejected
+                        Assert.That(csrfRejected.StatusCode, Is.EqualTo(HttpStatusCode.Forbidden), sprintf "%O %s must reject a missing synchronizer token." method' uri)
+                        do! assertProblemCode "admin.auth.csrf_invalid" csrfRejected
+
+                    let! domainResponse = sendAdminJsonWithMethod client (Some session.CsrfToken) method' uri (if body = "" then "{}" else body)
+                    use domainResponse = domainResponse
+                    Assert.That(domainResponse.StatusCode, Is.Not.EqualTo(HttpStatusCode.NotImplemented), sprintf "%O %s must be mapped to a domain handler." method' uri)
+                    Assert.That(domainResponse.StatusCode, Is.Not.EqualTo(HttpStatusCode.Unauthorized), sprintf "%O %s must accept the active session." method' uri)
+                    Assert.That(domainResponse.StatusCode, Is.Not.EqualTo(HttpStatusCode.Forbidden), sprintf "%O %s must accept the valid synchronizer token." method' uri)
+
+                for uri in [ sprintf "/api/v0/admin/say-messages/%O/approve" (Guid.NewGuid()); sprintf "/api/v0/admin/say-messages/%O/reject" (Guid.NewGuid()) ] do
+                    let! csrfRejected = sendAdminJson client None uri "{}"
+                    use csrfRejected = csrfRejected
+                    Assert.That(csrfRejected.StatusCode, Is.EqualTo(HttpStatusCode.Forbidden), "Say moderation is an admin mutation and must participate in the global CSRF matrix.")
+                    do! assertProblemCode "admin.auth.csrf_invalid" csrfRejected
             })
 
     [<Test>]
@@ -983,19 +1132,20 @@ LIMIT 1;""",
                         (Some(nowUtc.AddSeconds(30.0)))
                         false
 
-                let bearer = Some(sprintf "Bearer %s" AdminToken)
+                let! session = loginAdmin client
+                let csrf = Some session.CsrfToken
 
                 for uri in
                     [ "/api/v0/admin/say-messages"
                       "/api/v0/admin/say-messages?status=Pending"
                       "/api/v0/admin/say-messages?status=pending&status=approved"
                       "/api/v0/admin/say-messages?status=unknown" ] do
-                    let! invalid = sendAdminRequest client bearer HttpMethod.Get uri
+                    let! invalid = sendAdminRequest client csrf HttpMethod.Get uri
                     use invalid = invalid
                     Assert.That(invalid.StatusCode, Is.EqualTo(HttpStatusCode.BadRequest), uri)
                     do! assertProblemCode "say.status.invalid" invalid
 
-                let! response = sendAdminRequest client bearer HttpMethod.Get "/api/v0/admin/say-messages?status=pending"
+                let! response = sendAdminRequest client csrf HttpMethod.Get "/api/v0/admin/say-messages?status=pending"
                 use response = response
                 Assert.That(response.StatusCode, Is.EqualTo(HttpStatusCode.OK))
                 let! document = jsonDocument response
@@ -1038,7 +1188,8 @@ LIMIT 1;""",
                         (Some nowUtc)
                         false
 
-                let bearer = Some(sprintf "Bearer %s" AdminToken)
+                let! session = loginAdmin client
+                let csrf = Some session.CsrfToken
                 let approveUri = sprintf "/api/v0/admin/say-messages/%O/approve" messageId
                 let rejectUri = sprintf "/api/v0/admin/say-messages/%O/reject" messageId
                 let oversized = "\"" + String.replicate 2049 "x" + "\""
@@ -1053,7 +1204,7 @@ LIMIT 1;""",
                       rejectUri, sprintf "{\"reason\":\"%s\"}" (String.replicate 501 "x")
                       "/api/v0/admin/say-messages/not-a-guid/approve", "{}"
                       "/api/v0/admin/say-messages/00000000-0000-0000-0000-000000000000/reject", "{\"reason\":\"valid\"}" ] do
-                    let! invalid = sendAdminJson client bearer uri body
+                    let! invalid = sendAdminJson client csrf uri body
                     use invalid = invalid
                     Assert.That(invalid.StatusCode, Is.EqualTo(HttpStatusCode.BadRequest), uri)
                     do! assertProblemCode "say.request.invalid" invalid
@@ -1071,7 +1222,8 @@ LIMIT 1;""",
                 let approvedId = Guid.NewGuid()
                 let rejectedId = Guid.NewGuid()
                 let deletedId = Guid.NewGuid()
-                let bearer = Some(sprintf "Bearer %s" AdminToken)
+                let! session = loginAdmin client
+                let csrf = Some session.CsrfToken
 
                 for messageId, displayName, text, isDeleted in
                     [ approvedId, "Approved sender", "visible after moderation", false
@@ -1097,7 +1249,7 @@ LIMIT 1;""",
                 let! missing =
                     sendAdminJson
                         client
-                        bearer
+                        csrf
                         (sprintf "/api/v0/admin/say-messages/%O/approve" (Guid.NewGuid()))
                         "{}"
 
@@ -1108,7 +1260,7 @@ LIMIT 1;""",
                 let! deleted =
                     sendAdminJson
                         client
-                        bearer
+                        csrf
                         (sprintf "/api/v0/admin/say-messages/%O/reject" deletedId)
                         "{\"reason\":\"gone\"}"
 
@@ -1117,14 +1269,14 @@ LIMIT 1;""",
                 do! assertProblemCode "say.not_found" deleted
 
                 let approveUri = sprintf "/api/v0/admin/say-messages/%O/approve" approvedId
-                let! firstApproval = sendAdminJson client bearer approveUri "{}"
+                let! firstApproval = sendAdminJson client csrf approveUri "{}"
                 use firstApproval = firstApproval
                 Assert.That(firstApproval.StatusCode, Is.EqualTo(HttpStatusCode.NoContent))
-                let! repeatedApproval = sendAdminJson client bearer approveUri "{}"
+                let! repeatedApproval = sendAdminJson client csrf approveUri "{}"
                 use repeatedApproval = repeatedApproval
                 Assert.That(repeatedApproval.StatusCode, Is.EqualTo(HttpStatusCode.NoContent), "Same moderation target is a retry-safe transition.")
                 let! oppositeApproval =
-                    sendAdminJson client bearer (sprintf "/api/v0/admin/say-messages/%O/reject" approvedId) "{\"reason\":\"late\"}"
+                    sendAdminJson client csrf (sprintf "/api/v0/admin/say-messages/%O/reject" approvedId) "{\"reason\":\"late\"}"
 
                 use oppositeApproval = oppositeApproval
                 Assert.That(oppositeApproval.StatusCode, Is.EqualTo(HttpStatusCode.Conflict))
@@ -1157,13 +1309,13 @@ WHERE "EventType" = 'SayMessageModerated' AND "Payload" ->> 'sayMessageId' = @Id
                 Assert.That(eventReader.GetFieldValue<JsonElement>(3).ValueKind, Is.EqualTo(JsonValueKind.Null))
 
                 let rejectUri = sprintf "/api/v0/admin/say-messages/%O/reject" rejectedId
-                let! firstRejection = sendAdminJson client bearer rejectUri "{\"reason\":\"  too loud  \"}"
+                let! firstRejection = sendAdminJson client csrf rejectUri "{\"reason\":\"  too loud  \"}"
                 use firstRejection = firstRejection
                 Assert.That(firstRejection.StatusCode, Is.EqualTo(HttpStatusCode.NoContent))
-                let! repeatedRejection = sendAdminJson client bearer rejectUri "{\"reason\":\"too loud\"}"
+                let! repeatedRejection = sendAdminJson client csrf rejectUri "{\"reason\":\"too loud\"}"
                 use repeatedRejection = repeatedRejection
                 Assert.That(repeatedRejection.StatusCode, Is.EqualTo(HttpStatusCode.NoContent))
-                let! oppositeRejection = sendAdminJson client bearer (sprintf "/api/v0/admin/say-messages/%O/approve" rejectedId) "{}"
+                let! oppositeRejection = sendAdminJson client csrf (sprintf "/api/v0/admin/say-messages/%O/approve" rejectedId) "{}"
                 use oppositeRejection = oppositeRejection
                 Assert.That(oppositeRejection.StatusCode, Is.EqualTo(HttpStatusCode.Conflict))
                 do! assertProblemCode "say.state_conflict" oppositeRejection
@@ -1186,13 +1338,14 @@ WHERE "EventType" = 'SayMessageModerated' AND "Payload" ->> 'sayMessageId' = @Id
             })
 
     [<Test>]
-    let ``valid bearer exposes seeded social link and donation goal wire values`` () =
+    let ``admin session exposes seeded social link and donation goal wire values`` () =
         withApiClient (fun connectionString client ->
             task {
                 do! seedAdminReadModels connectionString
+                let! session = loginAdmin client
 
                 let! socialsResponse =
-                    sendAdminRequest client (Some(sprintf "Bearer %s" AdminToken)) HttpMethod.Get "/api/v0/admin/social-links"
+                    sendAdminRequest client (Some session.CsrfToken) HttpMethod.Get "/api/v0/admin/social-links"
 
                 use socialsResponse = socialsResponse
                 Assert.That(socialsResponse.StatusCode, Is.EqualTo(HttpStatusCode.OK))
@@ -1208,7 +1361,7 @@ WHERE "EventType" = 'SayMessageModerated' AND "Payload" ->> 'sayMessageId' = @Id
                 Assert.That(social |> boolProperty "isFeatured", Is.True)
 
                 let! goalResponse =
-                    sendAdminRequest client (Some(sprintf "Bearer %s" AdminToken)) HttpMethod.Get "/api/v0/admin/donation-goal"
+                    sendAdminRequest client (Some session.CsrfToken) HttpMethod.Get "/api/v0/admin/donation-goal"
 
                 use goalResponse = goalResponse
                 Assert.That(goalResponse.StatusCode, Is.EqualTo(HttpStatusCode.OK))
@@ -2042,4 +2195,624 @@ WHERE "Id" = @PaymentId AND "IsDeleted" = false;""",
                     let chatId, text = telegram.SentTexts.[0]
                     Assert.That(chatId, Is.EqualTo(-100502L))
                     Assert.That(text, Is.EqualTo("Open a private chat with the bot for this command."))
+                })
+
+    [<Test>]
+    let ``library scan is retry-idempotent exposes status count and durably requests work while tracks queue independently`` () =
+        withApiClientWithServices
+            (fun services -> services.RemoveAll<IHostedService>() |> ignore)
+            (fun connectionString _ _ client ->
+                task {
+                    do! seedBootstrapAdmin connectionString
+                    let! session = loginAdmin client
+                    let csrf = Some session.CsrfToken
+                    let! first = sendAdminJson client csrf "/api/v0/admin/library/scan" "{}"
+                    use first = first
+                    Assert.That(first.StatusCode, Is.EqualTo(HttpStatusCode.Accepted))
+                    let! firstDocument = jsonDocument first
+                    use firstDocument = firstDocument
+                    let scanJobId = firstDocument.RootElement |> stringProperty "scanJobId"
+                    let! retry = sendAdminJson client csrf "/api/v0/admin/library/scan" "{}"
+                    use retry = retry
+                    Assert.That(retry.StatusCode, Is.EqualTo(HttpStatusCode.Accepted))
+                    let! retryDocument = jsonDocument retry
+                    use retryDocument = retryDocument
+                    Assert.That(retryDocument.RootElement |> stringProperty "scanJobId", Is.EqualTo(scanJobId), "A retry must reuse the queued scan for the same backend.")
+                    use connection = new NpgsqlConnection(connectionString)
+                    do! connection.OpenAsync()
+                    use scanUpdate = new NpgsqlCommand("UPDATE \"LibraryScanJobs\" SET \"DiscoveredCount\" = 2 WHERE \"Id\" = @Id;", connection)
+                    scanUpdate.Parameters.AddWithValue("Id", Guid.Parse(scanJobId)) |> ignore
+                    let! _ = scanUpdate.ExecuteNonQueryAsync()
+                    let! status = sendAdminRequest client csrf HttpMethod.Get ("/api/v0/admin/library/scan/" + scanJobId)
+                    use status = status
+                    Assert.That(status.StatusCode, Is.EqualTo(HttpStatusCode.OK))
+                    let! statusDocument = jsonDocument status
+                    use statusDocument = statusDocument
+                    Assert.That(statusDocument.RootElement |> intProperty "discoveredCount", Is.EqualTo(2))
+                    use requestedEvent = new NpgsqlCommand("SELECT count(*) FROM \"OutboxEvents\" WHERE \"EventType\" = 'LibraryScanRequested' AND \"Payload\" ->> 'libraryScanJobId' = @Id;", connection)
+                    requestedEvent.Parameters.AddWithValue("Id", scanJobId) |> ignore
+                    let! requestedCount = requestedEvent.ExecuteScalarAsync()
+                    Assert.That(Convert.ToInt32(requestedCount), Is.EqualTo(1), "Accepting a scan is not complete until the durable work event is committed.")
+
+                    let trackId = Guid.Parse("01920000-0000-7000-8000-000000000111")
+                    use seedTrack = new NpgsqlCommand("INSERT INTO \"Tracks\" (\"Id\", \"Title\", \"Artist\", \"Album\", \"DurationMs\", \"IsDeleted\") VALUES (@Id, 'Queued track', 'Artist', NULL, NULL, false); INSERT INTO \"TrackFiles\" (\"Id\", \"TrackId\", \"StoragePath\", \"CachePath\", \"IsCached\", \"IsDeleted\") VALUES ('01920000-0000-7000-8000-000000000112', @Id, 'queued.mp3', '/library/queued.mp3', true, false);", connection)
+                    seedTrack.Parameters.AddWithValue("Id", trackId) |> ignore
+                    let! _ = seedTrack.ExecuteNonQueryAsync()
+                    let! tracks = sendAdminRequest client csrf HttpMethod.Get "/api/v0/admin/tracks?query=Queued&limit=1"
+                    use tracks = tracks
+                    Assert.That(tracks.StatusCode, Is.EqualTo(HttpStatusCode.OK))
+                    let! tracksDocument = jsonDocument tracks
+                    use tracksDocument = tracksDocument
+                    Assert.That(tracksDocument.RootElement.[0] |> stringProperty "artist", Is.EqualTo("Artist"))
+                    Assert.That(tracksDocument.RootElement.[0] |> stringProperty "album", Is.EqualTo(""))
+                    Assert.That(tracksDocument.RootElement.[0] |> intProperty "durationMs", Is.EqualTo(0))
+                    let! queued = sendAdminJson client csrf "/api/v0/admin/playback/queue" (sprintf "{\"trackId\":\"%O\"}" trackId)
+                    use queued = queued
+                    Assert.That(queued.StatusCode, Is.EqualTo(HttpStatusCode.Accepted))
+                    let! missing = sendAdminJson client csrf "/api/v0/admin/playback/queue" "{\"trackId\":\"01920000-0000-7000-8000-000000000199\"}"
+                    use missing = missing
+                    Assert.That(missing.StatusCode, Is.EqualTo(HttpStatusCode.NotFound))
+                    do! assertProblemCode "playback.not_found" missing
+                })
+
+    [<Test>]
+    let ``heartbeat and stream-node assignment contracts authenticate validate and expose durable transport state`` () =
+        withApiClient (fun connectionString client ->
+            task {
+                let heartbeatUri = "/api/v0/stream-node/heartbeat"
+                let! anonymous = sendPlaybackCallback client heartbeatUri "{}" []
+                use anonymous = anonymous
+                Assert.That(anonymous.StatusCode, Is.EqualTo(HttpStatusCode.Unauthorized))
+                let! malformed = sendPlaybackCallback client heartbeatUri "{\"status\":\"invalid\"}" [ "Bearer stream-callback-token-Secret_123456" ]
+                use malformed = malformed
+                Assert.That(malformed.StatusCode, Is.EqualTo(HttpStatusCode.BadRequest))
+                do! assertProblemCode "stream-node.heartbeat.invalid" malformed
+                let payload = "{\"status\":\"live\",\"failureReason\":null,\"metadata\":{\"bitrateKbps\":192,\"restartAttempt\":0,\"activeQueueItemId\":null}}"
+                let! accepted = sendPlaybackCallback client heartbeatUri payload [ "Bearer stream-callback-token-Secret_123456" ]
+                use accepted = accepted
+                Assert.That(accepted.StatusCode, Is.EqualTo(HttpStatusCode.NoContent))
+                let! heartbeatEvents = countOutboxRows connectionString "StreamNodeHeartbeatReceived"
+                Assert.That(heartbeatEvents, Is.EqualTo(1), "A heartbeat acknowledgement must follow its durable event append.")
+                let! noAssignment =
+                    let request = new HttpRequestMessage(HttpMethod.Get, "/api/v0/stream-node/playback/current")
+                    request.Headers.TryAddWithoutValidation("Authorization", "Bearer stream-callback-token-Secret_123456") |> ignore
+                    client.SendAsync(request)
+                use noAssignment = noAssignment
+                Assert.That(noAssignment.StatusCode, Is.EqualTo(HttpStatusCode.NoContent))
+            })
+
+    [<Test>]
+    let ``admin content writes return canonical success and domain validation not-found and conflict statuses`` () =
+        withApiClient (fun _ client ->
+            task {
+                let! session = loginAdmin client
+                let csrf = Some session.CsrfToken
+                let missingPlaylist = "01920000-0000-7000-8000-000000000221"
+                let cases =
+                    [ "donation validation", HttpMethod.Put, "/api/v0/admin/donation-goal", "{\"title\":\" \",\"goalStars\":0}", HttpStatusCode.BadRequest, "donation.goal.request_invalid"
+                      "donation update", HttpMethod.Put, "/api/v0/admin/donation-goal", "{\"title\":\"Fund the station\",\"goalStars\":500}", HttpStatusCode.OK, ""
+                      "social validation", HttpMethod.Put, "/api/v0/admin/social-links", "[{\"id\":null,\"kind\":\"external\",\"name\":\"Bad\",\"handle\":null,\"url\":\"ftp://bad\",\"glyph\":null,\"color\":null,\"qrImageUrl\":null,\"isFeatured\":false}]", HttpStatusCode.BadRequest, "social-links.request_invalid"
+                      "social replacement", HttpMethod.Put, "/api/v0/admin/social-links", "[{\"id\":null,\"kind\":\"telegram\",\"name\":\" Telegram \",\"handle\":null,\"url\":\"https://t.me/web10\",\"glyph\":null,\"color\":\"#112233\",\"qrImageUrl\":null,\"isFeatured\":true}]", HttpStatusCode.OK, ""
+                      "playlist validation", HttpMethod.Post, "/api/v0/admin/playlists", "{\"name\":\"\",\"description\":null,\"isActive\":false}", HttpStatusCode.BadRequest, "playlist.request_invalid"
+                      "playlist creation", HttpMethod.Post, "/api/v0/admin/playlists", "{\"name\":\"Night mix\",\"description\":null,\"isActive\":true}", HttpStatusCode.Created, ""
+                      "missing playlist update", HttpMethod.Put, "/api/v0/admin/playlists/" + missingPlaylist, "{\"name\":\"Gone\",\"description\":null,\"isActive\":false}", HttpStatusCode.NotFound, "playlist.not_found"
+                      "missing playlist item", HttpMethod.Post, "/api/v0/admin/playlists/" + missingPlaylist + "/items", "{\"trackId\":\"01920000-0000-7000-8000-000000000222\"}", HttpStatusCode.NotFound, "playlist.not_found"
+                      "storage validation", HttpMethod.Put, "/api/v0/admin/storage", "{\"additionalBackends\":[{\"id\":null,\"name\":\"Bad local\",\"type\":\"local\",\"localRoot\":\"relative\",\"s3Bucket\":null,\"isEnabled\":true}]}", HttpStatusCode.BadRequest, "storage.request_invalid"
+                      "storage replacement", HttpMethod.Put, "/api/v0/admin/storage", "{\"additionalBackends\":[{\"id\":null,\"name\":\"Archive\",\"type\":\"s3\",\"localRoot\":null,\"s3Bucket\":\"web10-archive\",\"isEnabled\":true}]}", HttpStatusCode.OK, "" ]
+
+                for name, method', uri, body, expectedStatus, expectedCode in cases do
+                    let! response = sendAdminJsonWithMethod client csrf method' uri body
+                    use response = response
+                    Assert.That(response.StatusCode, Is.EqualTo(expectedStatus), name)
+                    if expectedCode <> "" then do! assertProblemCode expectedCode response
+
+                let! controlStart = sendAdminJson client csrf "/api/v0/admin/stream-node/start" "{}"
+                use controlStart = controlStart
+                Assert.That(controlStart.StatusCode, Is.EqualTo(HttpStatusCode.Accepted))
+                let! startDocument = jsonDocument controlStart
+                use startDocument = startDocument
+                let startGeneration = startDocument.RootElement |> intProperty "restartGeneration"
+                let! controlStop = sendAdminJson client csrf "/api/v0/admin/stream-node/stop" "{}"
+                use controlStop = controlStop
+                Assert.That(controlStop.StatusCode, Is.EqualTo(HttpStatusCode.Accepted))
+                let! stopDocument = jsonDocument controlStop
+                use stopDocument = stopDocument
+                Assert.That(stopDocument.RootElement |> stringProperty "desiredState", Is.EqualTo("stopped"))
+                let! controlRestart = sendAdminJson client csrf "/api/v0/admin/stream-node/restart" "{}"
+                use controlRestart = controlRestart
+                Assert.That(controlRestart.StatusCode, Is.EqualTo(HttpStatusCode.Accepted))
+                let! restartDocument = jsonDocument controlRestart
+                use restartDocument = restartDocument
+                Assert.That(restartDocument.RootElement |> stringProperty "desiredState", Is.EqualTo("running"))
+                Assert.That(restartDocument.RootElement |> intProperty "restartGeneration", Is.EqualTo(startGeneration + 1))
+            })
+
+    [<Test>]
+    let ``current assignment projects a fenced playing row and admin status keeps the exact thirty-second freshness boundary`` () =
+        let nowUtc = DateTimeOffset(2026, 7, 10, 20, 0, 0, TimeSpan.Zero)
+
+        withApiClientAt nowUtc (fun connectionString _ client ->
+            task {
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+                let trackId = Guid.Parse("01920000-0000-7000-8000-000000000311")
+                let queueItemId = Guid.Parse("01920000-0000-7000-8000-000000000312")
+                let owner = Guid.Parse("01920000-0000-7000-8000-000000000313")
+                use seed = new NpgsqlCommand("INSERT INTO \"Tracks\" (\"Id\", \"Title\", \"Artist\", \"Album\", \"DurationMs\", \"IsDeleted\") VALUES (@TrackId, 'Assignment', 'Node', NULL, NULL, false); INSERT INTO \"TrackFiles\" (\"Id\", \"TrackId\", \"StoragePath\", \"CachePath\", \"ContentType\", \"IsCached\", \"IsDeleted\") VALUES ('01920000-0000-7000-8000-000000000314', @TrackId, 'assignment.mp3', '/library/assignment.mp3', NULL, true, false); INSERT INTO \"PlaybackQueue\" (\"Id\", \"TrackId\", \"Source\", \"Status\", \"RequestedAtUtc\", \"StartedAtUtc\", \"ClaimOwner\", \"ClaimAttempt\", \"ClaimLeaseExpiresAtUtc\", \"IsDeleted\") VALUES (@QueueItemId, @TrackId, 'admin', 'Playing', @NowUtc, @NowUtc, @Owner, 1, @LeaseExpiresAtUtc, false);", connection)
+                seed.Parameters.AddWithValue("TrackId", trackId) |> ignore
+                seed.Parameters.AddWithValue("QueueItemId", queueItemId) |> ignore
+                seed.Parameters.AddWithValue("Owner", owner) |> ignore
+                seed.Parameters.AddWithValue("NowUtc", nowUtc) |> ignore
+                seed.Parameters.AddWithValue("LeaseExpiresAtUtc", nowUtc.AddMinutes(1.0)) |> ignore
+                let! _ = seed.ExecuteNonQueryAsync()
+                use assignmentRequest = new HttpRequestMessage(HttpMethod.Get, "/api/v0/stream-node/playback/current")
+                assignmentRequest.Headers.TryAddWithoutValidation("Authorization", "Bearer stream-callback-token-Secret_123456") |> ignore
+                let! assignment = client.SendAsync(assignmentRequest)
+                use assignment = assignment
+                Assert.That(assignment.StatusCode, Is.EqualTo(HttpStatusCode.OK))
+                let! assignmentDocument = jsonDocument assignment
+                use assignmentDocument = assignmentDocument
+                Assert.That(assignmentDocument.RootElement |> stringProperty "queueItemId", Is.EqualTo(queueItemId.ToString("D")))
+                Assert.That(assignmentDocument.RootElement |> stringProperty "claimOwner", Is.EqualTo(owner.ToString("D")))
+                Assert.That(assignmentDocument.RootElement |> intProperty "claimAttempt", Is.EqualTo(1))
+                Assert.That(assignmentDocument.RootElement |> stringProperty "contentType", Is.EqualTo("audio/mpeg"))
+                Assert.That(assignmentDocument.RootElement |> intProperty "durationMs", Is.EqualTo(0))
+
+                do! seedHeartbeat connectionString "Live" (nowUtc.AddSeconds(-30.0))
+                let! session = loginAdmin client
+                let! fresh = sendAdminRequest client (Some session.CsrfToken) HttpMethod.Get "/api/v0/admin/stream-node/status"
+                use fresh = fresh
+                Assert.That(fresh.StatusCode, Is.EqualTo(HttpStatusCode.OK))
+                let! freshDocument = jsonDocument fresh
+                use freshDocument = freshDocument
+                Assert.That(freshDocument.RootElement |> stringProperty "status", Is.EqualTo("live"), "Exactly thirty seconds remains fresh.")
+                use stale = new NpgsqlCommand("UPDATE \"StreamNodeHeartbeats\" SET \"HeartbeatAtUtc\" = @StaleAtUtc;", connection)
+                stale.Parameters.AddWithValue("StaleAtUtc", nowUtc.AddSeconds(-30.001)) |> ignore
+                let! _ = stale.ExecuteNonQueryAsync()
+                let! staleResponse = sendAdminRequest client (Some session.CsrfToken) HttpMethod.Get "/api/v0/admin/stream-node/status"
+                use staleResponse = staleResponse
+                Assert.That(staleResponse.StatusCode, Is.EqualTo(HttpStatusCode.OK))
+                let! staleDocument = jsonDocument staleResponse
+                use staleDocument = staleDocument
+                Assert.That(staleDocument.RootElement |> stringProperty "status", Is.EqualTo("offline"))
+                Assert.That(staleDocument.RootElement |> valueKindProperty "lastHeartbeatUtc", Is.EqualTo(JsonValueKind.Null))
+                Assert.That(staleDocument.RootElement |> intProperty "bitrateKbps", Is.EqualTo(0))
+            })
+
+    type private FixtureIds =
+        { DonationPaymentId: Guid
+          SayPaymentId: Guid
+          SayMessageId: Guid }
+
+    type private FixtureDatabaseState =
+        { ActiveGoalCount: int64
+          GoalTitle: string
+          GoalStars: int
+          RaisedStars: int
+          DonationPaymentCount: int64
+          DonationPaymentId: Guid
+          DonationTelegramUserId: int64
+          DonationPurpose: string
+          DonationAmountStars: int
+          DonationCurrency: string
+          DonationInvoicePayload: string
+          DonationPayerDisplayName: string
+          DonationStatus: string
+          DonationChargeId: string option
+          DonationPaidAt: bool
+          SayPaymentCount: int64
+          SayPaymentId: Guid
+          SayTelegramUserId: int64
+          SayPurpose: string
+          SayPurposeEntityId: Guid
+          SayAmountStars: int
+          SayCurrency: string
+          SayInvoicePayload: string
+          SayPayerDisplayName: string
+          SayPaymentStatus: string
+          SayChargeId: string option
+          SayPaymentPaidAt: bool
+          SayMessageCount: int64
+          SayMessageId: Guid
+          SayMessageTelegramUserId: int64
+          SayMessageDisplayName: string
+          SayMessageText: string
+          SayMessageAmountStars: int
+          SayMessageStatus: string
+          SayMessagePaidAt: bool }
+
+    let private fixtureRoute = "/api/v0/admin/dev/fixtures/paid-vertical-slice"
+
+    let private fixtureInvoicePayload fixtureKey purpose =
+        sprintf "dev:%s:%s" fixtureKey purpose
+
+    let private expectedFixtureTelegramUpdateId fixtureKey purpose =
+        let source = Encoding.UTF8.GetBytes(fixtureInvoicePayload fixtureKey purpose)
+        let hash = SHA256.HashData(source)
+        let remainder = System.Numerics.BigInteger(hash, true, true) % System.Numerics.BigInteger(Int64.MaxValue)
+        let value = int64 remainder
+        if value = 0L then 1L else value
+
+    let private createFixtureFactory connectionString tempRoot environment fixturesEnabled configureServices =
+        let enabledText = if fixturesEnabled then "true" else "false"
+
+        let fixturePairs =
+            [ KeyValuePair<string, string>("DEV:FIXTURES_ENABLED", enabledText)
+              KeyValuePair<string, string>("WEB10_DEV__FIXTURES_ENABLED", enabledText) ]
+
+        (createFactory connectionString tempRoot None None None)
+            .WithWebHostBuilder(fun builder ->
+                builder.UseSetting(WebHostDefaults.EnvironmentKey, environment) |> ignore
+
+                fixturePairs
+                |> List.iter (fun pair -> builder.UseSetting(pair.Key, pair.Value) |> ignore)
+
+                builder.ConfigureAppConfiguration(fun _ configurationBuilder ->
+                    configurationBuilder.AddInMemoryCollection(fixturePairs) |> ignore)
+                |> ignore
+
+                builder.ConfigureServices(fun services -> configureServices services) |> ignore)
+
+    let private withFixtureApiClient environment fixturesEnabled configureServices work =
+        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
+            task {
+                let tempRoot = Directory.CreateTempSubdirectory("web10-radio-fixture-api-tests-")
+                let factory = createFixtureFactory connectionString tempRoot.FullName environment fixturesEnabled configureServices
+                let client = factory.CreateClient(WebApplicationFactoryClientOptions(HandleCookies = true))
+
+                try
+                    return! work connectionString factory client
+                finally
+                    client.Dispose()
+                    factory.Dispose()
+                    tempRoot.Delete(true)
+            })
+
+    let private parseFixtureIds (response: HttpResponseMessage) =
+        task {
+            let! document = jsonDocument response
+            use document = document
+            let root = document.RootElement
+            Assert.That(root.EnumerateObject() |> Seq.length, Is.EqualTo(3), "The fixture response must contain only its three durable identifiers.")
+
+            return
+                { DonationPaymentId = Guid.Parse(root |> stringProperty "donationPaymentId")
+                  SayPaymentId = Guid.Parse(root |> stringProperty "sayPaymentId")
+                  SayMessageId = Guid.Parse(root |> stringProperty "sayMessageId") }
+        }
+
+    let private readFixtureDatabaseState connectionString fixtureKey =
+        task {
+            let donationPayload = fixtureInvoicePayload fixtureKey "donation"
+            let sayPayload = fixtureInvoicePayload fixtureKey "say"
+            use connection = new NpgsqlConnection(connectionString)
+            do! connection.OpenAsync()
+
+            use command =
+                new NpgsqlCommand(
+                    """SELECT
+    (SELECT count(*) FROM "DonationGoals" WHERE "IsDeleted" = false AND "IsActive" = true),
+    (SELECT "Title" FROM "DonationGoals" WHERE "IsDeleted" = false AND "IsActive" = true ORDER BY "UpdatedAtUtc" DESC, "CreatedAtUtc" DESC, "Id" DESC LIMIT 1),
+    (SELECT "GoalStars" FROM "DonationGoals" WHERE "IsDeleted" = false AND "IsActive" = true ORDER BY "UpdatedAtUtc" DESC, "CreatedAtUtc" DESC, "Id" DESC LIMIT 1),
+    (SELECT "RaisedStars" FROM "DonationGoals" WHERE "IsDeleted" = false AND "IsActive" = true ORDER BY "UpdatedAtUtc" DESC, "CreatedAtUtc" DESC, "Id" DESC LIMIT 1),
+    (SELECT count(*) FROM "Payments" WHERE "TelegramInvoicePayload" = @DonationPayload AND "IsDeleted" = false),
+    (SELECT "Id" FROM "Payments" WHERE "TelegramInvoicePayload" = @DonationPayload AND "IsDeleted" = false),
+    (SELECT "TelegramUserId" FROM "Payments" WHERE "TelegramInvoicePayload" = @DonationPayload AND "IsDeleted" = false),
+    (SELECT "Purpose" FROM "Payments" WHERE "TelegramInvoicePayload" = @DonationPayload AND "IsDeleted" = false),
+    (SELECT "AmountStars" FROM "Payments" WHERE "TelegramInvoicePayload" = @DonationPayload AND "IsDeleted" = false),
+    (SELECT "Currency" FROM "Payments" WHERE "TelegramInvoicePayload" = @DonationPayload AND "IsDeleted" = false),
+    (SELECT "TelegramInvoicePayload" FROM "Payments" WHERE "TelegramInvoicePayload" = @DonationPayload AND "IsDeleted" = false),
+    (SELECT "PayerDisplayName" FROM "Payments" WHERE "TelegramInvoicePayload" = @DonationPayload AND "IsDeleted" = false),
+    (SELECT "Status" FROM "Payments" WHERE "TelegramInvoicePayload" = @DonationPayload AND "IsDeleted" = false),
+    (SELECT "TelegramPaymentChargeId" FROM "Payments" WHERE "TelegramInvoicePayload" = @DonationPayload AND "IsDeleted" = false),
+    (SELECT "PaidAtUtc" IS NOT NULL FROM "Payments" WHERE "TelegramInvoicePayload" = @DonationPayload AND "IsDeleted" = false),
+    (SELECT count(*) FROM "Payments" WHERE "TelegramInvoicePayload" = @SayPayload AND "IsDeleted" = false),
+    (SELECT "Id" FROM "Payments" WHERE "TelegramInvoicePayload" = @SayPayload AND "IsDeleted" = false),
+    (SELECT "TelegramUserId" FROM "Payments" WHERE "TelegramInvoicePayload" = @SayPayload AND "IsDeleted" = false),
+    (SELECT "Purpose" FROM "Payments" WHERE "TelegramInvoicePayload" = @SayPayload AND "IsDeleted" = false),
+    (SELECT "PurposeEntityId" FROM "Payments" WHERE "TelegramInvoicePayload" = @SayPayload AND "IsDeleted" = false),
+    (SELECT "AmountStars" FROM "Payments" WHERE "TelegramInvoicePayload" = @SayPayload AND "IsDeleted" = false),
+    (SELECT "Currency" FROM "Payments" WHERE "TelegramInvoicePayload" = @SayPayload AND "IsDeleted" = false),
+    (SELECT "TelegramInvoicePayload" FROM "Payments" WHERE "TelegramInvoicePayload" = @SayPayload AND "IsDeleted" = false),
+    (SELECT "PayerDisplayName" FROM "Payments" WHERE "TelegramInvoicePayload" = @SayPayload AND "IsDeleted" = false),
+    (SELECT "Status" FROM "Payments" WHERE "TelegramInvoicePayload" = @SayPayload AND "IsDeleted" = false),
+    (SELECT "TelegramPaymentChargeId" FROM "Payments" WHERE "TelegramInvoicePayload" = @SayPayload AND "IsDeleted" = false),
+    (SELECT "PaidAtUtc" IS NOT NULL FROM "Payments" WHERE "TelegramInvoicePayload" = @SayPayload AND "IsDeleted" = false),
+    (SELECT count(*) FROM "SayMessages" WHERE "Id" = (SELECT "PurposeEntityId" FROM "Payments" WHERE "TelegramInvoicePayload" = @SayPayload AND "IsDeleted" = false) AND "IsDeleted" = false),
+    (SELECT "Id" FROM "SayMessages" WHERE "Id" = (SELECT "PurposeEntityId" FROM "Payments" WHERE "TelegramInvoicePayload" = @SayPayload AND "IsDeleted" = false) AND "IsDeleted" = false),
+    (SELECT "TelegramUserId" FROM "SayMessages" WHERE "Id" = (SELECT "PurposeEntityId" FROM "Payments" WHERE "TelegramInvoicePayload" = @SayPayload AND "IsDeleted" = false) AND "IsDeleted" = false),
+    (SELECT "DisplayName" FROM "SayMessages" WHERE "Id" = (SELECT "PurposeEntityId" FROM "Payments" WHERE "TelegramInvoicePayload" = @SayPayload AND "IsDeleted" = false) AND "IsDeleted" = false),
+    (SELECT "Text" FROM "SayMessages" WHERE "Id" = (SELECT "PurposeEntityId" FROM "Payments" WHERE "TelegramInvoicePayload" = @SayPayload AND "IsDeleted" = false) AND "IsDeleted" = false),
+    (SELECT "AmountStars" FROM "SayMessages" WHERE "Id" = (SELECT "PurposeEntityId" FROM "Payments" WHERE "TelegramInvoicePayload" = @SayPayload AND "IsDeleted" = false) AND "IsDeleted" = false),
+    (SELECT "Status" FROM "SayMessages" WHERE "Id" = (SELECT "PurposeEntityId" FROM "Payments" WHERE "TelegramInvoicePayload" = @SayPayload AND "IsDeleted" = false) AND "IsDeleted" = false),
+    (SELECT "PaidAtUtc" IS NOT NULL FROM "SayMessages" WHERE "Id" = (SELECT "PurposeEntityId" FROM "Payments" WHERE "TelegramInvoicePayload" = @SayPayload AND "IsDeleted" = false) AND "IsDeleted" = false);""",
+                    connection
+                )
+
+            command.Parameters.AddWithValue("DonationPayload", donationPayload) |> ignore
+            command.Parameters.AddWithValue("SayPayload", sayPayload) |> ignore
+            use! reader = command.ExecuteReaderAsync()
+            let! found = reader.ReadAsync()
+            Assert.That(found, Is.True, "The fixture state query must return one aggregate row.")
+
+            let optionalString index = if reader.IsDBNull(index) then None else Some(reader.GetString(index))
+
+            return
+                { ActiveGoalCount = reader.GetInt64(0)
+                  GoalTitle = reader.GetString(1)
+                  GoalStars = reader.GetInt32(2)
+                  RaisedStars = reader.GetInt32(3)
+                  DonationPaymentCount = reader.GetInt64(4)
+                  DonationPaymentId = reader.GetGuid(5)
+                  DonationTelegramUserId = reader.GetInt64(6)
+                  DonationPurpose = reader.GetString(7)
+                  DonationAmountStars = reader.GetInt32(8)
+                  DonationCurrency = reader.GetString(9)
+                  DonationInvoicePayload = reader.GetString(10)
+                  DonationPayerDisplayName = reader.GetString(11)
+                  DonationStatus = reader.GetString(12)
+                  DonationChargeId = optionalString 13
+                  DonationPaidAt = reader.GetBoolean(14)
+                  SayPaymentCount = reader.GetInt64(15)
+                  SayPaymentId = reader.GetGuid(16)
+                  SayTelegramUserId = reader.GetInt64(17)
+                  SayPurpose = reader.GetString(18)
+                  SayPurposeEntityId = reader.GetGuid(19)
+                  SayAmountStars = reader.GetInt32(20)
+                  SayCurrency = reader.GetString(21)
+                  SayInvoicePayload = reader.GetString(22)
+                  SayPayerDisplayName = reader.GetString(23)
+                  SayPaymentStatus = reader.GetString(24)
+                  SayChargeId = optionalString 25
+                  SayPaymentPaidAt = reader.GetBoolean(26)
+                  SayMessageCount = reader.GetInt64(27)
+                  SayMessageId = reader.GetGuid(28)
+                  SayMessageTelegramUserId = reader.GetInt64(29)
+                  SayMessageDisplayName = reader.GetString(30)
+                  SayMessageText = reader.GetString(31)
+                  SayMessageAmountStars = reader.GetInt32(32)
+                  SayMessageStatus = reader.GetString(33)
+                  SayMessagePaidAt = reader.GetBoolean(34) }
+        }
+
+    let private readFixtureDonationPaidPayload connectionString (paymentId: Guid) =
+        task {
+            use connection = new NpgsqlConnection(connectionString)
+            do! connection.OpenAsync()
+            use command =
+                new NpgsqlCommand(
+                    """SELECT "Payload"::text
+FROM "OutboxEvents"
+WHERE "EventType" = 'DonationPaid'
+  AND "IsDeleted" = false
+  AND "Payload" ->> 'paymentId' = @PaymentId;""",
+                    connection
+                )
+
+            command.Parameters.AddWithValue("PaymentId", paymentId.ToString("D")) |> ignore
+            let! payload = command.ExecuteScalarAsync()
+
+            if isNull payload || payload = box DBNull.Value then
+                return raise (AssertionException(sprintf "Expected a DonationPaid envelope for fixture payment %O." paymentId))
+            else
+                return string payload
+        }
+
+    let private assertFixtureDonationPaidEnvelope (fixtureKey: string) (purpose: string) (paymentId: Guid) (amountStars: int) (payload: string) =
+        use document = JsonDocument.Parse(payload)
+        let root = document.RootElement
+        Assert.That(root |> stringProperty "paymentId", Is.EqualTo(paymentId.ToString("D")))
+        Assert.That((root |> jsonProperty "telegramUserId" |> fun value -> value.GetInt64()), Is.EqualTo(900000001L))
+        Assert.That(root |> stringProperty "telegramPaymentChargeId", Is.EqualTo(fixtureInvoicePayload fixtureKey purpose))
+        Assert.That((root |> jsonProperty "amountStars" |> fun value -> value.GetInt32()), Is.EqualTo(amountStars))
+        Assert.That(root |> stringProperty "currency", Is.EqualTo("XTR"))
+        Assert.That((root |> jsonProperty "telegramUpdateId" |> fun value -> value.GetInt64()), Is.EqualTo(expectedFixtureTelegramUpdateId fixtureKey purpose))
+        Assert.That((root |> jsonProperty "telegramUpdateId" |> fun value -> value.GetInt64()), Is.GreaterThan(0L))
+
+    [<Test>]
+    let ``paid vertical slice fixture remains route-absent outside the Development plus enabled double gate`` () =
+        let assertAbsent environment fixturesEnabled =
+            withFixtureApiClient
+                environment
+                fixturesEnabled
+                (fun services -> services.RemoveAll<IHostedService>() |> ignore)
+                (fun connectionString _ client ->
+                    task {
+                        do! seedBootstrapAdmin connectionString
+                        let! session = loginAdmin client
+                        let! response = sendAdminJson client (Some session.CsrfToken) fixtureRoute "{\"fixtureKey\":\"double-gate-proof\"}"
+                        use response = response
+                        Assert.That(response.StatusCode, Is.EqualTo(HttpStatusCode.NotFound), sprintf "%s/%b must not map the development fixture route." environment fixturesEnabled)
+                    })
+
+        task {
+            do! assertAbsent Environments.Production true
+            do! assertAbsent Environments.Development false
+        }
+
+    [<Test>]
+    let ``paid vertical slice fixture inside the enabled development gate requires an admin session and synchronizer token`` () =
+        withFixtureApiClient
+            Environments.Development
+            true
+            (fun services -> services.RemoveAll<IHostedService>() |> ignore)
+            (fun connectionString _ client ->
+                task {
+                    let body = "{\"fixtureKey\":\"session-csrf-proof\"}"
+                    let! anonymous = sendAdminJson client None fixtureRoute body
+                    use anonymous = anonymous
+                    Assert.That(anonymous.StatusCode, Is.EqualTo(HttpStatusCode.Unauthorized))
+                    do! assertProblemCode "admin.auth.required" anonymous
+
+                    do! seedBootstrapAdmin connectionString
+                    let! session = loginAdmin client
+                    let! missingCsrf = sendAdminJson client None fixtureRoute body
+                    use missingCsrf = missingCsrf
+                    Assert.That(missingCsrf.StatusCode, Is.EqualTo(HttpStatusCode.Forbidden))
+                    do! assertProblemCode "admin.auth.csrf_invalid" missingCsrf
+
+                    let! wrongCsrf = sendAdminJson client (Some "wrong-synchronizer-token") fixtureRoute body
+                    use wrongCsrf = wrongCsrf
+                    Assert.That(wrongCsrf.StatusCode, Is.EqualTo(HttpStatusCode.Forbidden))
+                    do! assertProblemCode "admin.auth.csrf_invalid" wrongCsrf
+
+                    let! admitted = sendAdminJson client (Some session.CsrfToken) fixtureRoute body
+                    use admitted = admitted
+                    Assert.That(admitted.StatusCode, Is.EqualTo(HttpStatusCode.OK))
+                    let! _ = parseFixtureIds admitted
+                    return ()
+                })
+
+    [<Test>]
+    let ``paid vertical slice fixture rejects malformed extra boundary and oversized bodies with its exact problem code`` () =
+        withFixtureApiClient
+            Environments.Development
+            true
+            (fun services -> services.RemoveAll<IHostedService>() |> ignore)
+            (fun connectionString _ client ->
+                task {
+                    do! seedBootstrapAdmin connectionString
+                    let! session = loginAdmin client
+                    let oversized = "{\"fixtureKey\":\"" + String.replicate (16 * 1024) "x" + "\"}"
+
+                    for name, body in
+                        [ "array", "[]"
+                          "missing key", "{}"
+                          "unknown key", "{\"fixtureKey\":\"valid\",\"other\":true}"
+                          "blank key", "{\"fixtureKey\":\"   \"}"
+                          "key over sixty-four characters", "{\"fixtureKey\":\"" + String.replicate 65 "k" + "\"}"
+                          "over sixteen kibibytes", oversized ] do
+                        let! response = sendAdminJson client (Some session.CsrfToken) fixtureRoute body
+                        use response = response
+                        Assert.That(response.StatusCode, Is.EqualTo(HttpStatusCode.BadRequest), name)
+                        do! assertProblemCode "dev.fixture.invalid" response
+                })
+
+    [<Test>]
+    let ``paid vertical slice fixture is concurrent-idempotent and relays the real payment transitions exactly once`` () =
+        let fixtureKey = "paid-vertical-slice-contract-20260710"
+        let telegram = RecordingTelegramBotClient()
+
+        withFixtureApiClient
+            Environments.Development
+            true
+            (fun services ->
+                services.RemoveAll<IHostedService>() |> ignore
+                services.AddSingleton<Web10.Radio.API.OutboxRelayHostedService>() |> ignore
+                services.RemoveAll<Web10.Radio.Telegram.ITelegramBotClient>() |> ignore
+                services.AddSingleton<Web10.Radio.Telegram.ITelegramBotClient>(telegram) |> ignore)
+            (fun connectionString factory client ->
+                task {
+                    do! seedBootstrapAdmin connectionString
+                    let secondClient = factory.CreateClient(WebApplicationFactoryClientOptions(HandleCookies = true))
+
+                    try
+                        let! firstSession = loginAdmin client
+                        let! secondSession = loginAdmin secondClient
+                        let body = sprintf "{\"fixtureKey\":%s}" (JsonSerializer.Serialize(fixtureKey))
+                        let firstRequest = sendAdminJson client (Some firstSession.CsrfToken) fixtureRoute body
+                        let secondRequest = sendAdminJson secondClient (Some secondSession.CsrfToken) fixtureRoute body
+                        let! responses = Task.WhenAll([| firstRequest; secondRequest |])
+                        use firstResponse = responses.[0]
+                        use secondResponse = responses.[1]
+                        Assert.That(firstResponse.StatusCode, Is.EqualTo(HttpStatusCode.OK))
+                        Assert.That(secondResponse.StatusCode, Is.EqualTo(HttpStatusCode.OK))
+                        let! firstIds = parseFixtureIds firstResponse
+                        let! secondIds = parseFixtureIds secondResponse
+                        Assert.That(secondIds, Is.EqualTo(firstIds), "Concurrent identical fixture requests must return the already-created durable identifiers.")
+
+                        let! beforeRelay = readFixtureDatabaseState connectionString fixtureKey
+                        Assert.That(beforeRelay.ActiveGoalCount, Is.EqualTo(1L))
+                        Assert.That(beforeRelay.GoalTitle, Is.EqualTo("Web10.Radio launch"))
+                        Assert.That(beforeRelay.GoalStars, Is.EqualTo(5000))
+                        Assert.That(beforeRelay.RaisedStars, Is.EqualTo(0), "The fixture must not directly credit the donation before the real relay runs.")
+                        Assert.That(beforeRelay.DonationPaymentCount, Is.EqualTo(1L))
+                        Assert.That(beforeRelay.DonationPaymentId, Is.EqualTo(firstIds.DonationPaymentId))
+                        Assert.That(beforeRelay.DonationTelegramUserId, Is.EqualTo(900000001L))
+                        Assert.That(beforeRelay.DonationPurpose, Is.EqualTo("Donation"))
+                        Assert.That(beforeRelay.DonationAmountStars, Is.EqualTo(250))
+                        Assert.That(beforeRelay.DonationCurrency, Is.EqualTo("XTR"))
+                        Assert.That(beforeRelay.DonationInvoicePayload, Is.EqualTo(fixtureInvoicePayload fixtureKey "donation"))
+                        Assert.That(beforeRelay.DonationPayerDisplayName, Is.EqualTo("dev_listener"))
+                        Assert.That(beforeRelay.DonationStatus, Is.EqualTo("InvoiceCreated"))
+                        Assert.That(beforeRelay.DonationChargeId, Is.EqualTo(None))
+                        Assert.That(beforeRelay.DonationPaidAt, Is.False)
+                        Assert.That(beforeRelay.SayPaymentCount, Is.EqualTo(1L))
+                        Assert.That(beforeRelay.SayPaymentId, Is.EqualTo(firstIds.SayPaymentId))
+                        Assert.That(beforeRelay.SayTelegramUserId, Is.EqualTo(900000001L))
+                        Assert.That(beforeRelay.SayPurpose, Is.EqualTo("Say"))
+                        Assert.That(beforeRelay.SayPurposeEntityId, Is.EqualTo(firstIds.SayMessageId))
+                        Assert.That(beforeRelay.SayAmountStars, Is.EqualTo(50))
+                        Assert.That(beforeRelay.SayCurrency, Is.EqualTo("XTR"))
+                        Assert.That(beforeRelay.SayInvoicePayload, Is.EqualTo(fixtureInvoicePayload fixtureKey "say"))
+                        Assert.That(beforeRelay.SayPayerDisplayName, Is.EqualTo("dev_listener"))
+                        Assert.That(beforeRelay.SayPaymentStatus, Is.EqualTo("InvoiceCreated"))
+                        Assert.That(beforeRelay.SayChargeId, Is.EqualTo(None))
+                        Assert.That(beforeRelay.SayPaymentPaidAt, Is.False)
+                        Assert.That(beforeRelay.SayMessageCount, Is.EqualTo(1L))
+                        Assert.That(beforeRelay.SayMessageId, Is.EqualTo(firstIds.SayMessageId))
+                        Assert.That(beforeRelay.SayMessageTelegramUserId, Is.EqualTo(900000001L))
+                        Assert.That(beforeRelay.SayMessageDisplayName, Is.EqualTo("dev_listener"))
+                        Assert.That(beforeRelay.SayMessageText, Is.EqualTo("hello from the development fixture"))
+                        Assert.That(beforeRelay.SayMessageAmountStars, Is.EqualTo(50))
+                        Assert.That(beforeRelay.SayMessageStatus, Is.EqualTo("PendingPayment"))
+                        Assert.That(beforeRelay.SayMessagePaidAt, Is.False)
+                        Assert.That(telegram.SentInvoices.Length, Is.EqualTo(0), "The development fixture must never call Telegram to construct its durable payment path.")
+                        Assert.That(telegram.SentTexts.Length, Is.EqualTo(0), "The development fixture must never send a Telegram message.")
+
+                        let! pendingOutbox = countOutboxRows connectionString "DonationPaid"
+                        Assert.That(pendingOutbox, Is.EqualTo(2), "The fixture must append one real DonationPaid event for each created payment.")
+                        let! donationEnvelope = readFixtureDonationPaidPayload connectionString firstIds.DonationPaymentId
+                        let! sayEnvelope = readFixtureDonationPaidPayload connectionString firstIds.SayPaymentId
+                        assertFixtureDonationPaidEnvelope fixtureKey "donation" firstIds.DonationPaymentId 250 donationEnvelope
+                        assertFixtureDonationPaidEnvelope fixtureKey "say" firstIds.SayPaymentId 50 sayEnvelope
+
+                        let relay = factory.Services.GetRequiredService<Web10.Radio.API.OutboxRelayHostedService>()
+
+                        let processOne paymentPurpose =
+                            task {
+                                let! result = relay.ProcessDueEventsOnceAsync(CancellationToken.None)
+
+                                match result with
+                                | Ok 1 -> return ()
+                                | Ok count -> return raise (AssertionException(sprintf "Expected one relayed %s fixture payment event, got %d." paymentPurpose count))
+                                | Error error -> return raise (AssertionException(sprintf "Relaying fixture %s payment failed: %O" paymentPurpose error))
+                            }
+
+                        do! processOne "first"
+                        do! processOne "second"
+
+                        let! afterRelay = readFixtureDatabaseState connectionString fixtureKey
+                        Assert.That(afterRelay.RaisedStars, Is.EqualTo(250), "Only the DonationPaid transition may credit the fixture goal, exactly once.")
+                        Assert.That(afterRelay.DonationStatus, Is.EqualTo("Paid"))
+                        Assert.That(afterRelay.DonationChargeId, Is.EqualTo(Some(fixtureInvoicePayload fixtureKey "donation")))
+                        Assert.That(afterRelay.DonationPaidAt, Is.True)
+                        Assert.That(afterRelay.SayPaymentStatus, Is.EqualTo("Paid"))
+                        Assert.That(afterRelay.SayChargeId, Is.EqualTo(Some(fixtureInvoicePayload fixtureKey "say")))
+                        Assert.That(afterRelay.SayPaymentPaidAt, Is.True)
+                        Assert.That(afterRelay.SayMessageStatus, Is.EqualTo("PaidPendingModeration"))
+                        Assert.That(afterRelay.SayMessagePaidAt, Is.True)
+                        Assert.That(telegram.SentInvoices.Length, Is.EqualTo(0), "Relaying durable fixture payment events must not issue Telegram invoices.")
+                        Assert.That(telegram.SentTexts.Length, Is.EqualTo(0), "Relaying durable fixture payment events must not send Telegram text.")
+
+                        let! repeated = sendAdminJson client (Some firstSession.CsrfToken) fixtureRoute body
+                        use repeated = repeated
+                        Assert.That(repeated.StatusCode, Is.EqualTo(HttpStatusCode.OK))
+                        let! repeatedIds = parseFixtureIds repeated
+                        Assert.That(repeatedIds, Is.EqualTo(firstIds), "A retry after relay must preserve all fixture identities.")
+                        let! repeatedState = readFixtureDatabaseState connectionString fixtureKey
+                        Assert.That(repeatedState.DonationPaymentCount, Is.EqualTo(1L))
+                        Assert.That(repeatedState.SayPaymentCount, Is.EqualTo(1L))
+                        Assert.That(repeatedState.SayMessageCount, Is.EqualTo(1L))
+                        Assert.That(repeatedState.RaisedStars, Is.EqualTo(250), "Fixture retries must not double-credit a paid donation.")
+                        let! repeatedOutbox = countOutboxRows connectionString "DonationPaid"
+                        Assert.That(repeatedOutbox, Is.EqualTo(2), "Fixture retries must not append duplicate payment events.")
+                        let! idleRelay = relay.ProcessDueEventsOnceAsync(CancellationToken.None)
+
+                        match idleRelay with
+                        | Ok 0 -> ()
+                        | Ok count -> Assert.Fail(sprintf "Fixture retry unexpectedly created %d relay work items." count)
+                        | Error error -> Assert.Fail(sprintf "Fixture retry relay check failed: %O" error)
+                    finally
+                        secondClient.Dispose()
                 })

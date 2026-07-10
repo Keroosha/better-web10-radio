@@ -35,6 +35,21 @@ type DiscoveredTrackFile =
       SizeBytes: int64 option
       DiscoveredAtUtc: DateTimeOffset }
 
+type LibraryScanJobStatusRecord =
+    { Id: Guid
+      StorageBackendId: Guid option
+      Status: string
+      DiscoveredCount: int
+      RequestedAtUtc: DateTimeOffset
+      StartedAtUtc: DateTimeOffset option
+      FinishedAtUtc: DateTimeOffset option
+      FailureReason: string option }
+
+type CreateOrGetActiveLibraryScanJobResult =
+    | Created of LibraryScanJobStatusRecord
+    | Existing of LibraryScanJobStatusRecord
+    | StorageBackendNotFound
+
 module LibraryScanRepository =
     [<Literal>]
     let private claimNextJobSql = """WITH next_job AS (
@@ -115,6 +130,63 @@ WHERE "Id" = @StorageBackendId
 LIMIT 1;"""
 
     [<Literal>]
+    let private activeJobForStorageBackendSql = """SELECT
+    "Id", "StorageBackendId", "Status", "DiscoveredCount", "RequestedAtUtc", "StartedAtUtc", "FinishedAtUtc", "FailureReason"
+FROM "LibraryScanJobs"
+WHERE "IsDeleted" = false
+  AND "Status" IN ('Queued', 'Running')
+  AND "StorageBackendId" IS NOT DISTINCT FROM @StorageBackendId
+ORDER BY "RequestedAtUtc" ASC, "CreatedAtUtc" ASC, "Id" ASC
+LIMIT 1
+FOR UPDATE;"""
+
+    [<Literal>]
+    let private insertActiveJobSql = """INSERT INTO "LibraryScanJobs" (
+    "Id", "StorageBackendId", "Status", "DiscoveredCount", "RequestedAtUtc", "StartedAtUtc", "FinishedAtUtc", "FailureReason",
+    "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc"
+)
+SELECT
+    @JobId, @StorageBackendId, 'Queued', 0, @RequestedAtUtc, NULL, NULL, NULL,
+    false, @RequestedAtUtc, @RequestedAtUtc
+WHERE @StorageBackendId IS NULL
+   OR EXISTS (
+       SELECT 1
+       FROM "StorageBackends"
+       WHERE "Id" = @StorageBackendId
+         AND "IsDeleted" = false
+         AND "IsEnabled" = true
+   )
+ON CONFLICT DO NOTHING
+RETURNING "Id", "StorageBackendId", "Status", "DiscoveredCount", "RequestedAtUtc", "StartedAtUtc", "FinishedAtUtc", "FailureReason";"""
+
+    [<Literal>]
+    let private activeStorageBackendExistsSql = """SELECT EXISTS (
+    SELECT 1
+    FROM "StorageBackends"
+    WHERE "Id" = @StorageBackendId
+      AND "IsDeleted" = false
+      AND "IsEnabled" = true
+);"""
+
+    [<Literal>]
+    let private getJobStatusSql = """SELECT
+    "Id", "StorageBackendId", "Status", "DiscoveredCount", "RequestedAtUtc", "StartedAtUtc", "FinishedAtUtc", "FailureReason"
+FROM "LibraryScanJobs"
+WHERE "Id" = @JobId
+  AND "IsDeleted" = false
+LIMIT 1;"""
+
+    [<Literal>]
+    let private incrementDiscoveredCountSql = """UPDATE "LibraryScanJobs"
+SET "DiscoveredCount" = "DiscoveredCount" + 1,
+    "UpdatedAtUtc" = @UpdatedAtUtc
+WHERE "Id" = @JobId
+  AND "IsDeleted" = false
+  AND "Status" = 'Running'
+  AND "ClaimOwner" = @ClaimOwner
+  AND "ClaimAttempt" = @ClaimAttempt;"""
+
+    [<Literal>]
     let private activeTrackFileExistsSql = """SELECT EXISTS (
     SELECT 1
     FROM "TrackFiles"
@@ -177,6 +249,19 @@ WHERE "Id" = @TrackId
 
     let private readNullableString (reader: NpgsqlDataReader) ordinal =
         if reader.IsDBNull(ordinal) then None else Some(reader.GetString(ordinal))
+
+    let private readNullableDateTimeOffset (reader: NpgsqlDataReader) ordinal =
+        if reader.IsDBNull(ordinal) then None else Some(reader.GetFieldValue<DateTimeOffset>(ordinal))
+
+    let private readJobStatus (reader: NpgsqlDataReader) =
+        { Id = reader.GetGuid(0)
+          StorageBackendId = readNullableGuid reader 1
+          Status = reader.GetString(2)
+          DiscoveredCount = reader.GetInt32(3)
+          RequestedAtUtc = reader.GetFieldValue<DateTimeOffset>(4)
+          StartedAtUtc = readNullableDateTimeOffset reader 5
+          FinishedAtUtc = readNullableDateTimeOffset reader 6
+          FailureReason = readNullableString reader 7 }
 
     let private readJob (reader: NpgsqlDataReader) =
         { Id = reader.GetGuid(0)
@@ -359,6 +444,144 @@ WHERE "Id" = @TrackId
                     return None
             with ex ->
                 return! Error(databaseError "LibraryScanRepository.getStorageBackend" ex)
+        }
+
+    let private tryReadActiveJobInTransaction
+        (connection: NpgsqlConnection)
+        (transaction: NpgsqlTransaction)
+        (storageBackendId: Guid option)
+        (cancellationToken: CancellationToken)
+        : Task<Result<LibraryScanJobStatusRecord option, RepositoryError>> =
+        taskResult {
+            try
+                use command = new NpgsqlCommand(activeJobForStorageBackendSql, connection, transaction)
+                addNullableUuid command "StorageBackendId" storageBackendId
+                let! reader = command.ExecuteReaderAsync(cancellationToken)
+                use reader = reader
+                let! hasRow = reader.ReadAsync(cancellationToken)
+                return if hasRow then Some(readJobStatus reader) else None
+            with ex ->
+                return! Error(databaseError "LibraryScanRepository.tryReadActiveJobInTransaction" ex)
+        }
+
+    let private activeStorageBackendExistsInTransaction
+        (connection: NpgsqlConnection)
+        (transaction: NpgsqlTransaction)
+        (storageBackendId: Guid)
+        (cancellationToken: CancellationToken)
+        : Task<Result<bool, RepositoryError>> =
+        taskResult {
+            try
+                use command = new NpgsqlCommand(activeStorageBackendExistsSql, connection, transaction)
+                command.Parameters.AddWithValue("StorageBackendId", storageBackendId) |> ignore
+                let! exists = command.ExecuteScalarAsync(cancellationToken)
+                return Convert.ToBoolean(exists)
+            with ex ->
+                return! Error(databaseError "LibraryScanRepository.activeStorageBackendExistsInTransaction" ex)
+        }
+
+    let createOrGetActiveJob
+        (dataSource: NpgsqlDataSource)
+        (candidateJobId: Guid)
+        (storageBackendId: Guid option)
+        (requestedAtUtc: DateTimeOffset)
+        (cancellationToken: CancellationToken)
+        : Task<Result<CreateOrGetActiveLibraryScanJobResult, RepositoryError>> =
+        taskResult {
+            try
+                return!
+                    DatabaseSession.withTransactionResult
+                        dataSource
+                        (fun connection transaction cancellationToken ->
+                            taskResult {
+                                let! backendIsAvailable =
+                                    match storageBackendId with
+                                    | Some backendId ->
+                                        activeStorageBackendExistsInTransaction connection transaction backendId cancellationToken
+                                    | None -> Task.FromResult(Ok true)
+
+                                if not backendIsAvailable then
+                                    return StorageBackendNotFound
+                                else
+                                    let! existing = tryReadActiveJobInTransaction connection transaction storageBackendId cancellationToken
+
+                                    match existing with
+                                    | Some job -> return Existing job
+                                    | None ->
+                                        use insertCommand = new NpgsqlCommand(insertActiveJobSql, connection, transaction)
+                                        insertCommand.Parameters.AddWithValue("JobId", candidateJobId) |> ignore
+                                        addNullableUuid insertCommand "StorageBackendId" storageBackendId
+                                        insertCommand.Parameters.AddWithValue("RequestedAtUtc", requestedAtUtc) |> ignore
+                                        let! insertedJob =
+                                            task {
+                                                let! reader = insertCommand.ExecuteReaderAsync(cancellationToken)
+                                                use reader = reader
+                                                let! inserted = reader.ReadAsync(cancellationToken)
+                                                return if inserted then Some(readJobStatus reader) else None
+                                            }
+
+                                        match insertedJob with
+                                        | Some job -> return Created job
+                                        | None ->
+                                            let! winner = tryReadActiveJobInTransaction connection transaction storageBackendId cancellationToken
+
+                                            match winner with
+                                            | Some job -> return Existing job
+                                            | None ->
+                                                match storageBackendId with
+                                                | Some backendId ->
+                                                    let! exists = activeStorageBackendExistsInTransaction connection transaction backendId cancellationToken
+
+                                                    if not exists then
+                                                        return StorageBackendNotFound
+                                                    else
+                                                        return! Error(DatabaseError("LibraryScanRepository.createOrGetActiveJob", "active scan job disappeared before the unique-race winner could be read"))
+                                                | None ->
+                                                    return! Error(DatabaseError("LibraryScanRepository.createOrGetActiveJob", "active default scan job disappeared before the unique-race winner could be read"))
+                            })
+                        cancellationToken
+            with ex ->
+                return! Error(databaseError "LibraryScanRepository.createOrGetActiveJob" ex)
+        }
+
+    let getJobStatus
+        (dataSource: NpgsqlDataSource)
+        (jobId: Guid)
+        (cancellationToken: CancellationToken)
+        : Task<Result<LibraryScanJobStatusRecord option, RepositoryError>> =
+        taskResult {
+            try
+                use! connection = dataSource.OpenConnectionAsync(cancellationToken)
+                use command = new NpgsqlCommand(getJobStatusSql, connection)
+                command.Parameters.AddWithValue("JobId", jobId) |> ignore
+                let! reader = command.ExecuteReaderAsync(cancellationToken)
+                use reader = reader
+                let! hasRow = reader.ReadAsync(cancellationToken)
+                return if hasRow then Some(readJobStatus reader) else None
+            with ex ->
+                return! Error(databaseError "LibraryScanRepository.getJobStatus" ex)
+        }
+
+    let incrementDiscoveredCountInTransaction
+        (connection: NpgsqlConnection)
+        (transaction: NpgsqlTransaction)
+        (jobId: Guid)
+        (claimOwner: Guid)
+        (claimAttempt: int)
+        (updatedAtUtc: DateTimeOffset)
+        (cancellationToken: CancellationToken)
+        : Task<Result<bool, RepositoryError>> =
+        taskResult {
+            try
+                use command = new NpgsqlCommand(incrementDiscoveredCountSql, connection, transaction)
+                command.Parameters.AddWithValue("JobId", jobId) |> ignore
+                command.Parameters.AddWithValue("ClaimOwner", claimOwner) |> ignore
+                command.Parameters.AddWithValue("ClaimAttempt", claimAttempt) |> ignore
+                command.Parameters.AddWithValue("UpdatedAtUtc", updatedAtUtc) |> ignore
+                let! affected = command.ExecuteNonQueryAsync(cancellationToken)
+                return affected = 1
+            with ex ->
+                return! Error(databaseError "LibraryScanRepository.incrementDiscoveredCountInTransaction" ex)
         }
 
     let activeTrackFileExists

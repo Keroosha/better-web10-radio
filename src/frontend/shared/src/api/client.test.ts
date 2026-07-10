@@ -1,7 +1,16 @@
-import { describe, expect, test, vi } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import { z } from 'zod';
 
-import { ApiError, getPlayerState, getSocialLinks, type FetchImpl } from '../index';
+import {
+  apiFetch,
+  apiSend,
+  ApiError,
+  clearAdminSession,
+  getPlayerState,
+  setAdminSession,
+  subscribeToAdminSessionInvalidation,
+  type FetchImpl,
+} from '../index';
 import { validPlayerState } from '../testing/fixtures';
 
 function jsonResponse<TBody>(body: TBody, status = 200): Response {
@@ -10,6 +19,20 @@ function jsonResponse<TBody>(body: TBody, status = 200): Response {
     headers: { 'Content-Type': 'application/json' },
   });
 }
+
+function noContentResponse(): Response {
+  return new Response(null, { status: 204 });
+}
+
+const activeSession = {
+  username: 'operator',
+  csrfToken: 'csrf-token',
+  developmentFixturesEnabled: true,
+};
+
+afterEach(() => {
+  clearAdminSession?.();
+});
 
 describe('apiFetch via getPlayerState', () => {
   test('requests /api/v0/player/state and returns the validated body', async () => {
@@ -35,7 +58,7 @@ describe('apiFetch via getPlayerState', () => {
     };
     const fetchImpl: FetchImpl = () => Promise.resolve(jsonResponse(problem, 503));
 
-    const error = await getPlayerState({ fetchImpl }).catch((e) => e);
+    const error = await getPlayerState({ fetchImpl }).catch((error) => error);
 
     expect(error).toBeInstanceOf(ApiError);
     if (error instanceof ApiError) {
@@ -49,24 +72,153 @@ describe('apiFetch via getPlayerState', () => {
   test('propagates a ZodError when a 2xx body violates the schema', async () => {
     const fetchImpl: FetchImpl = () => Promise.resolve(jsonResponse({ nope: true }));
 
-    const error = await getPlayerState({ fetchImpl }).catch((e) => e);
+    const error = await getPlayerState({ fetchImpl }).catch((caught) => caught);
 
     expect(error).toBeInstanceOf(z.ZodError);
   });
 });
 
-describe('getSocialLinks', () => {
-  test('validates an array of social links from the admin route', async () => {
-    const [social] = validPlayerState().socials;
-    const fetchImpl: FetchImpl = vi.fn(() => Promise.resolve(jsonResponse([social])));
+describe('admin session transport', () => {
+  test('uses same-origin cookies and a CSRF header for authenticated mutations without bearer auth', async () => {
+    setAdminSession(activeSession);
+    let captured: RequestInit | undefined;
+    const fetchImpl: FetchImpl = vi.fn((_url, init) => {
+      captured = init;
+      return Promise.resolve(noContentResponse());
+    });
 
-    const links = await getSocialLinks({ fetchImpl });
+    await apiSend('/api/v0/admin/say-messages/message-1/approve', {
+      method: 'POST',
+      body: {},
+      admin: true,
+      fetchImpl,
+    });
 
-    expect(links).toHaveLength(1);
-    expect(links[0]?.kind).toBe('telegram');
-    expect(fetchImpl).toHaveBeenCalledWith(
-      '/api/v0/admin/social-links',
-      expect.objectContaining({ method: 'GET' }),
+    const headers = new Headers(captured?.headers);
+    expect(captured?.credentials).toBe('include');
+    expect(headers.get('x-csrf-token')).toBe('csrf-token');
+    expect(headers.get('authorization')).toBeNull();
+    expect(captured?.body).toBe('{}');
+  });
+
+  test('uses cookies but no CSRF header for an authenticated admin read', async () => {
+    setAdminSession(activeSession);
+    let captured: RequestInit | undefined;
+    const fetchImpl: FetchImpl = vi.fn((_url, init) => {
+      captured = init;
+      return Promise.resolve(jsonResponse({ healthy: true }));
+    });
+
+    const body = await apiFetch('/api/v0/admin/health-shape-test', {
+      schema: z.object({ healthy: z.boolean() }).strict(),
+      admin: true,
+      fetchImpl,
+    });
+
+    expect(body.healthy).toBe(true);
+    expect(captured?.credentials).toBe('include');
+    expect(new Headers(captured?.headers).get('x-csrf-token')).toBeNull();
+    expect(new Headers(captured?.headers).get('authorization')).toBeNull();
+  });
+
+  test('resolves a 204 response without attempting JSON parsing', async () => {
+    setAdminSession(activeSession);
+    const fetchImpl: FetchImpl = vi.fn(() => Promise.resolve(noContentResponse()));
+
+    await expect(
+      apiSend('/api/v0/admin/auth/logout', {
+        method: 'POST',
+        body: {},
+        admin: true,
+        fetchImpl,
+      }),
+    ).resolves.toBeUndefined();
+  });
+
+  test('does not invalidate an authenticated session when an auth probe returns 401', async () => {
+    setAdminSession(activeSession);
+    const onInvalidated = vi.fn();
+    const unsubscribe = subscribeToAdminSessionInvalidation(onInvalidated);
+    const fetchImpl: FetchImpl = () => Promise.resolve(jsonResponse({ title: 'Required' }, 401));
+
+    await expect(
+      apiFetch('/api/v0/admin/auth/session', {
+        schema: z.object({ username: z.string() }).strict(),
+        authProbe: true,
+        fetchImpl,
+      }),
+    ).rejects.toBeInstanceOf(ApiError);
+
+    const nextFetch: FetchImpl = vi.fn(() => Promise.resolve(noContentResponse()));
+    await apiSend('/api/v0/admin/say-messages/message-1/approve', {
+      method: 'POST',
+      body: {},
+      admin: true,
+      fetchImpl: nextFetch,
+    });
+
+    expect(onInvalidated).not.toHaveBeenCalled();
+    expect(new Headers(vi.mocked(nextFetch).mock.calls[0]?.[1]?.headers).get('x-csrf-token')).toBe(
+      'csrf-token',
     );
+    unsubscribe();
+  });
+
+  test('clears session state and notifies subscribers when an authenticated request returns 401', async () => {
+    setAdminSession(activeSession);
+    const onInvalidated = vi.fn();
+    const unsubscribe = subscribeToAdminSessionInvalidation(onInvalidated);
+    const unauthorized: FetchImpl = () => Promise.resolve(jsonResponse({ title: 'Required' }, 401));
+
+    await expect(
+      apiSend('/api/v0/admin/playback/queue', {
+        method: 'POST',
+        body: { trackId: 'track-1' },
+        admin: true,
+        fetchImpl: unauthorized,
+      }),
+    ).rejects.toBeInstanceOf(ApiError);
+
+    let nextInit: RequestInit | undefined;
+    const nextFetch: FetchImpl = vi.fn((_url, init) => {
+      nextInit = init;
+      return Promise.resolve(noContentResponse());
+    });
+    await apiSend('/api/v0/admin/playback/queue', {
+      method: 'POST',
+      body: { trackId: 'track-1' },
+      admin: true,
+      fetchImpl: nextFetch,
+    });
+
+    expect(onInvalidated).toHaveBeenCalledTimes(1);
+    expect(new Headers(nextInit?.headers).get('x-csrf-token')).toBeNull();
+    unsubscribe();
+  });
+});
+
+describe('apiSend errors', () => {
+  test('throws a typed ApiError carrying the problem code on a non-2xx', async () => {
+    const problem = {
+      type: 'https://web10.radio/problems/say-state-conflict',
+      title: 'Conflict',
+      status: 409,
+      traceId: 'trace-9',
+      code: 'say.state_conflict',
+      message: 'Message already moderated',
+    };
+    const fetchImpl: FetchImpl = () => Promise.resolve(jsonResponse(problem, 409));
+
+    const error = await apiSend('/api/v0/admin/say-messages/x/approve', {
+      method: 'POST',
+      body: {},
+      fetchImpl,
+    }).catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(ApiError);
+    if (error instanceof ApiError) {
+      expect(error.status).toBe(409);
+      expect(error.code).toBe('say.state_conflict');
+    }
   });
 });

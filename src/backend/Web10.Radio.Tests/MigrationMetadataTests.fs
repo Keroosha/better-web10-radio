@@ -23,6 +23,6 @@ module MigrationMetadataTests =
 
         Assert.That(
             versions,
-            Is.EqualTo(([| 202607080001L; 202607100001L; 202607100002L; 202607100003L |] : int64 array) :> obj),
-            "Durable workflow and B4 payment migrations must remain discoverable and ordered after the initial schema."
+            Is.EqualTo(([| 202607080001L; 202607100001L; 202607100002L; 202607100003L; 202607100004L |] : int64 array) :> obj),
+            "The current ordered schema sequence, including migration 202607100004, must remain discoverable after the initial schema."
         )

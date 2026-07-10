@@ -1,17 +1,14 @@
 // Typed fetch wrapper for the Web10.Radio HTTP API.
 //
 // Contract rules enforced here (SPEC §5/§10):
-//   • Every successful body is validated with a Zod schema before it is returned,
-//     so callers never touch an untyped payload and no domain-erasing cast is used.
+//   • Every successful body is validated with a Zod schema before it is returned.
 //   • Every error body is parsed as RFC 7807 problem details and surfaced as a
 //     typed `ApiError`.
-//
-// Base URL: `shared` stays free of build-tool/env coupling. The default is the
-// empty string, so requests are same-origin relative paths (`/api/v0/...`) — which
-// the Vite dev proxy forwards to the backend in development and which resolve
-// directly in production. An app may override it once at startup via `setApiBaseUrl`.
+//   • Admin requests use the HttpOnly session cookie; mutations synchronize the
+//     recoverable CSRF token held only in module memory.
 import { z } from 'zod';
 
+import type { AdminSession } from '../domain/admin';
 import { ProblemDetailsSchema, type ProblemDetails } from '../domain/problem-details';
 
 /** Shared route prefix for all v0 endpoints (SPEC §5). */
@@ -29,20 +26,35 @@ export function getApiBaseUrl(): string {
   return apiBaseUrl;
 }
 
-// Admin routes (`/api/v0/admin/*`) require `Authorization: Bearer <WEB10_ADMIN__TOKEN>`
-// (backend `Web10Admin` policy). Player routes are unauthenticated and must stay
-// header-free. The token is app-configured once at startup (like the base URL); only
-// requests that opt in with `admin: true` carry it.
-let adminToken: string | null = null;
+let adminSession: AdminSession | null = null;
+type AdminSessionInvalidationListener = () => void;
+const adminSessionInvalidationListeners = new Set<AdminSessionInvalidationListener>();
 
-/** Set (or clear, with `null`) the admin bearer token attached to admin requests. */
-export function setAdminToken(token: string | null): void {
-  adminToken = token;
+/** Retain the validated login/session DTO needed to synchronize admin mutations. */
+export function setAdminSession(session: AdminSession): void {
+  adminSession = session;
 }
 
-/** The currently configured admin bearer token (`null` = unset). */
-export function getAdminToken(): string | null {
-  return adminToken;
+/** Clear locally retained admin session state without notifying application subscribers. */
+export function clearAdminSession(): void {
+  adminSession = null;
+}
+
+/** Subscribe to server-driven authenticated-session expiry or revocation. */
+export function subscribeToAdminSessionInvalidation(
+  listener: AdminSessionInvalidationListener,
+): () => void {
+  adminSessionInvalidationListeners.add(listener);
+  return (): void => {
+    adminSessionInvalidationListeners.delete(listener);
+  };
+}
+
+function invalidateAdminSession(): void {
+  clearAdminSession();
+  for (const listener of adminSessionInvalidationListeners) {
+    listener();
+  }
 }
 
 /** The `fetch` surface we depend on; injectable so tests need no real network. */
@@ -71,16 +83,68 @@ export class ApiError extends Error {
   }
 }
 
-export interface ApiRequest<T> {
+interface AdminRequestContext {
+  /** Marks an admin route: include cookies and apply CSRF when appropriate. */
+  readonly admin?: boolean;
+  /** Login/session probe: never invalidates state or synchronizes CSRF. */
+  readonly authProbe?: boolean;
+}
+
+export interface ApiRequest<TResponse, TBody extends object = never> extends AdminRequestContext {
   /** Schema the response body is validated against. */
-  readonly schema: z.ZodType<T>;
+  readonly schema: z.ZodType<TResponse>;
   /** HTTP method; defaults to `GET`. */
   readonly method?: string;
+  /** JSON body for a response-carrying mutation. */
+  readonly body?: TBody;
   readonly signal?: AbortSignal;
   /** Injected `fetch` for tests; defaults to the global. */
   readonly fetchImpl?: FetchImpl;
-  /** When true, attach `Authorization: Bearer <admin token>` (admin routes only). */
-  readonly admin?: boolean;
+}
+
+/** A body-carrying request whose successful response has no JSON body (e.g. `204`). */
+export interface SendRequest<TBody extends object> extends AdminRequestContext {
+  /** HTTP method; there is no default (a send always mutates). */
+  readonly method: string;
+  /** JSON body; when present it is sent as `application/json`. */
+  readonly body?: TBody;
+  readonly signal?: AbortSignal;
+  /** Injected `fetch` for tests; defaults to the global. */
+  readonly fetchImpl?: FetchImpl;
+}
+
+
+function createHeaders(
+  request: AdminRequestContext,
+  method: string,
+  includesJsonBody: boolean,
+): Record<string, string> {
+  const headers: Record<string, string> = { Accept: 'application/json' };
+  if (includesJsonBody) {
+    headers['Content-Type'] = 'application/json';
+  }
+  if (
+    request.admin === true &&
+    request.authProbe !== true &&
+    (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE') &&
+    adminSession !== null
+  ) {
+    headers['X-CSRF-Token'] = adminSession.csrfToken;
+  }
+  return headers;
+}
+
+function createRequestInit<TBody extends object>(
+  request: AdminRequestContext & { readonly signal?: AbortSignal; readonly body?: TBody },
+  method: string,
+): RequestInit {
+  return {
+    method,
+    headers: createHeaders(request, method, request.body !== undefined),
+    ...(request.admin === true ? { credentials: 'include' as const } : {}),
+    ...(request.body !== undefined ? { body: JSON.stringify(request.body) } : {}),
+    ...(request.signal ? { signal: request.signal } : {}),
+  };
 }
 
 async function toApiError(res: Response): Promise<ApiError> {
@@ -91,25 +155,36 @@ async function toApiError(res: Response): Promise<ApiError> {
   return new ApiError(res.status, message, problem);
 }
 
-/**
- * Perform a request and return the validated body. Throws {@link ApiError} on any
- * non-2xx response and lets `ZodError` propagate if a 2xx body violates its schema
- * (a contract breach worth surfacing, not swallowing).
- */
-export async function apiFetch<T>(path: string, req: ApiRequest<T>): Promise<T> {
-  const doFetch = req.fetchImpl ?? fetch;
-  const headers: Record<string, string> = { Accept: 'application/json' };
-  if (req.admin === true && adminToken !== null) {
-    headers.Authorization = `Bearer ${adminToken}`;
+async function throwForError(res: Response, request: AdminRequestContext): Promise<never> {
+  const error = await toApiError(res);
+  if (res.status === 401 && request.admin === true && request.authProbe !== true) {
+    invalidateAdminSession();
   }
-  const init: RequestInit = {
-    method: req.method ?? 'GET',
-    headers,
-    ...(req.signal ? { signal: req.signal } : {}),
-  };
-  const res = await doFetch(`${apiBaseUrl}${path}`, init);
+  throw error;
+}
+
+/** Perform a request and return the validated successful JSON body. */
+export async function apiFetch<TResponse, TBody extends object = never>(
+  path: string,
+  req: ApiRequest<TResponse, TBody>,
+): Promise<TResponse> {
+  const doFetch = req.fetchImpl ?? fetch;
+  const method = req.method ?? 'GET';
+  const res = await doFetch(`${apiBaseUrl}${path}`, createRequestInit(req, method));
   if (!res.ok) {
-    throw await toApiError(res);
+    return throwForError(res, req);
   }
   return req.schema.parse(await res.json());
+}
+
+/** Perform a request that returns no body on success (such as `204`). */
+export async function apiSend<TBody extends object>(
+  path: string,
+  req: SendRequest<TBody>,
+): Promise<void> {
+  const doFetch = req.fetchImpl ?? fetch;
+  const res = await doFetch(`${apiBaseUrl}${path}`, createRequestInit(req, req.method));
+  if (!res.ok) {
+    return throwForError(res, req);
+  }
 }

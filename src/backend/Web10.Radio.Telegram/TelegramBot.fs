@@ -146,6 +146,14 @@ type ITelegramBotClient =
         errorMessage: string option *
         CancellationToken -> Task<Result<unit, TelegramBotError>>
 
+    abstract member GetUpdatesAsync:
+        offset: int64 option *
+        timeoutSeconds: int *
+        CancellationToken -> Task<Result<Update array, TelegramBotError>>
+
+    abstract member DeleteWebhookAsync:
+        dropPendingUpdates: bool * CancellationToken -> Task<Result<unit, TelegramBotError>>
+
 [<RequireQualifiedAccess>]
 module TelegramText =
     let private commandList locale requestPriceStars sayPriceStars =
@@ -374,6 +382,26 @@ type FunogramTelegramBotClient(config: Funogram.Types.BotConfig) =
                 return Error(TelegramBotError.transportException methodName exceptionValue)
         }
 
+    let executeResult methodName request (cancellationToken: CancellationToken) : Task<Result<'T, TelegramBotError>> =
+        task {
+            try
+                let! response =
+                    Async.StartAsTask(
+                        (request |> Funogram.Api.api config),
+                        cancellationToken = cancellationToken
+                    )
+
+                cancellationToken.ThrowIfCancellationRequested()
+
+                return
+                    match response with
+                    | Ok value -> Ok value
+                    | Error error -> Error(TelegramBotError.api methodName error)
+            with exceptionValue ->
+                cancellationToken.ThrowIfCancellationRequested()
+                return Error(TelegramBotError.transportException methodName exceptionValue)
+        }
+
     let mapKeyboard (keyboard: TelegramInlineButton list list) =
         keyboard
         |> List.map (fun row ->
@@ -428,3 +456,11 @@ type FunogramTelegramBotClient(config: Funogram.Types.BotConfig) =
                 | None -> Funogram.Telegram.Api.answerPreCheckoutQuery preCheckoutQueryId
 
             execute "answerPreCheckoutQuery" request cancellationToken |> passThrough
+
+        member _.GetUpdatesAsync(offset, timeoutSeconds, cancellationToken) =
+            let request = Req.GetUpdates.Make(?offset = offset, timeout = int64 timeoutSeconds)
+            executeResult "getUpdates" request cancellationToken
+
+        member _.DeleteWebhookAsync(dropPendingUpdates, cancellationToken) =
+            let request = Req.DeleteWebhook.Make(dropPendingUpdates = dropPendingUpdates)
+            execute "deleteWebhook" request cancellationToken |> passThrough

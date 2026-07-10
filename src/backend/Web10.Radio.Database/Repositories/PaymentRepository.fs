@@ -25,6 +25,7 @@ type PaymentOrderToCreate =
       PurposeEntityId: Guid option
       AmountStars: int
       InvoicePayload: string
+      PayerDisplayName: string option
       CreatedAtUtc: DateTimeOffset }
 
 [<RequireQualifiedAccess>]
@@ -51,17 +52,22 @@ module PaymentRepository =
         let parameter = command.Parameters.Add(name, NpgsqlDbType.Uuid)
         parameter.Value <- value |> Option.map box |> Option.defaultValue DBNull.Value
 
+    let private optionalString (command: NpgsqlCommand) name value =
+        let parameter = command.Parameters.Add(name, NpgsqlDbType.Text)
+        parameter.Value <- value |> Option.map box |> Option.defaultValue DBNull.Value
+
     let private readOrderInTransaction (connection: NpgsqlConnection) (transaction: NpgsqlTransaction) (paymentId: Guid) (cancellationToken: CancellationToken) =
         task {
-            use command = new NpgsqlCommand("""SELECT "TelegramUserId", "Purpose", "PurposeEntityId", "AmountStars", "TelegramInvoicePayload", "Status", "TelegramPaymentChargeId"
+            use command = new NpgsqlCommand("""SELECT "TelegramUserId", "Purpose", "PurposeEntityId", "AmountStars", "TelegramInvoicePayload", "PayerDisplayName", "Status", "TelegramPaymentChargeId"
 FROM "Payments" WHERE "Id" = @Id AND "IsDeleted" = false FOR UPDATE;""", connection, transaction)
             command.Parameters.AddWithValue("Id", paymentId) |> ignore
             use! reader = command.ExecuteReaderAsync(cancellationToken)
             let! found = reader.ReadAsync(cancellationToken)
             if not found then return None else
                 let entityId = if reader.IsDBNull 2 then None else Some(reader.GetGuid 2)
-                let charge = if reader.IsDBNull 6 then None else Some(reader.GetString 6)
-                return Some(reader.GetInt64 0, reader.GetString 1, entityId, reader.GetInt32 3, reader.GetString 4, reader.GetString 5, charge)
+                let payerDisplayName = if reader.IsDBNull 5 then None else Some(reader.GetString 5)
+                let charge = if reader.IsDBNull 7 then None else Some(reader.GetString 7)
+                return Some(reader.GetInt64 0, reader.GetString 1, entityId, reader.GetInt32 3, reader.GetString 4, payerDisplayName, reader.GetString 6, charge)
         }
 
     let tryGetOrderInTransaction
@@ -71,9 +77,9 @@ FROM "Payments" WHERE "Id" = @Id AND "IsDeleted" = false FOR UPDATE;""", connect
             try
                 let! row = readOrderInTransaction connection transaction paymentId cancellationToken
                 return
-                    Ok(row |> Option.bind (fun (userId, purpose, entityId, amount, payload, _, _) ->
+                    Ok(row |> Option.bind (fun (userId, purpose, entityId, amount, payload, payerDisplayName, _, _) ->
                         tryPurpose purpose |> Option.map (fun parsed ->
-                            { Id = paymentId; TelegramUserId = userId; Purpose = parsed; PurposeEntityId = entityId; AmountStars = amount; InvoicePayload = payload; CreatedAtUtc = DateTimeOffset.MinValue })))
+                            { Id = paymentId; TelegramUserId = userId; Purpose = parsed; PurposeEntityId = entityId; AmountStars = amount; InvoicePayload = payload; PayerDisplayName = payerDisplayName; CreatedAtUtc = DateTimeOffset.MinValue })))
             with
             | :? OperationCanceledException as ex when cancellationToken.IsCancellationRequested -> return raise ex
             | ex -> return Error(error "PaymentRepository.tryGetOrderInTransaction" ex)
@@ -87,21 +93,22 @@ FROM "Payments" WHERE "Id" = @Id AND "IsDeleted" = false FOR UPDATE;""", connect
                 if order.AmountStars <= 0 || String.IsNullOrWhiteSpace order.InvoicePayload then
                     return Ok(CommandOutcome.Rejected "payment order is invalid")
                 else
-                    use insert = new NpgsqlCommand("""INSERT INTO "Payments" ("Id", "TelegramUserId", "Purpose", "PurposeEntityId", "AmountStars", "Currency", "ProviderToken", "TelegramInvoicePayload", "Status", "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc")
-VALUES (@Id, @TelegramUserId, @Purpose, @PurposeEntityId, @AmountStars, 'XTR', '', @InvoicePayload, 'InvoiceCreated', false, @CreatedAtUtc, @CreatedAtUtc)
-ON CONFLICT ("Id") DO NOTHING;""", connection, transaction)
+                    use insert = new NpgsqlCommand("""INSERT INTO "Payments" ("Id", "TelegramUserId", "Purpose", "PurposeEntityId", "AmountStars", "Currency", "ProviderToken", "TelegramInvoicePayload", "PayerDisplayName", "Status", "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc")
+VALUES (@Id, @TelegramUserId, @Purpose, @PurposeEntityId, @AmountStars, 'XTR', '', @InvoicePayload, @PayerDisplayName, 'InvoiceCreated', false, @CreatedAtUtc, @CreatedAtUtc)
+ON CONFLICT DO NOTHING;""", connection, transaction)
                     insert.Parameters.AddWithValue("Id", order.Id) |> ignore
                     insert.Parameters.AddWithValue("TelegramUserId", order.TelegramUserId) |> ignore
                     insert.Parameters.AddWithValue("Purpose", purposeText order.Purpose) |> ignore
                     optionalGuid insert "PurposeEntityId" order.PurposeEntityId
                     insert.Parameters.AddWithValue("AmountStars", order.AmountStars) |> ignore
                     insert.Parameters.AddWithValue("InvoicePayload", order.InvoicePayload) |> ignore
+                    optionalString insert "PayerDisplayName" order.PayerDisplayName
                     insert.Parameters.AddWithValue("CreatedAtUtc", order.CreatedAtUtc) |> ignore
                     let! inserted = insert.ExecuteNonQueryAsync(cancellationToken)
                     if inserted = 1 then return Ok(CommandOutcome.Created order) else
                         let! existing = readOrderInTransaction connection transaction order.Id cancellationToken
                         match existing with
-                        | Some(userId, purpose, entityId, amount, payload, _, _) when userId = order.TelegramUserId && purpose = purposeText order.Purpose && entityId = order.PurposeEntityId && amount = order.AmountStars && payload = order.InvoicePayload -> return Ok(CommandOutcome.AlreadyApplied order)
+                        | Some(userId, purpose, entityId, amount, payload, payerDisplayName, _, _) when userId = order.TelegramUserId && purpose = purposeText order.Purpose && entityId = order.PurposeEntityId && amount = order.AmountStars && payload = order.InvoicePayload && payerDisplayName = order.PayerDisplayName -> return Ok(CommandOutcome.AlreadyApplied order)
                         | _ -> return Ok(CommandOutcome.Rejected "payment order does not match existing order")
             with
             | :? OperationCanceledException as ex when cancellationToken.IsCancellationRequested -> return raise ex
@@ -151,11 +158,31 @@ FROM "Payments" WHERE "TelegramInvoicePayload" = @Payload AND "IsDeleted" = fals
             | ex -> return Error(error "PaymentRepository.validatePreCheckoutInTransaction" ex)
         }
 
+    let private incrementActiveDonationGoalInTransaction (connection: NpgsqlConnection) (transaction: NpgsqlTransaction) (amountStars: int) (paidAtUtc: DateTimeOffset) (cancellationToken: CancellationToken) =
+        task {
+            use command = new NpgsqlCommand("""UPDATE "DonationGoals"
+SET "RaisedStars" = "RaisedStars" + @AmountStars,
+    "UpdatedAtUtc" = @PaidAtUtc
+WHERE "Id" = (
+    SELECT "Id"
+    FROM "DonationGoals"
+    WHERE "IsDeleted" = false
+      AND "IsActive" = true
+    ORDER BY "UpdatedAtUtc" DESC, "CreatedAtUtc" DESC, "Id" DESC
+    LIMIT 1
+    FOR UPDATE
+);""", connection, transaction)
+            command.Parameters.AddWithValue("AmountStars", amountStars) |> ignore
+            command.Parameters.AddWithValue("PaidAtUtc", paidAtUtc) |> ignore
+            return! command.ExecuteNonQueryAsync(cancellationToken)
+        }
+
     let private completeInTransaction connection transaction paymentId telegramUserId chargeId amountStars currency paidAtUtc cancellationToken =
         task {
             let! row = readOrderInTransaction connection transaction paymentId cancellationToken
             match row with
-            | Some(user, purposeTextValue, entityId, amount, _, status, existingCharge) when user = telegramUserId && amount = amountStars && currency = "XTR" ->
+
+            | Some(user, purposeTextValue, entityId, amount, _, _, status, existingCharge) when user = telegramUserId && amount = amountStars && currency = "XTR" ->
                 match tryPurpose purposeTextValue with
                 | None -> return Ok(Rejected "payment purpose is invalid")
                 | Some purpose ->
@@ -173,6 +200,7 @@ FROM "Payments" WHERE "TelegramInvoicePayload" = @Payload AND "IsDeleted" = fals
                                 update.Parameters.AddWithValue("Charge", chargeId) |> ignore
                                 update.Parameters.AddWithValue("At", paidAtUtc) |> ignore
                                 let! _ = update.ExecuteNonQueryAsync(cancellationToken)
+                                let! _ = incrementActiveDonationGoalInTransaction connection transaction amountStars paidAtUtc cancellationToken
                                 return Ok(Completed { PaymentId = paymentId; Purpose = purpose; PurposeEntityId = entityId; AlreadyApplied = false })
                         | (Request | Say), None -> return Ok(Rejected "payment purpose entity is missing")
                         | Say, Some sayId ->

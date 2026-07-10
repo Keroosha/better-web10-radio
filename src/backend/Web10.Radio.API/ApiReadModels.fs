@@ -154,25 +154,41 @@ ORDER BY "UpdatedAtUtc" DESC, "CreatedAtUtc" DESC
 LIMIT 1;"""
 
     [<Literal>]
-    let private recentDonationsSql = """SELECT "Id", "AmountStars", "PaidAtUtc"
+    let private recentDonationsSql = """SELECT "Id", COALESCE("PayerDisplayName", 'anonymous'), "AmountStars", "PaidAtUtc"
 FROM "Payments"
 WHERE "IsDeleted" = false
   AND "Purpose" = 'Donation'
   AND "Status" = 'Paid'
   AND "PaidAtUtc" IS NOT NULL
-ORDER BY "PaidAtUtc" DESC, "CreatedAtUtc" DESC
+ORDER BY "PaidAtUtc" DESC, "CreatedAtUtc" DESC, "Id" DESC
 LIMIT 10;"""
 
     [<Literal>]
-    let private topDonatorSql = """SELECT SUM("AmountStars")::bigint AS "AmountStars"
-FROM "Payments"
-WHERE "IsDeleted" = false
-  AND "Purpose" = 'Donation'
-  AND "Status" = 'Paid'
-  AND "PaidAtUtc" IS NOT NULL
-GROUP BY "TelegramUserId"
-ORDER BY SUM("AmountStars") DESC
-LIMIT 1;"""
+    let private topDonatorSql = """WITH winner AS (
+    SELECT "TelegramUserId", SUM("AmountStars")::bigint AS "AmountStars"
+    FROM "Payments"
+    WHERE "IsDeleted" = false
+      AND "Purpose" = 'Donation'
+      AND "Status" = 'Paid'
+      AND "PaidAtUtc" IS NOT NULL
+    GROUP BY "TelegramUserId"
+    ORDER BY SUM("AmountStars") DESC, "TelegramUserId" ASC
+    LIMIT 1
+)
+SELECT COALESCE((
+    SELECT payment."PayerDisplayName"
+    FROM "Payments" AS payment
+    WHERE payment."IsDeleted" = false
+      AND payment."Purpose" = 'Donation'
+      AND payment."Status" = 'Paid'
+      AND payment."PaidAtUtc" IS NOT NULL
+      AND payment."TelegramUserId" = winner."TelegramUserId"
+      AND payment."PayerDisplayName" IS NOT NULL
+      AND btrim(payment."PayerDisplayName") <> ''
+    ORDER BY payment."PaidAtUtc" DESC, payment."CreatedAtUtc" DESC, payment."Id" DESC
+    LIMIT 1
+), 'anonymous') AS "DisplayName", winner."AmountStars"
+FROM winner;"""
 
     [<Literal>]
     let private superChatSql = """SELECT "Id", "DisplayName", "Text", "AmountStars", "Color", "SubmittedAtUtc"
@@ -366,9 +382,9 @@ LIMIT 1;"""
                 if hasRow then
                     donations.Add
                         { Id = reader.GetGuid(0).ToString("D")
-                          DisplayName = "anonymous"
-                          AmountStars = reader.GetInt32(1)
-                          PaidAtUtc = ApiTime.toIsoUtc (reader.GetFieldValue<DateTimeOffset>(2)) }
+                          DisplayName = reader.GetString(1)
+                          AmountStars = reader.GetInt32(2)
+                          PaidAtUtc = ApiTime.toIsoUtc (reader.GetFieldValue<DateTimeOffset>(3)) }
                 else
                     keepReading <- false
 
@@ -384,8 +400,8 @@ LIMIT 1;"""
 
             if hasRow then
                 return
-                    { DisplayName = "anonymous"
-                      AmountStars = clampToInt32 (reader.GetInt64(0)) }
+                    { DisplayName = reader.GetString(0)
+                      AmountStars = clampToInt32 (reader.GetInt64(1)) }
             else
                 return Unchecked.defaultof<TopDonatorDto>
         }

@@ -4,8 +4,8 @@ Web10.Radio — это 24/7 радио для Telegram-канала `https://t.m
 
 ## 1. Репозиторий сейчас
 
-- Текущий репозиторий содержит только `README.md`, `.idea/`, `Web 1.0-radio-scene.zip` и `src/frontend/web-stage/mocks/`.
-- Сейчас отсутствуют `docs/`, `src/backend/`, `src/frontend/admin/`, `src/stream-node/`.
+- Текущий репозиторий содержит canonical `docs/`, backend F# solution/projects and tests under `src/backend/`, Bun frontend workspaces under `src/frontend/`, stream-node runtime sources, Compose artifacts, и `src/frontend/web-stage/mocks/` design handoff. Presence артефактов не является evidence их end-to-end readiness.
+- Milestone boxes below intentionally remain unchecked until their targeted verification or integrated smoke assertion has passed; this SPEC не утверждает completion только по наличию исходников.
 - `src/frontend/web-stage/mocks/README.md` описывает HTML/CSS/JS как design handoff: визуал нужно faithfully recreate, но не копировать prototype structure в production runtime.
 - `Web 1.0-radio-scene.zip` — duplicate wrapper вокруг тех же mock assets, а не отдельный источник требований.
 
@@ -78,12 +78,19 @@ flowchart LR
 
 - JSON content type: `application/json; charset=utf-8`.
 - Все frontend-facing routes (`/api/v0/player/*`, `/api/v0/admin/*`) сериализуют JSON в camelCase — и имена полей, и enum-значения. Это фиксированный контракт для frontend (там принят camelCase). Внутренние PascalCase доменные состояния из БД (например `PlaybackQueue.Status`, `SayMessages.Status`, `StreamNodeHeartbeats.Status`) проецируются в camelCase на API-границе; frontend никогда не видит PascalCase и не видит внутренних состояний, которых нет в enum'ах ниже.
-- Все timestamps — UTC ISO-8601 strings ending with `Z`.
+- Все идентификаторы в wire contract — RFC9562 UUIDv7; все timestamps — UTC ISO-8601 strings ending with `Z`.
 - `amountStars`, `raisedStars`, `goalStars` — integer Telegram Stars, not cents.
 - Public player routes read-only и unauthenticated, если deployment later не поставит их behind CDN/internal network.
-- Все `/api/v0/admin/*` routes require the exact header contract `Authorization: Bearer <WEB10_ADMIN__TOKEN>` under named policy `Web10Admin`. Missing, malformed, multiple or wrong `Authorization` values return HTTP `401`, `WWW-Authenticate: Bearer`, and RFC 7807 code `admin.auth.required`; a valid token reaches the handler.
-- Telegram webhook route validates Telegram secret token before accepting updates.
 - REST errors use RFC 7807-style problem details with `traceId`, `code`, and `message` fields. Example shape: `{ "type": "https://web10.radio/problems/stream-unavailable", "title": "Stream unavailable", "status": 503, "traceId": "...", "code": "stream.unavailable", "message": "Stream is offline" }`.
+- Telegram webhook route validates Telegram secret token before accepting updates.
+
+### Admin session authentication
+
+- `POST /api/v0/admin/auth/login` is anonymous and accepts exact `{ "username": string, "password": string }`, maximum body 4 KiB. `username` is trimmed and must contain 1–64 characters; `password` is not trimmed and must contain 12–256 characters. It returns `200 { "username": string, "csrfToken": string, "developmentFixturesEnabled": boolean }` and sets `web10_admin_session`. Malformed input returns `400 admin.auth.request_invalid`; bad credentials, including an unknown or deleted user, return indistinguishable `401 admin.auth.invalid_credentials`.
+- `GET /api/v0/admin/auth/session` returns the same DTO without rotating the session, or `401 admin.auth.required`.
+- `POST /api/v0/admin/auth/logout` accepts exact `{}`, requires the active session cookie and `X-CSRF-Token`, revokes that session, clears the cookie, and returns `204`. Without an active session it returns `401 admin.auth.required`.
+- Every other `/api/v0/admin/*` route requires the opaque `web10_admin_session` cookie. Every admin `POST`, `PUT`, `PATCH`, or `DELETE`, including logout, requires the synchronizer token returned by login/session in `X-CSRF-Token`; a missing or wrong token returns `403 admin.auth.csrf_invalid`. There are no redirects, no `Authorization` header contract, and no bearer compatibility path.
+- The cookie value is 32 random bytes encoded base64url; only its SHA-256 hash is persisted. It is `HttpOnly`, `SameSite=Strict`, `Path=/api/v0/admin`, has an eight-hour absolute `Max-Age` with no sliding renewal, and is `Secure` outside Development. Development permits localhost HTTP. The recoverable CSRF token is non-authenticating, compared fixed-time, and never logged.
 
 ### Player routes
 
@@ -188,46 +195,87 @@ SSE route contract:
 
 В v0 Telegram ingestion работает только через webhook; long polling runtime не поставляется. Webhook требует ровно один `X-Telegram-Bot-Api-Secret-Token`, сравнивает его fixed-time, ограничивает body 1 MiB и принимает typed Funogram `Update`. Обычные команды/callbacks/`successful_payment` проходят durable inbox/outbox path; `pre_checkout_query` обрабатывается синхронно, потому что protocol acknowledgement нельзя ждать ordered relay.
 
-### Stream-node callback routes
+### Stream-node callback and control routes
 
-Эти routes internal-to-deployment и требуют exact `Authorization: Bearer <WEB10_STREAM__CALLBACK_TOKEN>` under policy `Web10StreamNode`; token не совпадает с admin token или Telegram RTMP key.
+Эти internal-to-deployment routes требуют `Authorization: Bearer <WEB10_STREAM__CALLBACK_TOKEN>` under policy `Web10StreamNode`. Этот token не совпадает с Telegram RTMP key и не участвует в admin authentication.
 
 | Method | Route | Purpose |
 | --- | --- | --- |
+| `POST` | `/api/v0/stream-node/heartbeat` | Durable heartbeat intake. |
+| `GET` | `/api/v0/stream-node/playback/current` | Obtain the current fenced playback assignment. |
+| `GET` | `/api/v0/stream-node/control` | Read desired process state and restart generation. |
 | `POST` | `/api/v0/stream-node/playback/{queueItemId}/lease` | Renew the active fenced playback lease. |
 | `POST` | `/api/v0/stream-node/playback/{queueItemId}/completion` | Authoritatively finish active playback as played or failed. |
 
-Lease body: `{ "claimOwner": "uuid-v7", "claimAttempt": 1 }`. Completion body adds `status: "played|failed"`; failed completion also requires non-empty `failureReason`. Body size is limited to 4096 bytes. Missing/wrong auth returns `401`; malformed/oversized body returns `400|413`; stale owner/attempt returns `409`; accepted callback returns `204`.
-
-`PlaybackStarted` carries `queueItemId`, `claimOwner`, `claimAttempt`, `trackId` and `cachePath`. The stream-node renews its 30-second lease at least every 10 seconds while playback is active. Completion transaction fences `(queueItemId, claimOwner, claimAttempt, Playing)`, writes `Played|Failed`, and appends `PlaybackEnded` atomically. Expired attempts cannot renew or complete; the playback worker reclaims them after restart/crash.
+- `POST /api/v0/stream-node/heartbeat` accepts, at most 4 KiB, `{ "status": "starting|live|degraded|restarting|failed|offline", "failureReason": string|null, "metadata": { "bitrateKbps": integer|null, "restartAttempt": integer|null, "activeQueueItemId": uuid|null } }`. It returns `204` only after durable `StreamNodeHeartbeatReceived` append. Server receipt time is authoritative; invalid input returns `400 stream-node.heartbeat.invalid`, while missing/wrong stream-node authentication remains `401 stream-node.auth.required`.
+- `GET /api/v0/stream-node/playback/current` returns `204` with no body if there is no fenced `Playing` row. Otherwise it returns `200 { "queueItemId": uuid, "claimOwner": uuid, "claimAttempt": positive integer, "trackId": uuid, "cachePath": nonempty string, "contentType": string, "title": string, "artist": string, "durationMs": nonnegative integer }`. Database-null `contentType`, `title`, `artist`, and `durationMs` project respectively to `"audio/mpeg"`, `""`, `""`, and `0`.
+- `GET /api/v0/stream-node/control` returns `200 { "desiredState": "running|stopped", "restartGeneration": nonnegative integer }`.
+- Lease body is `{ "claimOwner": "uuid-v7", "claimAttempt": 1 }`; completion body adds `status: "played|failed"`, and a failed completion requires non-empty `failureReason`. These callback bodies are limited to 4 KiB. Malformed/oversized bodies return `400|413`; stale owner/attempt returns `409`; accepted callbacks return `204`.
+- `PlaybackStarted` carries `queueItemId`, `claimOwner`, `claimAttempt`, `trackId`, and `cachePath`. The stream-node renews its 30-second lease at least every 10 seconds while playback is active. Completion transaction fences `(queueItemId, claimOwner, claimAttempt, Playing)`, writes `Played|Failed`, and appends `PlaybackEnded` atomically. Expired attempts cannot renew or complete; the playback worker reclaims them after restart/crash.
 
 ### Admin routes
 
+All read/list routes return `200`. Admin queue, stream-control, and scan acceptance return `202`; donation/social/storage and playlist/item replacement return `200` with the canonical DTO; playlist and playlist-item creation return `201` with the created DTO. A non-null ID that is missing/deleted, references a missing track/backend, or belongs to another parent returns the route's exact `404` problem code. Repeated IDs/positions, duplicate active names, and uniqueness races return the route's exact `409` code without partial writes. Single-object bodies are limited to 16 KiB; replace-all arrays are limited to 64 KiB unless a more restrictive route limit is stated.
+
 | Method | Route | Purpose |
 | --- | --- | --- |
-| `GET/PUT` | `/api/v0/admin/social-links` | Manage social links and QR/source metadata. |
-| `GET/PUT` | `/api/v0/admin/donation-goal` | Manage donation goal title and target Stars. |
+| `POST` | `/api/v0/admin/auth/login` | Establish admin session. |
+| `GET` | `/api/v0/admin/auth/session` | Restore active admin session. |
+| `POST` | `/api/v0/admin/auth/logout` | Revoke active admin session. |
+| `POST` | `/api/v0/admin/library/scan` | Create or return active scan job. |
+| `GET` | `/api/v0/admin/library/scan/{scanJobId}` | Read scan status. |
+| `GET` | `/api/v0/admin/tracks` | Search active tracks. |
+| `POST` | `/api/v0/admin/playback/queue` | Queue a scanned track immediately. |
+| `GET/PUT` | `/api/v0/admin/social-links` | Read/replace social links. |
+| `GET/PUT` | `/api/v0/admin/donation-goal` | Read/update donation goal. |
 | `GET/POST` | `/api/v0/admin/playlists` | List/create playlists. |
-| `GET/POST/PUT` | `/api/v0/admin/playlists/{playlistId}/items` | Manage playlist items and ordering. |
+| `PUT` | `/api/v0/admin/playlists/{playlistId}` | Update a playlist. |
+| `GET/POST/PUT` | `/api/v0/admin/playlists/{playlistId}/items` | List/create/replace playlist items. |
+| `GET` | `/api/v0/admin/storage` | Read default and additional storage backends. |
+| `PUT` | `/api/v0/admin/storage` | Replace additional storage backends. |
+| `GET` | `/api/v0/admin/stream-node/status` | Read heartbeat freshness and desired control state. |
+| `POST` | `/api/v0/admin/stream-node/start` | Request running state. |
+| `POST` | `/api/v0/admin/stream-node/stop` | Request stopped state. |
+| `POST` | `/api/v0/admin/stream-node/restart` | Force running state and increment restart generation. |
 | `GET` | `/api/v0/admin/say-messages?status=pending|approved|rejected` | Moderate `/say` messages. |
 | `POST` | `/api/v0/admin/say-messages/{messageId}/approve` | Approve a paid message for screen display. |
 | `POST` | `/api/v0/admin/say-messages/{messageId}/reject` | Reject a paid message with moderation reason. |
-| `GET/PUT` | `/api/v0/admin/storage` | Configure S3 or local filesystem library storage. |
-| `POST` | `/api/v0/admin/library/scan` | Enqueue a library scan job. |
-| `GET` | `/api/v0/admin/stream-node/status` | View stream-node process/heartbeat state. |
-| `POST` | `/api/v0/admin/stream-node/restart` | Request stream-node restart through backend command event. |
 
-Pinned `/say` moderation contract:
+#### Library and playback
+
+- `POST /api/v0/admin/library/scan` accepts exact `{}` or `{ "storageBackendId": "uuid-v7" }` and returns `202 { "scanJobId": "uuid-v7" }`. A concurrent `queued|running` job for the same default or explicit backend returns its existing ID with `202`, so retries are idempotent. Invalid body/UUID returns `400 library.scan.request_invalid`; a missing or disabled explicit backend returns `404 storage.backend_not_found`.
+- `GET /api/v0/admin/library/scan/{scanJobId}` returns `200 { "scanJobId": uuid, "status": "queued|running|completed|failed", "discoveredCount": nonnegative integer, "requestedAtUtc": Z-string, "startedAtUtc": Z-string|null, "finishedAtUtc": Z-string|null, "failureReason": string|null }`; missing/deleted job returns `404 library.scan_not_found`.
+- `GET /api/v0/admin/tracks?query=<0..200 chars>&limit=<1..100>` defaults to `query=""` and `limit=100`. It returns active `{ "id": uuid, "title": string, "artist": string, "album": string, "durationMs": nonnegative integer, "hasCachedFile": boolean }[]`, ordered newest first for empty query. Database-null artist/album/duration project to `""`, `""`, and `0`. Invalid query/limit returns `400 track.request_invalid`; a missing/deleted requested track returns `404 track.not_found`.
+- `POST /api/v0/admin/playback/queue` accepts exact `{ "trackId": "uuid-v7" }` and returns `202 { "queueItemId": "uuid-v7" }`. It is the immediate non-payment path for a scanned track. Invalid input returns `400 playback.request_invalid`, a missing/unplayable track returns `404 playback.not_found`, and a queue conflict returns `409 playback.conflict`.
+
+#### Stream control and status
+
+- `POST /api/v0/admin/stream-node/start`, `/stop`, and `/restart` each accept exact `{}` and return `202 { "desiredState": "running|stopped", "restartGeneration": nonnegative integer }`. Restart forces `running` and increments `restartGeneration`. Invalid body returns `400 stream-node.control.request_invalid`; state/uniqueness conflict returns `409 stream-node.control.conflict`.
+- `GET /api/v0/admin/stream-node/status` returns `200 { "status": "offline|starting|live|degraded", "desiredState": "running|stopped", "lastHeartbeatUtc": Z-string|null, "failureReason": string|null, "bitrateKbps": nonnegative integer, "restartGeneration": nonnegative integer }`. Missing heartbeat or a heartbeat stale by more than 30 seconds maps to `offline`, `lastHeartbeatUtc: null`, `failureReason: null`, and `bitrateKbps: 0` through the same freshness rule.
+
+#### Donation, socials, playlists, and storage
+
+- `PUT /api/v0/admin/donation-goal` accepts `{ "title": string, "goalStars": positive integer }`; `title` is trimmed to 1–120 characters and `goalStars` is `1..Int32.MaxValue`. It returns the updated canonical `DonationGoalDto`, preserves `raisedStars` during update, and creates it at zero only when no active goal exists. Invalid input is `400 donation.goal.request_invalid`, missing is `404 donation.goal.not_found`, and uniqueness/state conflict is `409 donation.goal.conflict`.
+- `GET /api/v0/admin/social-links` returns canonical non-null `SocialLinkDto[]`. `PUT /api/v0/admin/social-links` accepts a replace-all array of at most 50 `{ "id": uuid|null, "kind": "telegram|youtube|instagram|discord|external", "name": string, "handle": string|null, "url": string, "glyph": string|null, "color": string|null, "qrImageUrl": string|null, "isFeatured": boolean }`. Array order is `Position`; null IDs receive UUIDv7 and omitted old rows are soft-deleted. `name`/`handle` are trimmed, `url` must be absolute `http|https`, and `color` is `#RRGGBB` or null. Database-null optional strings project to `""` in the response. Invalid, missing, and conflict cases return `400 social-links.request_invalid`, `404 social-links.not_found`, and `409 social-links.conflict`.
+- Playlist summaries are `{ "id": uuid, "name": string, "description": string|null, "isActive": boolean, "itemCount": nonnegative integer }`; playlist items are `{ "id": uuid, "trackId": uuid, "title": string, "artist": string, "position": nonnegative integer }`. `POST /api/v0/admin/playlists` and `PUT /api/v0/admin/playlists/{playlistId}` accept `{ "name": string, "description": string|null, "isActive": boolean }`, where name is trimmed 1–120 and description is null or at most 1000 characters. `POST /items` accepts `{ "trackId": uuid-v7 }`; `PUT /items` accepts `{ "items": [{ "id": uuid|null, "trackId": uuid-v7 }] }`. Item-array order determines position; null IDs are created and omitted rows are soft-deleted. Activating one playlist transactionally deactivates every other active playlist. Invalid, missing, and conflict cases return `400 playlist.request_invalid`, `404 playlist.not_found`, and `409 playlist.conflict`.
+- `GET /api/v0/admin/storage` returns `{ "defaultBackend": { "type": "local|s3", "localRoot": string|null, "s3Bucket": string|null, "s3Region": string|null, "s3ServiceUrl": string|null, "s3ForcePathStyle": boolean }, "additionalBackends": [{ "id": uuid, "name": string, "type": "local|s3", "localRoot": string|null, "s3Bucket": string|null, "isEnabled": boolean }] }`. `PUT /api/v0/admin/storage` accepts `{ "additionalBackends": [{ "id": uuid|null, "name": string, "type": "local|s3", "localRoot": string|null, "s3Bucket": string|null, "isEnabled": boolean }] }`, with at most 20 rows, and returns the same DTO. Local requires an absolute nonblank root and null bucket; S3 requires nonblank bucket and null root. This route manages only additional database rows and never writes environment configuration or credentials. Invalid, missing, and conflict cases return `400 storage.request_invalid`, `404 storage.not_found`, and `409 storage.conflict`.
+
+#### Development-only paid vertical-slice fixture
+
+`POST /api/v0/admin/dev/fixtures/paid-vertical-slice` is mapped only when `IWebHostEnvironment.IsDevelopment()` and `WEB10_DEV__FIXTURES_ENABLED=true`; it still requires the active admin session and CSRF header. It accepts exact `{ "fixtureKey": string }`, with `fixtureKey` trimmed to 1–64 characters, and returns `200 { "donationPaymentId": uuid, "sayPaymentId": uuid, "sayMessageId": uuid }`. Repeating the same key returns the same IDs. Invalid input returns `400 dev.fixture.invalid`; outside the double gate the route is absent (`404`). The fixture seeds through the real durable outbox/payment path only: it must not call Telegram, directly change payment/say states, or relax production validation.
+- Within one transaction the fixture acquires `pg_advisory_xact_lock(hashtext('web10.radio.dev-fixture:' || fixtureKey))`, locates or creates by unique invoice payloads `dev:<fixtureKey>:donation|say`, and returns only after commit. It ensures active goal `Web10.Radio launch` with 5000 Stars, creates an `InvoiceCreated` 250-Star Donation payment for `telegramUserId=900000001` and `payerDisplayName=dev_listener`, and creates `PendingPayment` say text `hello from the development fixture` for the same actor plus its `InvoiceCreated` payment at configured say price.
+- It appends two real `DonationPaid` envelopes with `currency=XTR`, persisted amounts, charge IDs `dev:<fixtureKey>:donation|say`, and stable positive `telegramUpdateId` values computed as SHA-256 of `dev:<fixtureKey>:<purpose>` modulo `Int64.MaxValue` (zero becomes one). `OutboxRelayHostedService` and `PaymentRepository.completePayment` perform the transitions; the resulting say message remains pending until the existing approval route appends `SayMessageModerated`.
+
+#### Pinned `/say` moderation contract
 
 - `AdminSayMessageDto`: `{ id, telegramUserId, displayName, text, amountStars, color, status, submittedAtUtc, paidAtUtc, moderatedAtUtc, moderationReason }`. `telegramUserId` — nullable JSON number; absent `color`, timestamps и reason сериализуются как JSON `null`; `status` — exact lowercase `pending|approved|rejected`.
 - `GET /api/v0/admin/say-messages` требует ровно одно lowercase query value `status=pending|approved|rejected`, возвращает не более 100 active rows в порядке `SubmittedAtUtc DESC, CreatedAtUtc DESC`; `pending` означает database state `PaidPendingModeration`. Invalid/missing/multiple status возвращает `400 say.status.invalid`.
 - Approve принимает exact JSON `{}`; reject принимает exact `{ "reason": "..." }`, trims reason и требует 1–500 символов. Body limit обоих routes — 2 KiB.
 - Invalid UUID/body/reason возвращает `400 say.request.invalid`; missing/deleted row — `404 say.not_found`; opposite или invalid state — `409 say.state_conflict`; first application и identical retry возвращают `204`.
 - First moderation атомарно меняет `PaidPendingModeration -> Approved|Rejected` и append-ит `SayMessageModerated`. Approval сразу попадает в player state; rejection остается hidden. Связанный `Payments.Status` остается `Paid`; automatic refund не является частью этого route contract.
-
 ## 6. Event model вместо процедурных действий
 
-Backend side effects model as events handled by in-process agents/queues, not as direct procedural chains. В v0 F# `MailboxProcessor` — in-process event handler primitive: он serializes mutable state updates through a message queue, упрощает reasoning about queue/payment/stream state и сохраняет transactional boundary в modular monolith.
+Backend side effects model as events handled by in-process agents/queues, not as direct procedural chains. В v0 F# `MailboxProcessor` — in-process event handler primitive: он serializes mutable state updates through a message queue, упрощает reasoning about queue/payment/stream state и сохраняет transactional boundary в modular monolith. Durable effects append an event envelope in the same database transaction as the state change; relay ordering, not an HTTP handler, dispatches the effect.
 
 Event envelope:
 
@@ -254,18 +302,19 @@ Event envelope:
 | `DonationInvoiceCreated` | Backend создал Stars invoice для donation/request/say flow. |
 | `DonationPaid` | Telegram прислал `successful_payment`; paid effect can proceed. |
 | `PaymentRefunded` | Refund выполнен через Telegram Bot API. |
-| `LibraryScanRequested` | Admin или system enqueue library scan job. |
+| `LibraryScanRequested` | Admin создал или получил scan job; exact payload is `{ "libraryScanJobId": "uuid-v7" }`, producer `Web10.Radio.API.Admin`. |
 | `TrackDiscovered` | Library scanner нашел audio file/metadata. |
 | `PlaybackQueueItemClaimed` | Worker pessimistically claimed queue item. |
 | `PlaybackStarted` | Playback state moved to current item. |
 | `PlaybackEnded` | Track завершен или failed, queue advances. |
-| `StreamNodeHeartbeatReceived` | Backend получил heartbeat от stream-node. |
+| `StreamNodeHeartbeatReceived` | Backend получил валидный heartbeat от stream-node; lower-case API status maps exactly to persisted `Starting|Live|Degraded|Restarting|Failed|Offline`. |
 | `StreamNodeFailureDetected` | Heartbeat/process state сигнализирует degradation/failure. |
 | `AdminGoalChanged` | Donation goal changed by admin route. |
 | `SocialLinkChanged` | Social link metadata changed by admin route. |
 
-Duplicate Telegram updates are deduped by `(telegramUpdateId, eventType)` before event emission.
+`POST /api/v0/stream-node/heartbeat` validates its complete payload before appending `StreamNodeHeartbeatReceived`, then publishes durably; it never directly bypasses the event path. `LibraryScanRequested`, `AdminGoalChanged`, and `SocialLinkChanged` are likewise appended atomically with their owning mutation. Playlist and storage mutations intentionally have no invented no-op event type.
 
+Duplicate Telegram updates are deduped by `(telegramUpdateId, eventType)` before event emission. The development fixture appends two real `DonationPaid` envelopes after creating its idempotent invoice rows, so normal relay/payment transitions—not direct fixture writes—produce Paid donation and pending `/say` state.
 ## 7. Telegram bot features
 
 v0 localization поддерживает Russian и English. `User.language_code` со значением `ru` или prefix `ru-` выбирает Russian через ordinal-ignore-case comparison; отсутствующий tag и любое другое значение выбирают English.
@@ -352,7 +401,8 @@ The selected row is updated to `Claimed` in the same transaction before playback
 - `WEB10_TELEGRAM__CHANNEL_ID_OR_USERNAME=@netscapedidnothingwrong`
 - `WEB10_TELEGRAM__REQUEST_PRICE_STARS=100`
 - `WEB10_TELEGRAM__SAY_PRICE_STARS=50`
-- `WEB10_ADMIN__TOKEN`
+- `WEB10_ADMIN__USERNAME`
+- `WEB10_ADMIN__PASSWORD`
 - `WEB10_STREAM__RTMP_URL`
 - `WEB10_STREAM__RTMP_KEY`
 - `WEB10_STREAM__STAGE_URL`
@@ -360,6 +410,10 @@ The selected row is updated to `Claimed` in the same transaction before playback
 - `WEB10_STORAGE__TYPE=Local|S3`
 - `WEB10_OTEL__EXPORTER_OTLP_ENDPOINT`
 - `WEB10_DATA_PROTECTION__KEY_RING_PATH`
+
+Optional development configuration:
+
+- `WEB10_DEV__FIXTURES_ENABLED=false` controls only the development fixture endpoint. It never enables that endpoint outside `IWebHostEnvironment.IsDevelopment()`.
 
 Selected-storage contract:
 
@@ -371,29 +425,31 @@ Selected-storage contract:
 - `WEB10_STORAGE__TYPE` selects the default backend. An enabled non-default S3 `StorageBackends` row takes its bucket from PostgreSQL and resolves credentials and region through the standard AWS SDK provider chains (`AWS_REGION`/profile/workload metadata); this path does not reuse Local settings or require `WEB10_STORAGE__TYPE=S3`.
 - S3 library scan paginates `ListObjectsV2` incrementally, renews the fenced scan-job lease before processing every page, filters supported audio extensions, records object key/size metadata and emits `TrackDiscovered`; it never materializes the full bucket listing in memory. Discovery does not download/cache the object: S3 tracks remain `CachePath=None`, `IsCached=false` until a separate cache path materializes them.
 
-Реализованные startup validation rules:
+Startup validation rules:
 
 - API агрегирует ошибки и fails before host build/port binding, если обязательный key отсутствует или пуст.
 - `WEB10_POSTGRES__CONNECTION_STRING` парсится как Npgsql connection string.
+- `WEB10_ADMIN__USERNAME` is trimmed and must be 1–64 characters; `WEB10_ADMIN__PASSWORD` is not trimmed and must be 12–256 characters. At startup this configured credential is authoritative: it creates or updates that admin, soft-deletes other active admins, and revokes their sessions. Passwords, hashes, session values, and CSRF tokens are never logged.
+- `WEB10_DEV__FIXTURES_ENABLED`, if set, accepts exact `true|false` and defaults to `false`.
 - `WEB10_STREAM__RTMP_URL` разрешает только `rtmp`/`rtmps`; `WEB10_STREAM__STAGE_URL`, `WEB10_OTEL__EXPORTER_OTLP_ENDPOINT` и optional `WEB10_STORAGE__S3_SERVICE_URL` — только absolute `http`/`https` URI.
-- Telegram bot token, webhook secret и channel id/username проверяются синтаксически; `WEB10_STREAM__RTMP_KEY` должен быть nontrivial whitespace-free secret минимум из 16 символов, а `WEB10_STREAM__CALLBACK_TOKEN` и `WEB10_ADMIN__TOKEN` — bearer-safe secrets минимум из 24 символов с exact alphabet `A-Za-z0-9_-`.
+- Telegram bot token, webhook secret и channel id/username проверяются синтаксически; `WEB10_STREAM__RTMP_KEY` должен быть nontrivial whitespace-free secret минимум из 16 символов, а `WEB10_STREAM__CALLBACK_TOKEN` — bearer-safe secret минимум из 24 символов с exact alphabet `A-Za-z0-9_-`.
 - Telegram request/say price keys parse invariant positive `Int32`; missing, non-integer, overflow, zero или negative value fails startup с exact `<KEY> must be a positive 32-bit integer.`
 - Local storage root и Data Protection key-ring path проверяются как creatable/writable directories; S3 bucket, region и взаимоисключающие Local/S3 fields проверяются до `Build()`.
-- Telegram token, stream callback token, admin token и RTMP key являются config/Docker secrets, а не database rows. Если later admin feature хранит secrets в PostgreSQL, payload защищается ASP.NET Core Data Protection, а key ring сохраняется вне container filesystem.
+- Telegram token, stream callback token, admin bootstrap password и RTMP key являются config/Docker secrets, а не database rows. Admin sessions persist only a SHA-256 token hash; configured admin password is persisted only as the password hasher's password hash. The recoverable CSRF token is a session row field, not an authentication secret. Data Protection key ring сохраняется вне container filesystem.
 
 Правила Container/Docker Compose:
 
 - Docker images не должны быть Alpine/libmusl based. Для non-.NET infrastructure используются Debian/Ubuntu-based images, даже если они больше.
 - .NET final/runtime images используют Microsoft .NET chiseled variants. Текущие backend runtime tags используют `10.0-noble-chiseled`; SDK build stages остаются на официальных non-Alpine SDK images, потому что Microsoft не публикует chiseled SDK images.
-- `compose.yaml` — текущий backend infrastructure smoke path: PostgreSQL `postgres:17`, one-shot `Web10.Radio.Migrator`, затем `Web10.Radio.API`.
+- Compose vertical-slice environment supplies Development mode, `WEB10_DEV__FIXTURES_ENABLED=true`, username/password bootstrap credentials, callback token, shared storage, frontend, stream-node, and RTMP sink. Production overrides these local values and never gains fixture access merely from the flag.
 - Compose smoke explicitly supplies request/say prices `100`/`50`; production также обязана задать оба keys и не получает runtime default.
-- Compose startup order: PostgreSQL healthcheck → migrator successful completion → API startup and API liveness healthcheck. Bounded `docker compose up --wait --wait-timeout` возвращает success только после healthy API; ad hoc `sleep` не входит в smoke contract.
+- Compose startup order: PostgreSQL healthcheck → migrator successful completion → storage-init successful completion → API/frontend/stream-node/RTMP sink health. Bounded `docker compose up --wait --wait-timeout` возвращает success только после healthy declared services; ad hoc `sleep` не входит в smoke contract.
 - В chiseled API container healthcheck выполняет exact managed command `dotnet Web10.Radio.API.dll --health-check http://127.0.0.1:8080/health/live`; image не предполагает наличие shell, `curl` или `wget`, а probe exit code отражает HTTP success.
-- Текущий compose smoke намеренно не закрывает full v0 Compose target с frontend, stream-node и observability collector; это остается для later Docker verification phase.
 
 DI rules aligned with ASP.NET lifecycle:
 
 - До `builder.Build()` service-registration chain имеет порядок: Database → application services → Telegram adapter → background workers → API authentication/authorization services → health checks → observability.
+- `AdminSessionAuthenticationHandler` reads only `web10_admin_session`, hashes it, loads the active user/session, and emits name-identifier/user-name claims. Login is anonymous; session/logout and every other admin route use the session policy. CSRF validation precedes each mutating admin handler.
 - После `Build()` вызываются `UseAuthentication()` и `UseAuthorization()`, затем отдельно mapping-ятся health endpoints и `/api/v0/*` endpoints; endpoint mapping не является DI registration stage.
 - Use constructor injection, not service locator.
 - Use scoped repositories/transactions for request work.
@@ -404,7 +460,6 @@ Logging/OTEL rules:
 - Use high-performance logging with `LoggerMessageAttribute`/source-generated logging or equivalent F# wrapper over source-generated partial methods where implemented in C# support code; no string interpolation in hot-path log calls.
 - Include `traceId`, `correlationId`, `eventId`, `telegramUpdateId`, and `queueItemId` where applicable.
 - Emit OTEL traces and metrics for API requests, Telegram updates, queue claims, library scans, stream-node heartbeats, and payment flow.
-
 ## 10. Frontend architecture contract
 
 Frontend paths:
@@ -439,18 +494,17 @@ Web-stage visual invariants from the mock:
 
 ## 11. stream-node contract
 
-`src/stream-node/` is its own runtime area with these responsibilities:
+`src/stream-node/` is its own runtime area. It is a supervised process group, not a binary probe: `dumb-init` starts one `scripts/supervisor.py` child, which owns Xvfb, kiosk Chromium, Liquidsoap, FFmpeg/x11grab, the loopback-only callback listener, and the Unix Liquidsoap command socket. It uses no third-party Python packages.
 
-- Start Xvfb display for headless Chromium.
-- Start Chromium in kiosk mode pointed at the deployed `web-stage` URL and include `--enable-unsafe-swiftshader` because software WebGL is required in the stream container.
-- Run LiquidSoap script that builds the audio/video stream graph, reads backend metadata/queue state, and produces a Telegram-compatible RTMP output.
-- Use FFmpeg/x11grab to capture the Chromium/X11 stage video.
-- Mix video from Chromium with audio selected from backend metadata/cache.
-- Push to Telegram RTMP using `WEB10_STREAM__RTMP_URL` and `WEB10_STREAM__RTMP_KEY`.
-- Report heartbeat/failure status to backend.
-
-Failure states: `Starting`, `Live`, `Degraded`, `Restarting`, `Failed`, `Offline`. Restart policy uses bounded retries with surfacing to admin after the retry window, not silent infinite restart.
-
+- Image base is glibc `debian:trixie-slim`, never Alpine/libmusl. It retains `dumb-init`, installs `python3` and `socat`, and installs the official Savonet x86-64 Trixie Liquidsoap package `https://github.com/savonet/liquidsoap/releases/download/v2.4.0/liquidsoap_2.4.0-debian-trixie-ocaml4.14.2-3_amd64.deb` only after SHA-256 verification against `dd437f1a6af842aa4ebc61090fc3270890a592a0a531026e16b49e7b78c858fe`. Debian's Liquidsoap 2.3.2 is not an acceptable substitute because it lacks the required end callback.
+- Exact supervisor configuration is `WEB10_API__BASE_URL`, `WEB10_STREAM__CALLBACK_TOKEN`, `WEB10_STREAM__STAGE_URL`, `WEB10_STREAM__RTMP_URL`, `WEB10_STREAM__RTMP_KEY`, `WEB10_STREAM__DISPLAY=:99`, `WEB10_STREAM__WIDTH=1280`, `WEB10_STREAM__HEIGHT=720`, `WEB10_STREAM__FRAMERATE=30`, and `WEB10_STREAM__BITRATE_KBPS=192`. Heartbeat and lease cadence is 10 seconds; control and assignment polling cadence is two seconds; restart budget is five restarts in five minutes.
+- The supervisor starts Xvfb on `:99`, then Chromium kiosk at the configured stage URL with `capture=1` merged query-safely into the URL. Chromium uses `--enable-unsafe-swiftshader`, `--no-sandbox`, `--autoplay-policy=no-user-gesture-required`, and fixed window size. Early child exit is `degraded`. On SIGTERM it terminates the complete child process group and attempts a best-effort `offline` heartbeat before exit.
+- `liquidsoap/web10.liq` uses the verified Liquidsoap 2.4 API: `request.queue(id="web10")` with safe blank fallback; `input.external.rawvideo` running FFmpeg `x11grab` against `:99`; `source.mux.video`; `%ffmpeg(format="flv", AAC audio, H.264 video)`; `output.url` to `${RTMP_URL}${RTMP_KEY}`; and `on_position(remaining=true, allow_partial=true)` for track-end reporting. It enables only a filesystem Unix command socket at `/run/web10/liquidsoap.sock`; it exposes no unauthenticated TCP/telnet control port.
+- The supervisor polls `GET /api/v0/stream-node/playback/current`. For an assignment it verifies that `cachePath` exists under mounted storage root, pushes exactly one annotated file URI through the `web10` request-queue socket, and renews the existing fenced lease every 10 seconds. Liquidsoap `on_track` and `on_position(remaining=true, allow_partial=true)` callbacks post assignment metadata to the loopback listener; start marks the node `live` and end invokes the existing completion route with `played`.
+- Missing file, no start callback in five seconds, decoder/output failure, or callback error invokes fenced completion with `failed` and a bounded reason, then emits `degraded`. The node never treats a callback as authorization: backend lease/completion fencing remains authoritative.
+- The supervisor polls `GET /api/v0/stream-node/control`. `stopped` tears down Liquidsoap/FFmpeg while retaining supervisor, Xvfb, and Chromium and heartbeats `offline`; a larger `restartGeneration` restarts the media pipeline once and resumes `running`. Child crashes emit `restarting` with exponential 1/2/4/8/16-second delays. Exceeding the restart budget emits `failed` and remains a healthy control daemon until an admin raises restart generation.
+- It reports `live` only when Xvfb, Chromium, Liquidsoap, FFmpeg video input/output, and an active playback assignment are healthy. With healthy processes and no assignment it reports `starting`. Every heartbeat includes bitrate, restart attempt, and current queue item (or null). Valid statuses are exact lowercase `starting|live|degraded|restarting|failed|offline` at the API boundary.
+- `check-runtime.sh` validates actual runtime capability rather than binary presence: `python3`, `liquidsoap --check web10.liq`, Chromium/Xvfb startup, FFmpeg `x11grab` and FLV encoders, and supervisor configuration validation must succeed.
 ## 12. Testing and acceptance
 
 Integration tests are preferred over unit tests because v0 risk sits at contracts, database concurrency, Telegram payment state, and process boundaries. Required test/check areas:

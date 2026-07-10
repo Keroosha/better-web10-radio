@@ -11,11 +11,14 @@ function toError<TCause>(cause: TCause): Error {
 }
 
 /**
- * Runs `load` once on mount and tracks loading/error/ready. `load` MUST be a stable
+ * Runs `load` on mount and tracks loading/error/ready. `load` MUST be a stable
  * reference (module-level or `useCallback`) — an inline arrow changes every render and
  * would re-fire the effect in a loop.
+ *
+ * Pass `reloadKey` and bump it (e.g. after a mutation) to re-run `load`; omit it and
+ * the resource loads exactly once. Existing callers that pass no key are unaffected.
  */
-export function useApiResource<T>(load: () => Promise<T>): ApiResource<T> {
+export function useApiResource<T>(load: () => Promise<T>, reloadKey?: number): ApiResource<T> {
   const [resource, setResource] = useState<ApiResource<T>>({ status: 'loading' });
 
   useEffect(() => {
@@ -35,7 +38,7 @@ export function useApiResource<T>(load: () => Promise<T>): ApiResource<T> {
     return () => {
       active = false;
     };
-  }, [load]);
+  }, [load, reloadKey]);
 
   return resource;
 }

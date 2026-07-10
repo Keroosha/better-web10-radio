@@ -57,7 +57,8 @@ module Program =
             |> ApplicationComposition.addApplicationServices
             |> TelegramComposition.addTelegram options.Telegram
             |> BackgroundWorkerComposition.addBackgroundWorkers options
-            |> ApiEndpoints.addApiServices options.Admin options.Stream
+            |> ApiEndpoints.addApiServices options.Admin options.DevelopmentFixturesEnabled options.Stream
+            |> TelegramLongPollingComposition.addTelegramLongPolling options.Telegram
             |> HealthComposition.addHealthChecks options
             |> ObservabilityComposition.addObservability options.Otel builder.Environment
             |> ignore

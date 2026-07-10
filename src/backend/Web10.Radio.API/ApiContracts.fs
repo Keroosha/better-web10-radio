@@ -199,3 +199,93 @@ type AdminSayMessageDto =
 
 type RejectSayMessageRequest =
     { Reason: string }
+
+type AdminAuthSessionDto =
+    { Username: string
+      CsrfToken: string
+      DevelopmentFixturesEnabled: bool }
+
+type LibraryScanAcceptedDto =
+    { ScanJobId: string }
+
+type LibraryScanStatusDto =
+    { ScanJobId: string
+      Status: string
+      DiscoveredCount: int
+      RequestedAtUtc: string
+      StartedAtUtc: string
+      FinishedAtUtc: string
+      FailureReason: string }
+
+type AdminTrackDto =
+    { Id: string
+      Title: string
+      Artist: string
+      Album: string
+      DurationMs: int
+      HasCachedFile: bool }
+
+type PlaybackQueueAcceptedDto =
+    { QueueItemId: string }
+
+type StreamNodeControlDto =
+    { DesiredState: string
+      RestartGeneration: int }
+
+type StreamNodeStatusDto =
+    { Status: string
+      DesiredState: string
+      LastHeartbeatUtc: string
+      FailureReason: string
+      BitrateKbps: int
+      RestartGeneration: int }
+
+type CurrentPlaybackAssignmentDto =
+    { QueueItemId: string
+      ClaimOwner: string
+      ClaimAttempt: int
+      TrackId: string
+      CachePath: string
+      ContentType: string
+      Title: string
+      Artist: string
+      DurationMs: int }
+
+type PlaylistSummaryDto =
+    { Id: string
+      Name: string
+      Description: string
+      IsActive: bool
+      ItemCount: int }
+
+type PlaylistItemDto =
+    { Id: string
+      TrackId: string
+      Title: string
+      Artist: string
+      Position: int }
+
+type DefaultStorageBackendDto =
+    { Type: string
+      LocalRoot: string
+      S3Bucket: string
+      S3Region: string
+      S3ServiceUrl: string
+      S3ForcePathStyle: bool }
+
+type AdditionalStorageBackendDto =
+    { Id: string
+      Name: string
+      Type: string
+      LocalRoot: string
+      S3Bucket: string
+      IsEnabled: bool }
+
+type AdminStorageDto =
+    { DefaultBackend: DefaultStorageBackendDto
+      AdditionalBackends: AdditionalStorageBackendDto list }
+
+type PaidVerticalSliceFixtureResponseDto =
+    { DonationPaymentId: string
+      SayPaymentId: string
+      SayMessageId: string }

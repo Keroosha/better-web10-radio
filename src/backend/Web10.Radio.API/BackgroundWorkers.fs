@@ -663,6 +663,7 @@ type LibraryScanHostedService
         }
 
     let insertDiscoveredFile
+        (job: LibraryScanJobRecord)
         (backend: StorageBackendRecord)
         storagePath
         cachePath
@@ -696,6 +697,18 @@ type LibraryScanHostedService
                                 |> TaskResult.mapError RepositoryError
 
                             if inserted then
+                                let! incremented =
+                                    LibraryScanRepository.incrementDiscoveredCountInTransaction
+                                        connection
+                                        transaction
+                                        job.Id
+                                        job.ClaimOwner
+                                        job.ClaimAttempt
+                                        nowUtc
+                                        cancellationToken
+                                    |> TaskResult.mapError RepositoryError
+
+                                do! requireTransition "increment library scan discovered count" job.Id incremented
                                 let payload =
                                     JsonPayload.objectWithStrings
                                         [ "trackId", string discovered.TrackId
@@ -721,7 +734,7 @@ type LibraryScanHostedService
             for filePath in files do
                 do! renewClaim job cancellationToken
                 let fileInfo = FileInfo(filePath)
-                do! insertDiscoveredFile backend filePath (Some filePath) true (Some fileInfo.Length) cancellationToken
+                do! insertDiscoveredFile job backend filePath (Some filePath) true (Some fileInfo.Length) cancellationToken
         }
 
     let processS3Backend (job: LibraryScanJobRecord) (backend: StorageBackendRecord) bucketName cancellationToken =
@@ -736,6 +749,7 @@ type LibraryScanHostedService
                                 if supportedExtensions.Contains(Path.GetExtension(item.Key).ToLowerInvariant()) then
                                     do!
                                         insertDiscoveredFile
+                                            job
                                             backend
                                             item.Key
                                             None
@@ -1067,6 +1081,32 @@ type PlaybackProgramHostedService
     let claimedPayload (claimed: ClaimedPlaybackQueueItem) =
         claimIdentityPayload claimed.QueueItemId claimed.ClaimOwner claimed.ClaimAttempt []
 
+    let claimNextQueueItem cancellationToken =
+        let nowUtc = clock.UtcNow
+
+        DatabaseSession.withTransactionResult
+            dataSource
+            (fun connection transaction cancellationToken ->
+                taskResult {
+                    let! claimed =
+                        PlaybackQueueRepository.claimNextDetailedInTransaction
+                            connection
+                            transaction
+                            claimOwner
+                            nowUtc
+                            (nowUtc + claimLease)
+                            cancellationToken
+                        |> TaskResult.mapError RepositoryError
+
+                    match claimed with
+                    | None -> return false
+                    | Some claimed ->
+                        let! envelope = claimed |> claimedPayload |> createPlaybackEnvelope PlaybackQueueItemClaimed
+                        do! appendEnvelope connection transaction envelope cancellationToken
+                        return true
+                })
+            cancellationToken
+
     let playbackStartedPayload queueItemId owner attempt trackId cachePath =
         claimIdentityPayload
             queueItemId
@@ -1250,31 +1290,20 @@ type PlaybackProgramHostedService
 
     member _.ProcessOneQueueItemAsync(cancellationToken: CancellationToken) : Task<Result<bool, BackgroundWorkerError>> =
         taskResult {
-            let nowUtc = clock.UtcNow
+            let! initiallyClaimed = claimNextQueueItem cancellationToken
 
-            return!
-                DatabaseSession.withTransactionResult
-                    dataSource
-                    (fun connection transaction cancellationToken ->
-                        taskResult {
-                            let! claimed =
-                                PlaybackQueueRepository.claimNextDetailedInTransaction
-                                    connection
-                                    transaction
-                                    claimOwner
-                                    nowUtc
-                                    (nowUtc + claimLease)
-                                    cancellationToken
-                                |> TaskResult.mapError RepositoryError
+            if initiallyClaimed then
+                return true
+            else
+                let! _ =
+                    PlaybackQueueRepository.enqueueNextActivePlaylistItemIfIdle
+                        dataSource
+                        (idGenerator.NewId())
+                        clock.UtcNow
+                        cancellationToken
+                    |> TaskResult.mapError RepositoryError
 
-                            match claimed with
-                            | None -> return false
-                            | Some claimed ->
-                                let! envelope = claimed |> claimedPayload |> createPlaybackEnvelope PlaybackQueueItemClaimed
-                                do! appendEnvelope connection transaction envelope cancellationToken
-                                return true
-                        })
-                    cancellationToken
+                return! claimNextQueueItem cancellationToken
         }
 
     member _.HandleEventAsync(envelope: DomainEventEnvelope, cancellationToken: CancellationToken) =

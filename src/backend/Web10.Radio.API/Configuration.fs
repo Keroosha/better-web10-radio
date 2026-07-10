@@ -29,7 +29,8 @@ type StorageOptions =
       S3ForcePathStyle: bool }
 
 type AdminOptions =
-    { Token: string }
+    { Username: string
+      Password: string }
 
 type OtelOptions =
     { ExporterOtlpEndpoint: Uri }
@@ -44,6 +45,7 @@ type Web10Options =
       Storage: StorageOptions
       Admin: AdminOptions
       Otel: OtelOptions
+      DevelopmentFixturesEnabled: bool
       DataProtection: DataProtectionOptions }
 
 [<RequireQualifiedAccess>]
@@ -60,7 +62,8 @@ module Configuration =
           "STREAM:STAGE_URL", "WEB10_STREAM__STAGE_URL"
           "STREAM:CALLBACK_TOKEN", "WEB10_STREAM__CALLBACK_TOKEN"
           "STORAGE:TYPE", "WEB10_STORAGE__TYPE"
-          "ADMIN:TOKEN", "WEB10_ADMIN__TOKEN"
+          "ADMIN:USERNAME", "WEB10_ADMIN__USERNAME"
+          "ADMIN:PASSWORD", "WEB10_ADMIN__PASSWORD"
           "OTEL:EXPORTER_OTLP_ENDPOINT", "WEB10_OTEL__EXPORTER_OTLP_ENDPOINT"
           "DATA_PROTECTION:KEY_RING_PATH", "WEB10_DATA_PROTECTION__KEY_RING_PATH" ]
 
@@ -80,6 +83,18 @@ module Configuration =
     let private readOptional (configuration: IConfiguration) key =
         let value = configuration[key]
         if String.IsNullOrWhiteSpace value then None else Some(value.Trim())
+
+    let private readRequiredUntrimmed (configuration: IConfiguration) (errors: ResizeArray<string>) (key: string, envVar: string) =
+        let value = configuration[key]
+
+        if String.IsNullOrWhiteSpace value then
+            errors.Add(sprintf "%s is required and must be non-empty." envVar)
+            None
+        else
+            Some value
+    let private readOptionalExact (configuration: IConfiguration) key =
+        let value = configuration[key]
+        if isNull value then None else Some value
 
     let private parseAbsoluteUri (errors: ResizeArray<string>) envVar allowedSchemes (value: string option) =
         match value with
@@ -102,6 +117,15 @@ module Configuration =
         | Some _ ->
             errors.Add("WEB10_STORAGE__TYPE must be exactly Local or S3.")
             None
+
+    let private parseTelegramUpdateMode (errors: ResizeArray<string>) (value: string option) =
+        match value with
+        | None -> TelegramUpdateMode.Webhook
+        | Some "Webhook" -> TelegramUpdateMode.Webhook
+        | Some "LongPolling" -> TelegramUpdateMode.LongPolling
+        | Some _ ->
+            errors.Add("WEB10_TELEGRAM__UPDATE_MODE must be exactly Webhook or LongPolling.")
+            TelegramUpdateMode.Webhook
 
     let private parseBoolean (errors: ResizeArray<string>) envVar (value: string option) =
         match value with
@@ -162,6 +186,15 @@ module Configuration =
                     minimumLength
             )
         | Some _ -> ()
+    let private validateAdminUsername (errors: ResizeArray<string>) (username: string option) =
+        match username with
+        | Some value when value.Length <= 64 -> ()
+        | _ -> errors.Add("WEB10_ADMIN__USERNAME must be 1 to 64 characters after trimming.")
+
+    let private validateAdminPassword (errors: ResizeArray<string>) (password: string option) =
+        match password with
+        | Some value when value.Length >= 12 && value.Length <= 256 -> ()
+        | _ -> errors.Add("WEB10_ADMIN__PASSWORD must be 12 to 256 characters and is not trimmed.")
 
     let private telegramTokenPattern = Regex("^[1-9][0-9]{5,19}:[A-Za-z0-9_-]{20,}$", RegexOptions.CultureInvariant)
     let private telegramUsernamePattern = Regex("^@[A-Za-z][A-Za-z0-9_]{4,31}$", RegexOptions.CultureInvariant)
@@ -278,6 +311,8 @@ module Configuration =
                 let value =
                     if List.contains requiredKey requiredPositiveInt32Keys then
                         readOptional configuration key
+                    elif key = "ADMIN:PASSWORD" then
+                        readRequiredUntrimmed configuration errors requiredKey
                     else
                         readRequired configuration errors requiredKey
 
@@ -292,12 +327,14 @@ module Configuration =
         let telegramChannel = requiredValue "TELEGRAM:CHANNEL_ID_OR_USERNAME"
         let rtmpKey = requiredValue "STREAM:RTMP_KEY"
         let streamCallbackToken = requiredValue "STREAM:CALLBACK_TOKEN"
-        let adminToken = requiredValue "ADMIN:TOKEN"
+        let adminUsername = requiredValue "ADMIN:USERNAME"
+        let adminPassword = requiredValue "ADMIN:PASSWORD"
         let requestPriceStars =
             parsePositiveInt32 errors "WEB10_TELEGRAM__REQUEST_PRICE_STARS" (requiredValue "TELEGRAM:REQUEST_PRICE_STARS")
 
         let sayPriceStars =
             parsePositiveInt32 errors "WEB10_TELEGRAM__SAY_PRICE_STARS" (requiredValue "TELEGRAM:SAY_PRICE_STARS")
+        let telegramUpdateMode = parseTelegramUpdateMode errors (optionalValue "TELEGRAM:UPDATE_MODE")
         let localRoot = optionalValue "STORAGE:LOCAL_ROOT"
         let s3Bucket = optionalValue "STORAGE:S3_BUCKET"
         let s3Region = optionalValue "STORAGE:S3_REGION"
@@ -308,13 +345,14 @@ module Configuration =
         let rtmpUrl = parseAbsoluteUri errors "WEB10_STREAM__RTMP_URL" (Set.ofList [ "rtmp"; "rtmps" ]) (requiredValue "STREAM:RTMP_URL")
         let stageUrl = parseAbsoluteUri errors "WEB10_STREAM__STAGE_URL" (Set.ofList [ "http"; "https" ]) (requiredValue "STREAM:STAGE_URL")
         let otlpEndpoint = parseAbsoluteUri errors "WEB10_OTEL__EXPORTER_OTLP_ENDPOINT" (Set.ofList [ "http"; "https" ]) (requiredValue "OTEL:EXPORTER_OTLP_ENDPOINT")
+        let developmentFixturesEnabled = parseBoolean errors "WEB10_DEV__FIXTURES_ENABLED" (readOptionalExact configuration "DEV:FIXTURES_ENABLED")
         let s3ServiceUrl = parseAbsoluteUri errors "WEB10_STORAGE__S3_SERVICE_URL" (Set.ofList [ "http"; "https" ]) s3ServiceUrlRaw
-
         validateConnectionString errors connectionString
         validateTelegram errors botToken webhookSecret telegramChannel
         validateSecret errors "WEB10_STREAM__RTMP_KEY" 16 rtmpKey
         validateBearerSecret errors "WEB10_STREAM__CALLBACK_TOKEN" 24 streamCallbackToken
-        validateBearerSecret errors "WEB10_ADMIN__TOKEN" 24 adminToken
+        validateAdminUsername errors adminUsername
+        validateAdminPassword errors adminPassword
         validateStorage errors storageType localRoot s3Bucket s3Region s3ServiceUrlRaw forcePathStyleRaw
         validateWritableDirectory errors "WEB10_DATA_PROTECTION__KEY_RING_PATH" (requiredValue "DATA_PROTECTION:KEY_RING_PATH")
 
@@ -330,7 +368,8 @@ module Configuration =
                       WebhookSecret = getRequired "TELEGRAM:WEBHOOK_SECRET"
                       ChannelIdOrUsername = getRequired "TELEGRAM:CHANNEL_ID_OR_USERNAME"
                       RequestPriceStars = Option.get requestPriceStars
-                      SayPriceStars = Option.get sayPriceStars }
+                      SayPriceStars = Option.get sayPriceStars
+                      UpdateMode = telegramUpdateMode }
                   Stream =
                     { RtmpUrl = Option.get rtmpUrl
                       RtmpKey = getRequired "STREAM:RTMP_KEY"
@@ -343,6 +382,9 @@ module Configuration =
                       S3Region = Option.defaultValue "" s3Region
                       S3ServiceUrl = s3ServiceUrl
                       S3ForcePathStyle = forcePathStyle }
-                  Admin = { Token = getRequired "ADMIN:TOKEN" }
+                  Admin =
+                    { Username = getRequired "ADMIN:USERNAME"
+                      Password = getRequired "ADMIN:PASSWORD" }
                   Otel = { ExporterOtlpEndpoint = Option.get otlpEndpoint }
-                  DataProtection = { KeyRingPath = getRequired "DATA_PROTECTION:KEY_RING_PATH" } }
+                  DataProtection = { KeyRingPath = getRequired "DATA_PROTECTION:KEY_RING_PATH" }
+                  DevelopmentFixturesEnabled = developmentFixturesEnabled }

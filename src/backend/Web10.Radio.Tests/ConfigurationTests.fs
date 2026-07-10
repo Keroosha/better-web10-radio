@@ -27,7 +27,8 @@ module ConfigurationTests =
           "WEB10_STREAM__STAGE_URL"
           "WEB10_STREAM__CALLBACK_TOKEN"
           "WEB10_STORAGE__TYPE"
-          "WEB10_ADMIN__TOKEN"
+          "WEB10_ADMIN__USERNAME"
+          "WEB10_ADMIN__PASSWORD"
           "WEB10_OTEL__EXPORTER_OTLP_ENDPOINT"
           "WEB10_DATA_PROTECTION__KEY_RING_PATH" ]
 
@@ -45,7 +46,8 @@ module ConfigurationTests =
               "STREAM:CALLBACK_TOKEN", "stream-callback-token-Secret_123456"
               "STORAGE:TYPE", "Local"
               "STORAGE:LOCAL_ROOT", Path.Combine(root, "library")
-              "ADMIN:TOKEN", "admin-token-Secret_1234567890"
+              "ADMIN:USERNAME", "test-admin"
+              "ADMIN:PASSWORD", "test-admin-password-1234567890"
               "OTEL:EXPORTER_OTLP_ENDPOINT", "https://otel.web10.radio/v1/traces"
               "DATA_PROTECTION:KEY_RING_PATH", Path.Combine(root, "keys") ]
 
@@ -72,7 +74,7 @@ module ConfigurationTests =
           "TELEGRAM:WEBHOOK_SECRET"
           "STREAM:RTMP_KEY"
           "STREAM:CALLBACK_TOKEN"
-          "ADMIN:TOKEN" ]
+          "ADMIN:PASSWORD" ]
         |> List.choose (fun key -> pairs |> Map.tryFind key)
         |> List.iter (fun secret -> Assert.That(message, Does.Not.Contain(secret), "Configuration diagnostics must not echo supplied secrets."))
 
@@ -113,9 +115,18 @@ module ConfigurationTests =
           { Name = "Local storage rejects enabled S3 force path style"
             Overrides = [ "STORAGE:S3_FORCE_PATH_STYLE", Some "true" ]
             ExpectedErrorFragments = [ "S3 bucket, region, service URL, and true force-path-style settings must be unset when WEB10_STORAGE__TYPE=Local." ] }
-          { Name = "admin token rejects comma-delimited values"
-            Overrides = [ "ADMIN:TOKEN", Some "admin-token-Secret_1234567890,second" ]
-            ExpectedErrorFragments = [ "WEB10_ADMIN__TOKEN" ] }
+          { Name = "admin username must remain nonblank after trimming"
+            Overrides = [ "ADMIN:USERNAME", Some "   " ]
+            ExpectedErrorFragments = [ "WEB10_ADMIN__USERNAME" ] }
+          { Name = "admin username is capped at 64 characters after trimming"
+            Overrides = [ "ADMIN:USERNAME", Some(String.replicate 65 "u") ]
+            ExpectedErrorFragments = [ "WEB10_ADMIN__USERNAME" ] }
+          { Name = "admin password must contain at least 12 characters"
+            Overrides = [ "ADMIN:PASSWORD", Some "short-pass" ]
+            ExpectedErrorFragments = [ "WEB10_ADMIN__PASSWORD" ] }
+          { Name = "admin password is capped at 256 characters"
+            Overrides = [ "ADMIN:PASSWORD", Some(String.replicate 257 "p") ]
+            ExpectedErrorFragments = [ "WEB10_ADMIN__PASSWORD" ] }
           { Name = "stream callback token rejects comma-delimited values"
             Overrides = [ "STREAM:CALLBACK_TOKEN", Some "stream-callback-token-Secret_123456,second" ]
             ExpectedErrorFragments = [ "WEB10_STREAM__CALLBACK_TOKEN" ] }

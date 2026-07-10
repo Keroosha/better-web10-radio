@@ -4,7 +4,7 @@
 
 Web10.Radio is intended to be a 24/7 Telegram-channel radio station for `@netscapedidnothingwrong` with a Web 1.0 / Aero visual identity: fullscreen 3D stage, retro overlay widgets, music playback, Telegram bot interactions, paid screen messages, donation goals, and admin moderation.
 
-Current state matters: this repository is still a contract/planning and design-handoff repo. It contains docs and a mock bundle, not a scaffolded app. There is currently no `package.json`, `tsconfig`, `.sln`, Dockerfile, backend source, admin app, stream-node source, or executable test suite.
+Current state: the backend and frontend are implemented and building. `src/backend/` has the F# solution (`Web10.Radio.sln`: API, Telegram, Database, Migrator, Tests) with the `/api/v0/*` routes, durable Telegram workflows, Stars payments, NUnit + Testcontainers tests, and Dockerfiles + `compose.yaml`. `src/frontend/` is the Bun monorepo (`shared`, `web-stage`, `admin`) with a build image. Telegram updates can be ingested by webhook or by long polling (`WEB10_TELEGRAM__UPDATE_MODE`). The remaining gap is the real `src/stream-node/` runtime (phase B5) — still only a stub Dockerfile + a binary-presence `check-runtime.sh`; `scripts/fake-stream-node.py` simulates a LIVE node locally in the meantime.
 
 ## Architecture & Data Flow
 

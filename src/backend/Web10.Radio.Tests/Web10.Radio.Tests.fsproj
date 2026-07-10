@@ -26,6 +26,8 @@
     <Compile Include="HealthOperabilityTests.fs" />
     <Compile Include="BackgroundWorkerTests.fs" />
     <Compile Include="ApiContractTests.fs" />
+    <Compile Include="AdminRepositoryTests.fs" />
+    <Compile Include="TelegramLongPollingTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

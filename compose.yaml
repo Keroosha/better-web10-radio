@@ -46,6 +46,8 @@ services:
       WEB10_TELEGRAM__BOT_TOKEN: 123456:compose_smoke_token_1234567890
       WEB10_TELEGRAM__WEBHOOK_SECRET: compose-smoke-webhook-secret
       WEB10_TELEGRAM__CHANNEL_ID_OR_USERNAME: "@netscapedidnothingwrong"
+      WEB10_TELEGRAM__REQUEST_PRICE_STARS: 100
+      WEB10_TELEGRAM__SAY_PRICE_STARS: 50
       WEB10_ADMIN__TOKEN: compose-smoke-admin-token-1234567890
       WEB10_STREAM__RTMP_URL: rtmps://dc4-1.rtmp.t.me/s/
       WEB10_STREAM__RTMP_KEY: compose-smoke-rtmp-key

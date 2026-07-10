@@ -186,6 +186,8 @@ SSE route contract:
 | `POST` | `/api/v0/telegram/webhook` | Accept Telegram Bot API update webhook. |
 | `GET` | `/api/v0/telegram/health` | Bot adapter health and last update id. |
 
+В v0 Telegram ingestion работает только через webhook; long polling runtime не поставляется. Webhook требует ровно один `X-Telegram-Bot-Api-Secret-Token`, сравнивает его fixed-time, ограничивает body 1 MiB и принимает typed Funogram `Update`. Обычные команды/callbacks/`successful_payment` проходят durable inbox/outbox path; `pre_checkout_query` обрабатывается синхронно, потому что protocol acknowledgement нельзя ждать ordered relay.
+
 ### Stream-node callback routes
 
 Эти routes internal-to-deployment и требуют exact `Authorization: Bearer <WEB10_STREAM__CALLBACK_TOKEN>` under policy `Web10StreamNode`; token не совпадает с admin token или Telegram RTMP key.
@@ -215,6 +217,14 @@ Lease body: `{ "claimOwner": "uuid-v7", "claimAttempt": 1 }`. Completion body ad
 | `GET` | `/api/v0/admin/stream-node/status` | View stream-node process/heartbeat state. |
 | `POST` | `/api/v0/admin/stream-node/restart` | Request stream-node restart through backend command event. |
 
+Pinned `/say` moderation contract:
+
+- `AdminSayMessageDto`: `{ id, telegramUserId, displayName, text, amountStars, color, status, submittedAtUtc, paidAtUtc, moderatedAtUtc, moderationReason }`. `telegramUserId` — nullable JSON number; absent `color`, timestamps и reason сериализуются как JSON `null`; `status` — exact lowercase `pending|approved|rejected`.
+- `GET /api/v0/admin/say-messages` требует ровно одно lowercase query value `status=pending|approved|rejected`, возвращает не более 100 active rows в порядке `SubmittedAtUtc DESC, CreatedAtUtc DESC`; `pending` означает database state `PaidPendingModeration`. Invalid/missing/multiple status возвращает `400 say.status.invalid`.
+- Approve принимает exact JSON `{}`; reject принимает exact `{ "reason": "..." }`, trims reason и требует 1–500 символов. Body limit обоих routes — 2 KiB.
+- Invalid UUID/body/reason возвращает `400 say.request.invalid`; missing/deleted row — `404 say.not_found`; opposite или invalid state — `409 say.state_conflict`; first application и identical retry возвращают `204`.
+- First moderation атомарно меняет `PaidPendingModeration -> Approved|Rejected` и append-ит `SayMessageModerated`. Approval сразу попадает в player state; rejection остается hidden. Связанный `Payments.Status` остается `Paid`; automatic refund не является частью этого route contract.
+
 ## 6. Event model вместо процедурных действий
 
 Backend side effects model as events handled by in-process agents/queues, not as direct procedural chains. В v0 F# `MailboxProcessor` — in-process event handler primitive: он serializes mutable state updates through a message queue, упрощает reasoning about queue/payment/stream state и сохраняет transactional boundary в modular monolith.
@@ -238,6 +248,8 @@ Event envelope:
 | `TrackRequested` | Пользователь запросил трек через Telegram bot или admin action. |
 | `TrackRequestMatched` | Запрос сопоставлен с track record или отправлен на admin review. |
 | `SayMessageSubmitted` | `/say` message создана до оплаты или модерации. |
+| `TelegramCommandReceived` | Bot получил informational `/start|help|song|terms|paysupport` command для localized workflow. |
+| `TelegramCallbackReceived` | Bot получил request/song inline callback; owner/state guards выполняются до side effects. |
 | `SayMessageModerated` | Admin approved/rejected paid screen message. |
 | `DonationInvoiceCreated` | Backend создал Stars invoice для donation/request/say flow. |
 | `DonationPaid` | Telegram прислал `successful_payment`; paid effect can proceed. |
@@ -256,25 +268,26 @@ Duplicate Telegram updates are deduped by `(telegramUpdateId, eventType)` before
 
 ## 7. Telegram bot features
 
+v0 localization поддерживает Russian и English. `User.language_code` со значением `ru` или prefix `ru-` выбирает Russian через ordinal-ignore-case comparison; отсутствующий tag и любое другое значение выбирают English.
+
 Command contracts:
 
-- `/start` — greeting and command list.
-- `/help` — command help and payment/support links.
-- `/request <query>` — searches the library. If 2-5 matches are found, reply with inline keyboard suggestions. If exactly one confident match is found, ask for confirmation. If no match is found, create a `TrackRequest` with status `NeedsReview` for admin mapping. Payment is requested before the item enters the playable request queue.
-- `/say <text>` — creates a pending paid screen message. Bot sends a Stars invoice. After `successful_payment`, message status becomes `PaidPendingModeration`; only admin approval moves it into `approved` messages served to web-stage.
-- `/song` — with no args returns current track title, artist, and best external link. With args, uses the same search/suggestion flow as `/request` and returns Bandcamp/SoundCloud/other URL if known; fallback is plain `artist — title`.
-- `/terms` — payment terms link/text required before live Stars payments.
-- `/paysupport` — payment support command required for Stars payment disputes.
+- `/start` — localized greeting and command list; `/help` — тот же список без greeting.
+- `/request <query>` — private-chat paid request flow. Search выполняется в PostgreSQL через `pg_trgm`: transaction-local `pg_trgm.similarity_threshold = 0.30`, active tracks only, максимум пять rows. Normalized exact title или `artist — title` дает confident result только при единственном exact hit; без exact hit единственный fuzzy result confident при `similarity >= 0.70`; 2–5 rows становятся suggestions. Selection immutable и owner-guarded.
+- Если `/request` дает zero rows или единственный result ниже `0.70`, backend сохраняет unpaid `TrackRequests.NeedsReview` backlog и сообщает, что automatic processing unavailable. До появления canonical admin mapping contract этот backlog не создает invoice и не попадает в playback queue.
+- `/say <text>` — private-chat paid screen-message flow. Backend атомарно создает `SayMessages.PendingPayment`, payment order и durable invoice event; только `successful_payment` переводит message в `PaidPendingModeration`, а только admin approval — в public player state.
+- `/song` без args возвращает current track best external link или `artist — title`; query mode использует тот же ranking contract и `sg:s:*` callbacks, но не создает payment/order.
+- `/terms` и `/paysupport` возвращают localized Stars/payment support copy. Group invocation private-only commands получает localized private-chat instruction и не создает domain row, payment, invoice или keyboard.
 
-Telegram Stars payment rules from official Telegram Bot API behavior:
+Request/say prices являются required startup config, без runtime defaults: deployed v0 values — `WEB10_TELEGRAM__REQUEST_PRICE_STARS=100` и `WEB10_TELEGRAM__SAY_PRICE_STARS=50`. Измененная configuration value одновременно управляет localized copy, persisted `AmountStars`, pre-checkout validation и единственным `LabeledPrice.Amount`.
 
-- Digital goods/services in Telegram use currency `XTR`.
-- `sendInvoice` uses `provider_token = ""` for Stars.
-- Bot must answer `pre_checkout_query` within 10 seconds.
-- Backend must not deliver a paid message/request after pre-checkout approval; it only delivers after a `successful_payment` update.
-- Store `successful_payment.telegram_payment_charge_id` for refunds.
-- Refunds use Telegram Bot API `refundStarPayment`.
-- USDT/card terminal are future providers and must not be implemented in v0 phases.
+Telegram Stars payment rules:
+
+- Digital goods/services используют exact currency `XTR`, `provider_token = ""` и ровно один positive price item. Invoice title/description/label — bounded fixed copy; raw track metadata и `/say` text в invoice не включаются.
+- Request/say order creation, callback confirmation, inbox/outbox append и purpose transition idempotent. Telegram update dedupe key остается `(telegramUpdateId,eventType)`.
+- `pre_checkout_query` bypasses outbox: linked internal deadline 8 секунд оставляет Telegram protocol limit 10 секунд с 2-second headroom. Validation требует matching user, payload, `XTR`, exact configured amount и live pending purpose; approval изменяет только `Payments.Status` на `PreCheckoutApproved`.
+- Paid effect разрешен только после `successful_payment`: request атомарно становится `Paid` и создает одну queue row; say атомарно становится `PaidPendingModeration`. Identical replay — no-op success; mismatch terminally processed и не блокирует ordered outbox.
+- Backend сохраняет `successful_payment.telegram_payment_charge_id`. B4 не вызывает `refundStarPayment`: rejected moderation сохраняет `Payments.Paid`, audit reason и направляет пользователя в `/paysupport`. Реальный refund остается отдельным future operational contract. USDT/card providers не входят в v0.
 
 ## 8. Database and persistence invariants
 
@@ -292,6 +305,7 @@ Persistence rules:
 - Application code never uses `DELETE` for domain data. Deletion means `UPDATE ... SET IsDeleted = true`.
 - Read queries for mutable tables include `WHERE "IsDeleted" = false` unless the query is an admin audit query that explicitly asks for deleted rows.
 - Indexes over active records should use partial predicates where appropriate: `WHERE "IsDeleted" = false`.
+- Migration `202607100003` installs `pg_trgm`, two active expression GIN indexes for lowercased title and `artist — title`, and active unique indexes for invoice payload, payment purpose entity и playback request. Перед unique indexes migration fail-fast проверяет duplicate domain data с actionable errors и не исправляет его автоматически. Rollback удаляет эти пять indexes, но оставляет extension: `CREATE EXTENSION IF NOT EXISTS` не доказывает ownership.
 
 First-version tables:
 
@@ -336,6 +350,8 @@ The selected row is updated to `Claimed` in the same transaction before playback
 - `WEB10_TELEGRAM__BOT_TOKEN`
 - `WEB10_TELEGRAM__WEBHOOK_SECRET`
 - `WEB10_TELEGRAM__CHANNEL_ID_OR_USERNAME=@netscapedidnothingwrong`
+- `WEB10_TELEGRAM__REQUEST_PRICE_STARS=100`
+- `WEB10_TELEGRAM__SAY_PRICE_STARS=50`
 - `WEB10_ADMIN__TOKEN`
 - `WEB10_STREAM__RTMP_URL`
 - `WEB10_STREAM__RTMP_KEY`
@@ -361,6 +377,7 @@ Selected-storage contract:
 - `WEB10_POSTGRES__CONNECTION_STRING` парсится как Npgsql connection string.
 - `WEB10_STREAM__RTMP_URL` разрешает только `rtmp`/`rtmps`; `WEB10_STREAM__STAGE_URL`, `WEB10_OTEL__EXPORTER_OTLP_ENDPOINT` и optional `WEB10_STORAGE__S3_SERVICE_URL` — только absolute `http`/`https` URI.
 - Telegram bot token, webhook secret и channel id/username проверяются синтаксически; `WEB10_STREAM__RTMP_KEY` должен быть nontrivial whitespace-free secret минимум из 16 символов, а `WEB10_STREAM__CALLBACK_TOKEN` и `WEB10_ADMIN__TOKEN` — bearer-safe secrets минимум из 24 символов с exact alphabet `A-Za-z0-9_-`.
+- Telegram request/say price keys parse invariant positive `Int32`; missing, non-integer, overflow, zero или negative value fails startup с exact `<KEY> must be a positive 32-bit integer.`
 - Local storage root и Data Protection key-ring path проверяются как creatable/writable directories; S3 bucket, region и взаимоисключающие Local/S3 fields проверяются до `Build()`.
 - Telegram token, stream callback token, admin token и RTMP key являются config/Docker secrets, а не database rows. Если later admin feature хранит secrets в PostgreSQL, payload защищается ASP.NET Core Data Protection, а key ring сохраняется вне container filesystem.
 
@@ -369,6 +386,7 @@ Selected-storage contract:
 - Docker images не должны быть Alpine/libmusl based. Для non-.NET infrastructure используются Debian/Ubuntu-based images, даже если они больше.
 - .NET final/runtime images используют Microsoft .NET chiseled variants. Текущие backend runtime tags используют `10.0-noble-chiseled`; SDK build stages остаются на официальных non-Alpine SDK images, потому что Microsoft не публикует chiseled SDK images.
 - `compose.yaml` — текущий backend infrastructure smoke path: PostgreSQL `postgres:17`, one-shot `Web10.Radio.Migrator`, затем `Web10.Radio.API`.
+- Compose smoke explicitly supplies request/say prices `100`/`50`; production также обязана задать оба keys и не получает runtime default.
 - Compose startup order: PostgreSQL healthcheck → migrator successful completion → API startup and API liveness healthcheck. Bounded `docker compose up --wait --wait-timeout` возвращает success только после healthy API; ad hoc `sleep` не входит в smoke contract.
 - В chiseled API container healthcheck выполняет exact managed command `dotnet Web10.Radio.API.dll --health-check http://127.0.0.1:8080/health/live`; image не предполагает наличие shell, `curl` или `wget`, а probe exit code отражает HTTP success.
 - Текущий compose smoke намеренно не закрывает full v0 Compose target с frontend, stream-node и observability collector; это остается для later Docker verification phase.

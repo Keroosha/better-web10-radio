@@ -5,11 +5,14 @@ open System.IO
 open System.Text
 open System.Text.Json
 open FsToolkit.ErrorHandling
+open Web10.Radio.Database.Repositories
 
 type DomainEventType =
     | TrackRequested
     | TrackRequestMatched
     | SayMessageSubmitted
+    | TelegramCommandReceived
+    | TelegramCallbackReceived
     | SayMessageModerated
     | DonationInvoiceCreated
     | DonationPaid
@@ -29,6 +32,8 @@ module DomainEventType =
         [ TrackRequested
           TrackRequestMatched
           SayMessageSubmitted
+          TelegramCommandReceived
+          TelegramCallbackReceived
           SayMessageModerated
           DonationInvoiceCreated
           DonationPaid
@@ -48,6 +53,8 @@ module DomainEventType =
         | TrackRequested -> "TrackRequested"
         | TrackRequestMatched -> "TrackRequestMatched"
         | SayMessageSubmitted -> "SayMessageSubmitted"
+        | TelegramCommandReceived -> "TelegramCommandReceived"
+        | TelegramCallbackReceived -> "TelegramCallbackReceived"
         | SayMessageModerated -> "SayMessageModerated"
         | DonationInvoiceCreated -> "DonationInvoiceCreated"
         | DonationPaid -> "DonationPaid"
@@ -67,6 +74,8 @@ module DomainEventType =
         | "TrackRequested" -> Some TrackRequested
         | "TrackRequestMatched" -> Some TrackRequestMatched
         | "SayMessageSubmitted" -> Some SayMessageSubmitted
+        | "TelegramCommandReceived" -> Some TelegramCommandReceived
+        | "TelegramCallbackReceived" -> Some TelegramCallbackReceived
         | "SayMessageModerated" -> Some SayMessageModerated
         | "DonationInvoiceCreated" -> Some DonationInvoiceCreated
         | "DonationPaid" -> Some DonationPaid
@@ -167,3 +176,13 @@ module DomainEventEnvelope =
         writer.WriteEndObject()
         writer.Flush()
         Encoding.UTF8.GetString(buffer.ToArray())
+
+module internal OutboxMapping =
+    let toOutboxEvent (envelope: DomainEventEnvelope) =
+        { Id = envelope.EventId
+          EventType = DomainEventType.toString envelope.EventType
+          OccurredAtUtc = envelope.OccurredAtUtc
+          Producer = envelope.Producer
+          CorrelationId = Some envelope.CorrelationId
+          CausationId = envelope.CausationId
+          PayloadJson = envelope.PayloadJson }

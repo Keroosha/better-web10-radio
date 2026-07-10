@@ -259,6 +259,82 @@ ORDER BY index_class.relname;""",
             return Set.ofSeq predicates
         }
 
+    let private readB4IndexDefinitions (connection: NpgsqlConnection) =
+        task {
+            use command =
+                new NpgsqlCommand(
+                    """SELECT index_class.relname,
+       table_class.relname,
+       access_method.amname,
+       index_definition.indisunique,
+       COALESCE(pg_get_expr(index_definition.indexprs, index_definition.indrelid), ''),
+       COALESCE(pg_get_expr(index_definition.indpred, index_definition.indrelid), ''),
+       (
+           SELECT string_agg(
+               pg_get_indexdef(index_definition.indexrelid, key_position, true),
+               ', ' ORDER BY key_position
+           )
+           FROM generate_series(1, index_definition.indnkeyatts) AS key_position
+       ),
+       (
+           SELECT string_agg(opclass.opcname, ', ' ORDER BY key_position)
+           FROM generate_series(1, index_definition.indnkeyatts) AS key_position
+           INNER JOIN pg_opclass AS opclass
+               ON opclass.oid = index_definition.indclass[(key_position - 1)::integer]
+       )
+FROM pg_index AS index_definition
+INNER JOIN pg_class AS index_class ON index_class.oid = index_definition.indexrelid
+INNER JOIN pg_class AS table_class ON table_class.oid = index_definition.indrelid
+INNER JOIN pg_namespace AS schema ON schema.oid = index_class.relnamespace
+INNER JOIN pg_am AS access_method ON access_method.oid = index_class.relam
+WHERE schema.nspname = 'public'
+  AND index_class.relname IN (
+      'IX_Tracks_Active_Title_Trgm',
+      'IX_Tracks_Active_ArtistTitle_Trgm',
+      'UX_Payments_Active_InvoicePayload',
+      'UX_Payments_Active_PurposeEntity',
+      'UX_PlaybackQueue_Active_TrackRequest'
+  )
+ORDER BY index_class.relname;""",
+                    connection
+                )
+
+            let! reader = command.ExecuteReaderAsync()
+            use reader = reader
+            let definitions = ResizeArray<string * string * string * bool * string * string * string * string>()
+            let mutable hasRow = true
+
+            while hasRow do
+                let! next = reader.ReadAsync()
+                hasRow <- next
+
+                if next then
+                    definitions.Add(
+                        ( reader.GetString(0),
+                          reader.GetString(1),
+                          reader.GetString(2),
+                          reader.GetBoolean(3),
+                          reader.GetString(4) |> normalizeCatalogExpression,
+                          reader.GetString(5) |> normalizeCatalogExpression,
+                          reader.GetString(6) |> normalizeCatalogExpression,
+                          reader.GetString(7) |> normalizeCatalogExpression )
+                    )
+
+            return Set.ofSeq definitions
+        }
+
+    let private hasPgTrgmExtension (connection: NpgsqlConnection) =
+        task {
+            use command =
+                new NpgsqlCommand(
+                    "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm');",
+                    connection
+                )
+
+            let! extensionInstalled = command.ExecuteScalarAsync()
+            return extensionInstalled :?> bool
+        }
+
     let private withMigrationRunner (connectionString: string) operation =
         let services = ServiceCollection()
 
@@ -275,6 +351,42 @@ ORDER BY index_class.relname;""",
 
         use provider = services.BuildServiceProvider()
         operation (provider.GetRequiredService<IMigrationRunner>())
+
+    let private postgresExceptionMessage (error: exn) =
+        let rec findMessage (current: exn) =
+            match current with
+            | :? PostgresException as postgresError -> Some postgresError.MessageText
+            | _ ->
+                match current.InnerException with
+                | null -> None
+                | inner -> findMessage inner
+
+        findMessage error
+
+    let private assertB4DuplicatePreflightRejects
+        (seedSql: string)
+        (expectedMessage: string)
+        : System.Threading.Tasks.Task<unit> =
+        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
+            task {
+                withMigrationRunner connectionString (fun runner -> runner.MigrateDown(202607100002L))
+
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+                use seed = new NpgsqlCommand(seedSql, connection)
+                let! _ = seed.ExecuteNonQueryAsync()
+
+                let migrationFailure =
+                    try
+                        withMigrationRunner connectionString (fun runner -> runner.MigrateUp())
+                        None
+                    with error ->
+                        Some error
+
+                match migrationFailure |> Option.bind postgresExceptionMessage with
+                | Some actualMessage -> Assert.That(actualMessage, Is.EqualTo(expectedMessage))
+                | None -> Assert.Fail("Expected B4 migration preflight to surface a PostgreSQL exception with its actionable diagnostic.")
+            })
 
     [<Test>]
     let ``migrations preserve audit columns foreign keys checks and all active index predicates`` () =
@@ -336,6 +448,8 @@ ORDER BY index_class.relname;""",
                 let expectedActiveIndexPredicates =
                     Set.ofList
                         [ "IX_Tracks_Active_TitleArtist", "IsDeleted=false"
+                          "IX_Tracks_Active_Title_Trgm", "IsDeleted=false"
+                          "IX_Tracks_Active_ArtistTitle_Trgm", "IsDeleted=false"
                           "IX_StorageBackends_Active_Type", "IsDeleted=false"
                           "IX_TrackLinks_Active_TrackId", "IsDeleted=false"
                           "UX_TrackLinks_Active_TrackId_Url", "IsDeleted=false"
@@ -350,8 +464,11 @@ ORDER BY index_class.relname;""",
                           "IX_PlaybackQueue_Active_Claim", "IsDeleted=falseANDStatus='Queued'"
                           "IX_PlaybackQueue_Active_Status", "IsDeleted=false"
                           "IX_PlaybackQueue_Active_ClaimLease", "IsDeleted=falseANDStatusIN'Claimed','Playing'"
+                          "UX_PlaybackQueue_Active_TrackRequest", "IsDeleted=falseANDTrackRequestIdISNOTNULL"
                           "IX_SayMessages_Active_Status_SubmittedAtUtc", "IsDeleted=false"
                           "UX_Payments_Active_TelegramPaymentChargeId", "IsDeleted=falseANDTelegramPaymentChargeIdISNOTNULL"
+                          "UX_Payments_Active_InvoicePayload", "IsDeleted=false"
+                          "UX_Payments_Active_PurposeEntity", "IsDeleted=falseANDPurposeEntityIdISNOTNULL"
                           "IX_Payments_Active_Status", "IsDeleted=false"
                           "IX_DonationGoals_Active_IsActive", "IsDeleted=false"
                           "IX_SocialLinks_Active_Position", "IsDeleted=false"
@@ -370,6 +487,62 @@ ORDER BY index_class.relname;""",
             })
 
     [<Test>]
+    let ``202607100003 installs pg_trgm and the five exact B4 indexes`` () =
+        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
+            task {
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+                let! pgTrgmInstalled = hasPgTrgmExtension connection
+                let! b4Indexes = readB4IndexDefinitions connection
+
+                let expectedB4Indexes =
+                    Set.ofList
+                        [ "IX_Tracks_Active_Title_Trgm", "Tracks", "gin", false, "lowerTitle", "IsDeleted=false", "lowerTitle", "gin_trgm_ops"
+                          "IX_Tracks_Active_ArtistTitle_Trgm", "Tracks", "gin", false, "lowerArtist||'—'||Title", "IsDeleted=false", "lowerArtist||'—'||Title", "gin_trgm_ops"
+                          "UX_Payments_Active_InvoicePayload", "Payments", "btree", true, "", "IsDeleted=false", "TelegramInvoicePayload", "text_ops"
+                          "UX_Payments_Active_PurposeEntity", "Payments", "btree", true, "", "IsDeleted=falseANDPurposeEntityIdISNOTNULL", "Purpose,PurposeEntityId", "text_ops,uuid_ops"
+                          "UX_PlaybackQueue_Active_TrackRequest", "PlaybackQueue", "btree", true, "", "IsDeleted=falseANDTrackRequestIdISNOTNULL", "TrackRequestId", "uuid_ops" ]
+
+                Assert.That(pgTrgmInstalled, Is.True, "B4 must install pg_trgm before creating trigram indexes.")
+
+                Assert.That(
+                    (b4Indexes = expectedB4Indexes),
+                    Is.True,
+                    sprintf
+                        "B4 index access methods, expressions, uniqueness, key columns, and active-row predicates must not drift. Expected: %A; actual: %A"
+                        expectedB4Indexes
+                        b4Indexes
+                )
+            })
+
+    [<Test>]
+    let ``202607100003 refuses duplicate active invoice payloads before adding indexes`` () =
+        assertB4DuplicatePreflightRejects
+            """INSERT INTO "Payments" ("Id", "Purpose", "AmountStars", "TelegramInvoicePayload", "Status", "IsDeleted")
+VALUES ('00000000-0000-0000-0000-000000000101', 'Donation', 1, 'duplicate-invoice-payload', 'InvoiceCreated', false),
+       ('00000000-0000-0000-0000-000000000102', 'Donation', 1, 'duplicate-invoice-payload', 'InvoiceCreated', false);"""
+            "Duplicate active TelegramInvoicePayload prevents B4 migration."
+
+    [<Test>]
+    let ``202607100003 refuses duplicate active payment purpose entities before adding indexes`` () =
+        assertB4DuplicatePreflightRejects
+            """INSERT INTO "Payments" ("Id", "Purpose", "PurposeEntityId", "AmountStars", "TelegramInvoicePayload", "Status", "IsDeleted")
+VALUES ('00000000-0000-0000-0000-000000000201', 'Request', '00000000-0000-0000-0000-000000000299', 1, 'purpose-invoice-one', 'InvoiceCreated', false),
+       ('00000000-0000-0000-0000-000000000202', 'Request', '00000000-0000-0000-0000-000000000299', 1, 'purpose-invoice-two', 'InvoiceCreated', false);"""
+            "Duplicate active payment purpose entity prevents B4 migration."
+
+    [<Test>]
+    let ``202607100003 refuses duplicate active playback request rows before adding indexes`` () =
+        assertB4DuplicatePreflightRejects
+            """INSERT INTO "TrackRequests" ("Id", "Query", "Status", "IsDeleted")
+VALUES ('00000000-0000-0000-0000-000000000301', 'duplicate playback request', 'NeedsReview', false);
+INSERT INTO "PlaybackQueue" ("Id", "TrackRequestId", "Source", "Status", "IsDeleted")
+VALUES ('00000000-0000-0000-0000-000000000302', '00000000-0000-0000-0000-000000000301', 'request', 'Queued', false),
+       ('00000000-0000-0000-0000-000000000303', '00000000-0000-0000-0000-000000000301', 'request', 'Queued', false);"""
+            "Duplicate active playback TrackRequestId prevents B4 migration."
+
+
+    [<Test>]
     let ``migrations roll back to zero and rebuild the complete current schema`` () =
         DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
             task {
@@ -380,6 +553,8 @@ ORDER BY index_class.relname;""",
                 let! tablesAfterDown = readPublicTables connection
                 let remainingDomainTables = Set.intersect mutableDomainTables tablesAfterDown
                 Assert.That(remainingDomainTables, Is.Empty, "Down must remove every domain table before an upgrade can rebuild it.")
+                let! extensionAfterDown = hasPgTrgmExtension connection
+                Assert.That(extensionAfterDown, Is.True, "B4 rollback must retain pg_trgm because the migration cannot prove extension ownership.")
 
                 withMigrationRunner connectionString (fun runner -> runner.MigrateUp())
                 let! tablesAfterUp = readPublicTables connection
@@ -400,7 +575,11 @@ ORDER BY index_class.relname;""",
                     if next then
                         versions.Add(reader.GetInt64(0))
 
-                Assert.That(Set.ofSeq versions, Is.EqualTo(Set.ofList [ 202607080001L; 202607100001L; 202607100002L ] :> obj))
+                Assert.That(
+                    List.ofSeq versions,
+                    Is.EqualTo(([ 202607080001L; 202607100001L; 202607100002L; 202607100003L ] : int64 list) :> obj),
+                    "A full down/up cycle must restore every migration in version order."
+                )
             })
 
     [<Test>]

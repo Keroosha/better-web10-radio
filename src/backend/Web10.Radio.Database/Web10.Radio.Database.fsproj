@@ -11,13 +11,15 @@
     <Compile Include="Migrations\InitialSchema.fs" />
     <Compile Include="Migrations\DurableWorkflowFencing.fs" />
     <Compile Include="Migrations\TrackDuplicateCleanup.fs" />
+    <Compile Include="Migrations\TelegramBotPayments.fs" />
     <Compile Include="Repositories\RepositoryError.fs" />
     <Compile Include="Repositories\TrackRepository.fs" />
     <Compile Include="Repositories\OutboxEventRepository.fs" />
     <Compile Include="Repositories\TelegramUpdateInboxRepository.fs" />
     <Compile Include="Repositories\LibraryScanRepository.fs" />
-    <Compile Include="Repositories\TelegramCommandRepository.fs" />
     <Compile Include="Repositories\PaymentRepository.fs" />
+    <Compile Include="Repositories\SayMessageRepository.fs" />
+    <Compile Include="Repositories\TelegramCommandRepository.fs" />
     <Compile Include="Repositories\StreamNodeHeartbeatRepository.fs" />
     <Compile Include="Repositories\PlaybackQueueRepository.fs" />
     <Compile Include="Composition.fs" />

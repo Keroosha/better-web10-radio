@@ -183,3 +183,19 @@ type TelegramHealthDto =
 type StreamFileDto =
     { CachePath: string
       ContentType: string }
+
+type AdminSayMessageDto =
+    { Id: string
+      TelegramUserId: Nullable<int64>
+      DisplayName: string
+      Text: string
+      AmountStars: int
+      Color: string
+      Status: string
+      SubmittedAtUtc: string
+      PaidAtUtc: string
+      ModeratedAtUtc: string
+      ModerationReason: string }
+
+type RejectSayMessageRequest =
+    { Reason: string }

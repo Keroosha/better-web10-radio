@@ -3,4 +3,6 @@ namespace Web10.Radio.Telegram
 type TelegramOptions =
     { BotToken: string
       WebhookSecret: string
-      ChannelIdOrUsername: string }
+      ChannelIdOrUsername: string
+      RequestPriceStars: int
+      SayPriceStars: int }

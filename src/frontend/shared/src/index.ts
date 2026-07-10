@@ -63,6 +63,8 @@ export {
   apiFetch,
   getApiBaseUrl,
   setApiBaseUrl,
+  getAdminToken,
+  setAdminToken,
   type FetchImpl,
   type RequestOptions,
   type ApiRequest,

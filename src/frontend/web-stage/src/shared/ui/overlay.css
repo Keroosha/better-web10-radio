@@ -1,0 +1,54 @@
+/* Keyframes for the overlay widgets. Inline styles cannot declare @keyframes, so the
+   equalizer bars, live pulse, row float-in and toast pop live here (copied verbatim
+   from the mock, Web 1.0 Radio Scene.dc.html L20-24). Imported once by StagePage. */
+
+@keyframes eqbar {
+  0%,
+  100% {
+    transform: scaleY(0.35);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
+
+@keyframes livepulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.25;
+  }
+}
+
+@keyframes floatin {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Toast: vertical pop only. Horizontal centering is handled by the toast's fixed
+   wrapper (translateX(-50%)), so it is intentionally not in this keyframe. */
+@keyframes toastpop {
+  0% {
+    transform: translateY(14px) scale(0.9);
+    opacity: 0;
+  }
+  18% {
+    transform: translateY(0) scale(1.04);
+    opacity: 1;
+  }
+  30% {
+    transform: scale(1);
+  }
+  100% {
+    transform: translateY(0) scale(1);
+    opacity: 1;
+  }
+}

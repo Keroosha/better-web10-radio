@@ -68,18 +68,18 @@
 
 ### Phase B4 — Telegram bot and Stars payments
 
-- [x] Configure Funogram bot token from `WEB10_TELEGRAM__BOT_TOKEN`.
-- [ ] Support webhook mode through `/api/v0/telegram/webhook`; long polling is allowed only as a local development mode documented in config.
-- [ ] Implement `/start` and `/help`.
-- [ ] Implement `/request <query>` with library search suggestions and admin-review fallback.
-- [ ] Implement `/say <text>` as paid message flow: create pending message, send Stars invoice, wait for `successful_payment`, then mark `PaidPendingModeration`.
-- [ ] Implement `/song` with no-arg current track response and query-based suggestions.
-- [ ] Implement `/terms` and `/paysupport` for Telegram Stars live readiness.
-- [ ] Send Stars invoices with `currency = "XTR"`, `provider_token = ""`, and one price item.
-- [ ] Answer `pre_checkout_query` within 10 seconds after validating pending order, amount, and currency.
-- [ ] Deliver paid effects only after `successful_payment`.
-- [ ] Store `telegram_payment_charge_id` for refunds.
-- [ ] Add tests for pre-checkout rejection, successful payment idempotency, duplicate update dedupe, and moderation status transitions.
+- [x] Configure Funogram bot token from `WEB10_TELEGRAM__BOT_TOKEN` and configured Stars prices from required `WEB10_TELEGRAM__REQUEST_PRICE_STARS` / `WEB10_TELEGRAM__SAY_PRICE_STARS` keys.
+- [x] Support webhook-only v0 mode through `/api/v0/telegram/webhook`; no long-polling runtime path is shipped.
+- [x] Implement localized `/start` and `/help` with RU for `ru|ru-*` and English fallback.
+- [x] Implement `/request <query>` with `pg_trgm` ranked suggestions, immutable selection/confirmation, and unpaid `NeedsReview` backlog for unmatched requests.
+- [x] Implement `/say <text>` as a paid flow: create the pending message/order, relay the Stars invoice, wait for `successful_payment`, then atomically mark `PaidPendingModeration`.
+- [x] Implement `/song` with no-arg current-track response and query-based suggestions.
+- [x] Implement localized `/terms` and `/paysupport` for Telegram Stars live readiness.
+- [x] Send Stars invoices with `currency = "XTR"`, `provider_token = ""`, exactly one configured-price item, and durable retry through `DonationInvoiceCreated`.
+- [x] Answer `pre_checkout_query` synchronously within an 8-second internal deadline after validating user, pending order, amount, currency, and purpose state.
+- [x] Deliver `/request` queue and `/say` moderation effects only after `successful_payment`; pre-checkout approval changes only payment state.
+- [x] Store `telegram_payment_charge_id` for future refunds; v0 rejection uses `/paysupport` and does not invent automatic refund execution.
+- [x] Add integration tests for locale/callback/search/invoice contracts, pre-checkout rejection, successful-payment idempotency, duplicate update dedupe, terminal failures, and moderation transitions.
 
 ### Phase B5 — Stream-node
 
@@ -101,7 +101,7 @@
 - [ ] Add OTEL tracing and metrics for API, Telegram updates, payment flow, queue claims, library scans, and stream-node callbacks.
 - [ ] Add Docker Compose for PostgreSQL, API, frontend placeholder/service URL, stream-node, and optional observability collector.
 - [x] Add Docker Compose smoke path for PostgreSQL, separate migrator, API startup, and a chiseled-compatible managed API liveness healthcheck.
-- [x] Verify `docker compose up --build --wait --wait-timeout 120 api` applies migrations `202607080001`, `202607100001`, and `202607100002`, reaches healthy API liveness, and permits immediate `/health/*` requests without `sleep`.
+- [x] Verify `docker compose up --build --wait --wait-timeout 120 api` applies migrations through `202607100003`, installs `pg_trgm` and all five B4 indexes, reaches healthy API liveness, and permits immediate `/health/*` requests without `sleep`.
 - [x] Document backend Compose smoke commands, migration check, and Docker image policy.
 - [ ] Add NUnit integration tests for database, API, Telegram, and stream-node contracts.
 - [ ] Verify all apps can run in containers with required config.

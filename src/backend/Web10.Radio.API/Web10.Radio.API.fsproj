@@ -10,11 +10,13 @@
     <Compile Include="Application.fs" />
     <Compile Include="S3Storage.fs" />
     <Compile Include="Events.fs" />
-    <Compile Include="BackgroundWorkers.fs" />
+    <Compile Include="BackgroundWorkerContracts.fs" />
     <Compile Include="Health.fs" />
     <Compile Include="Observability.fs" />
     <Compile Include="ApiContracts.fs" />
     <Compile Include="ApiReadModels.fs" />
+    <Compile Include="TelegramBotWorkflow.fs" />
+    <Compile Include="BackgroundWorkers.fs" />
     <Compile Include="ApiEndpoints.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>

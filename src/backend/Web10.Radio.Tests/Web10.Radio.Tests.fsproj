@@ -21,6 +21,7 @@
     <Compile Include="TelegramUpdateInboxRepositoryTests.fs" />
     <Compile Include="LibraryScanRepositoryTests.fs" />
     <Compile Include="PaymentRepositoryTests.fs" />
+    <Compile Include="TelegramBotTests.fs" />
     <Compile Include="PlaybackQueueRepositoryB2Tests.fs" />
     <Compile Include="HealthOperabilityTests.fs" />
     <Compile Include="BackgroundWorkerTests.fs" />

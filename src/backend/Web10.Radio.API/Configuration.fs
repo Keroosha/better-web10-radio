@@ -1,6 +1,7 @@
 namespace Web10.Radio.API
 
 open System
+open System.Globalization
 open System.IO
 open System.Net
 open System.Text.RegularExpressions
@@ -52,6 +53,8 @@ module Configuration =
           "TELEGRAM:BOT_TOKEN", "WEB10_TELEGRAM__BOT_TOKEN"
           "TELEGRAM:WEBHOOK_SECRET", "WEB10_TELEGRAM__WEBHOOK_SECRET"
           "TELEGRAM:CHANNEL_ID_OR_USERNAME", "WEB10_TELEGRAM__CHANNEL_ID_OR_USERNAME"
+          "TELEGRAM:REQUEST_PRICE_STARS", "WEB10_TELEGRAM__REQUEST_PRICE_STARS"
+          "TELEGRAM:SAY_PRICE_STARS", "WEB10_TELEGRAM__SAY_PRICE_STARS"
           "STREAM:RTMP_URL", "WEB10_STREAM__RTMP_URL"
           "STREAM:RTMP_KEY", "WEB10_STREAM__RTMP_KEY"
           "STREAM:STAGE_URL", "WEB10_STREAM__STAGE_URL"
@@ -60,6 +63,10 @@ module Configuration =
           "ADMIN:TOKEN", "WEB10_ADMIN__TOKEN"
           "OTEL:EXPORTER_OTLP_ENDPOINT", "WEB10_OTEL__EXPORTER_OTLP_ENDPOINT"
           "DATA_PROTECTION:KEY_RING_PATH", "WEB10_DATA_PROTECTION__KEY_RING_PATH" ]
+
+    let private requiredPositiveInt32Keys =
+        [ "TELEGRAM:REQUEST_PRICE_STARS", "WEB10_TELEGRAM__REQUEST_PRICE_STARS"
+          "TELEGRAM:SAY_PRICE_STARS", "WEB10_TELEGRAM__SAY_PRICE_STARS" ]
 
     let private readRequired (configuration: IConfiguration) (errors: ResizeArray<string>) (key: string, envVar: string) =
         let value = configuration[key]
@@ -105,6 +112,17 @@ module Configuration =
             errors.Add(sprintf "%s must be exactly true or false." envVar)
             false
 
+    let private parsePositiveInt32 (errors: ResizeArray<string>) envVar (value: string option) =
+        match value with
+        | Some raw ->
+            match Int32.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture) with
+            | true, parsed when parsed > 0 -> Some parsed
+            | _ ->
+                errors.Add(sprintf "%s must be a positive 32-bit integer." envVar)
+                None
+        | None ->
+            errors.Add(sprintf "%s must be a positive 32-bit integer." envVar)
+            None
 
     let private validateConnectionString (errors: ResizeArray<string>) (value: string option) =
         match value with
@@ -256,7 +274,14 @@ module Configuration =
         let errors = ResizeArray<string>()
         let values =
             requiredKeys
-            |> List.map (fun ((key, _) as requiredKey) -> key, readRequired configuration errors requiredKey)
+            |> List.map (fun ((key, _) as requiredKey) ->
+                let value =
+                    if List.contains requiredKey requiredPositiveInt32Keys then
+                        readOptional configuration key
+                    else
+                        readRequired configuration errors requiredKey
+
+                key, value)
             |> Map.ofList
 
         let requiredValue key = values[key]
@@ -268,6 +293,11 @@ module Configuration =
         let rtmpKey = requiredValue "STREAM:RTMP_KEY"
         let streamCallbackToken = requiredValue "STREAM:CALLBACK_TOKEN"
         let adminToken = requiredValue "ADMIN:TOKEN"
+        let requestPriceStars =
+            parsePositiveInt32 errors "WEB10_TELEGRAM__REQUEST_PRICE_STARS" (requiredValue "TELEGRAM:REQUEST_PRICE_STARS")
+
+        let sayPriceStars =
+            parsePositiveInt32 errors "WEB10_TELEGRAM__SAY_PRICE_STARS" (requiredValue "TELEGRAM:SAY_PRICE_STARS")
         let localRoot = optionalValue "STORAGE:LOCAL_ROOT"
         let s3Bucket = optionalValue "STORAGE:S3_BUCKET"
         let s3Region = optionalValue "STORAGE:S3_REGION"
@@ -298,7 +328,9 @@ module Configuration =
                   Telegram =
                     { BotToken = getRequired "TELEGRAM:BOT_TOKEN"
                       WebhookSecret = getRequired "TELEGRAM:WEBHOOK_SECRET"
-                      ChannelIdOrUsername = getRequired "TELEGRAM:CHANNEL_ID_OR_USERNAME" }
+                      ChannelIdOrUsername = getRequired "TELEGRAM:CHANNEL_ID_OR_USERNAME"
+                      RequestPriceStars = Option.get requestPriceStars
+                      SayPriceStars = Option.get sayPriceStars }
                   Stream =
                     { RtmpUrl = Option.get rtmpUrl
                       RtmpKey = getRequired "STREAM:RTMP_KEY"

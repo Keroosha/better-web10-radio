@@ -24,6 +24,7 @@ open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Options
 open Microsoft.Extensions.Primitives
 open Npgsql
+open Web10.Radio.Database
 open Web10.Radio.Database.Repositories
 open Web10.Radio.Telegram
 
@@ -479,6 +480,20 @@ module ApiEndpoints =
         { EventType: DomainEventType
           PayloadJson: string }
 
+    type private TelegramMappedUpdate =
+        | Ignored
+        | DurableEvent of TelegramMappedEvent
+        | PreCheckout of TelegramPreCheckoutInput
+
+    type private TelegramUserContext =
+        { TelegramUserId: int64
+          DisplayName: string option
+          LanguageCode: string option }
+
+    type private CallbackMessageContext =
+        { ChatId: int64
+          MessageId: int64 }
+
     let private webhookSecretHeader (context: HttpContext) =
         let mutable values = StringValues()
 
@@ -491,7 +506,7 @@ module ApiEndpoints =
         if String.IsNullOrWhiteSpace text then
             None
         else
-            let separatorIndex = text.IndexOf(' ')
+            let separatorIndex = text.IndexOfAny([| ' '; '\t'; '\r'; '\n' |])
 
             let commandToken, argument =
                 if separatorIndex < 0 then
@@ -501,78 +516,200 @@ module ApiEndpoints =
 
             let commandWithoutBot =
                 let botSeparatorIndex = commandToken.IndexOf('@')
-                if botSeparatorIndex < 0 then commandToken else commandToken.Substring(0, botSeparatorIndex)
+
+                if botSeparatorIndex > 0
+                   && botSeparatorIndex < commandToken.Length - 1
+                   && commandToken.IndexOf('@', botSeparatorIndex + 1) < 0 then
+                    commandToken.Substring(0, botSeparatorIndex)
+                else
+                    commandToken
 
             if String.Equals(commandWithoutBot, expectedCommand, StringComparison.OrdinalIgnoreCase) then Some argument else None
 
+    let private telegramUserContext (user: User) =
+        let displayName =
+            match user.Username with
+            | Some username when not (String.IsNullOrWhiteSpace username) -> Some username
+            | _ ->
+                [ Some user.FirstName; user.LastName ]
+                |> List.choose id
+                |> String.concat " "
+                |> fun value -> if String.IsNullOrWhiteSpace value then None else Some value
+
+        { TelegramUserId = user.Id
+          DisplayName = displayName
+          LanguageCode = user.LanguageCode }
+
     let private telegramActor (message: Message) =
-        match message.From with
-        | None -> None, None
-        | Some (user: User) ->
-            let displayName =
-                match user.Username with
-                | Some username when not (String.IsNullOrWhiteSpace username) -> Some username
-                | _ ->
-                    [ Some user.FirstName; user.LastName ]
-                    |> List.choose id
-                    |> String.concat " "
-                    |> fun value -> if String.IsNullOrWhiteSpace value then None else Some value
+        message.From |> Option.map telegramUserContext
 
-            Some user.Id, displayName
+    let private callbackMessageContext (callbackQuery: CallbackQuery) =
+        callbackQuery.Message
+        |> Option.map (function
+            | MaybeInaccessibleMessage.Message message ->
+                { ChatId = message.Chat.Id
+                  MessageId = message.MessageId }
+            | MaybeInaccessibleMessage.InaccessibleMessage message ->
+                { ChatId = message.Chat.Id
+                  MessageId = message.MessageId })
 
+    let private isPositiveInt32 (value: int64) =
+        value > 0L && value <= int64 Int32.MaxValue
 
-    let private mapTelegramUpdate (update: Update) : Result<TelegramMappedEvent option, string> =
-        match update.Message with
-        | Some message ->
-            match message.SuccessfulPayment with
-            | Some payment when payment.TotalAmount > int64 Int32.MaxValue ->
-                Error "Telegram payment amount exceeds the supported range."
-            | Some payment ->
+    let private mapTelegramUpdate (update: Update) : Result<TelegramMappedUpdate, string> =
+        match update.PreCheckoutQuery with
+        | Some preCheckoutQuery when String.IsNullOrWhiteSpace preCheckoutQuery.Id ->
+            Error "Telegram pre-checkout query id is required."
+        | Some preCheckoutQuery when String.IsNullOrWhiteSpace preCheckoutQuery.InvoicePayload ->
+            Error "Telegram pre-checkout invoice payload is required."
+        | Some preCheckoutQuery when not (isPositiveInt32 preCheckoutQuery.TotalAmount) ->
+            Error "Telegram pre-checkout amount must be a positive supported integer."
+        | Some preCheckoutQuery ->
+            let user = telegramUserContext preCheckoutQuery.From
+
+            Ok(
+                PreCheckout
+                    { TelegramUpdateId = update.UpdateId
+                      QueryId = preCheckoutQuery.Id
+                      TelegramUserId = user.TelegramUserId
+                      LanguageCode = user.LanguageCode
+                      Currency = preCheckoutQuery.Currency
+                      TotalAmount = int preCheckoutQuery.TotalAmount
+                      InvoicePayload = preCheckoutQuery.InvoicePayload }
+            )
+        | None ->
+            match update.Message |> Option.bind (fun message -> message.SuccessfulPayment |> Option.map (fun payment -> message, payment)) with
+            | Some(message, payment) when String.IsNullOrWhiteSpace payment.InvoicePayload ->
+                Error "Telegram payment invoice payload is required."
+            | Some(message, payment) when String.IsNullOrWhiteSpace payment.TelegramPaymentChargeId ->
+                Error "Telegram payment charge id is required."
+            | Some(message, payment) when not (isPositiveInt32 payment.TotalAmount) ->
+                Error "Telegram payment amount must be a positive supported integer."
+            | Some(message, payment) ->
+                let actor = telegramActor message
+
                 let payload =
                     JsonSerializer.Serialize(
                         {| paymentId = payment.InvoicePayload
                            telegramPaymentChargeId = payment.TelegramPaymentChargeId
                            amountStars = int payment.TotalAmount
-                           currency = payment.Currency |},
+                           currency = payment.Currency
+                           telegramUpdateId = update.UpdateId
+                           telegramMessageId = message.MessageId
+                           chatId = message.Chat.Id
+                           telegramUserId = actor |> Option.map (fun value -> value.TelegramUserId)
+                           displayName = actor |> Option.bind (fun value -> value.DisplayName)
+                           languageCode = actor |> Option.bind (fun value -> value.LanguageCode) |},
                         ApiJson.options
                     )
 
-                Ok(Some { EventType = DomainEventType.DonationPaid; PayloadJson = payload })
+                Ok(DurableEvent { EventType = DomainEventType.DonationPaid; PayloadJson = payload })
             | None ->
-                match message.Text with
-                | Some text ->
-                    let telegramUserId, displayName = telegramActor message
+                match update.CallbackQuery with
+                | Some callbackQuery when String.IsNullOrWhiteSpace callbackQuery.Id ->
+                    Error "Telegram callback query id is required."
+                | Some callbackQuery ->
+                    let actor = telegramUserContext callbackQuery.From
+                    let message = callbackMessageContext callbackQuery
+                    let chatId = message |> Option.map (fun value -> value.ChatId)
+                    let isPrivateChat = chatId = Some actor.TelegramUserId
 
-                    match tryCommandArgument "/request" text, tryCommandArgument "/say" text with
-                    | Some query, _ when not (String.IsNullOrWhiteSpace query) ->
-                        let payload =
-                            JsonSerializer.Serialize(
-                                {| query = query
-                                   telegramUpdateId = update.UpdateId
-                                   telegramMessageId = message.MessageId
-                                   telegramUserId = telegramUserId
-                                   displayName = displayName |},
-                                ApiJson.options
-                            )
+                    let payload =
+                        JsonSerializer.Serialize(
+                            {| telegramUpdateId = update.UpdateId
+                               telegramMessageId = message |> Option.map (fun value -> value.MessageId)
+                               chatId = chatId
+                               telegramUserId = actor.TelegramUserId
+                               displayName = actor.DisplayName
+                               languageCode = actor.LanguageCode
+                               callbackQueryId = callbackQuery.Id
+                               rawCallbackData = callbackQuery.Data
+                               isPrivateChat = isPrivateChat |},
+                            ApiJson.options
+                        )
 
-                        Ok(Some { EventType = DomainEventType.TrackRequested; PayloadJson = payload })
-                    | _, Some submittedText when not (String.IsNullOrWhiteSpace submittedText) ->
-                        let payload =
-                            JsonSerializer.Serialize(
-                                {| text = submittedText
-                                   telegramUpdateId = update.UpdateId
-                                   telegramMessageId = message.MessageId
-                                   telegramUserId = telegramUserId
-                                   displayName = displayName |},
-                                ApiJson.options
-                            )
+                    Ok(DurableEvent { EventType = DomainEventType.TelegramCallbackReceived; PayloadJson = payload })
+                | None ->
+                    match update.Message with
+                    | Some message ->
+                        match message.Text, telegramActor message with
+                        | Some text, Some actor ->
+                            let chatId = message.Chat.Id
+                            let isPrivateChat = chatId = actor.TelegramUserId
 
-                        Ok(Some { EventType = DomainEventType.SayMessageSubmitted; PayloadJson = payload })
-                    | Some _, _ -> Error "/request requires a non-empty query."
-                    | _, Some _ -> Error "/say requires non-empty text."
-                    | _ -> Ok None
-                | None -> Ok None
-        | None -> Ok None
+                            let commandEvent eventType command argument =
+                                let payload =
+                                    JsonSerializer.Serialize(
+                                        {| telegramUpdateId = update.UpdateId
+                                           telegramMessageId = message.MessageId
+                                           chatId = chatId
+                                           telegramUserId = actor.TelegramUserId
+                                           displayName = actor.DisplayName
+                                           languageCode = actor.LanguageCode
+                                           command = command
+                                           argument = argument
+                                           isPrivateChat = isPrivateChat |},
+                                        ApiJson.options
+                                    )
+
+                                DurableEvent { EventType = eventType; PayloadJson = payload }
+
+                            match
+                                tryCommandArgument "/request" text,
+                                tryCommandArgument "/say" text,
+                                tryCommandArgument "/start" text,
+                                tryCommandArgument "/help" text,
+                                tryCommandArgument "/song" text,
+                                tryCommandArgument "/terms" text,
+                                tryCommandArgument "/paysupport" text
+                            with
+                            | Some query, _, _, _, _, _, _ ->
+                                let payload =
+                                    JsonSerializer.Serialize(
+                                        {| telegramUpdateId = update.UpdateId
+                                           telegramMessageId = message.MessageId
+                                           chatId = chatId
+                                           telegramUserId = actor.TelegramUserId
+                                           displayName = actor.DisplayName
+                                           languageCode = actor.LanguageCode
+                                           command = "/request"
+                                           argument = query
+                                           query = query
+                                           isPrivateChat = isPrivateChat |},
+                                        ApiJson.options
+                                    )
+
+                                Ok(DurableEvent { EventType = DomainEventType.TrackRequested; PayloadJson = payload })
+                            | _, Some submittedText, _, _, _, _, _ ->
+                                let payload =
+                                    JsonSerializer.Serialize(
+                                        {| telegramUpdateId = update.UpdateId
+                                           telegramMessageId = message.MessageId
+                                           chatId = chatId
+                                           telegramUserId = actor.TelegramUserId
+                                           displayName = actor.DisplayName
+                                           languageCode = actor.LanguageCode
+                                           command = "/say"
+                                           argument = submittedText
+                                           text = submittedText
+                                           isPrivateChat = isPrivateChat |},
+                                        ApiJson.options
+                                    )
+
+                                Ok(DurableEvent { EventType = DomainEventType.SayMessageSubmitted; PayloadJson = payload })
+                            | _, _, Some argument, _, _, _, _ ->
+                                commandEvent DomainEventType.TelegramCommandReceived "/start" argument |> Ok
+                            | _, _, _, Some argument, _, _, _ ->
+                                commandEvent DomainEventType.TelegramCommandReceived "/help" argument |> Ok
+                            | _, _, _, _, Some argument, _, _ ->
+                                commandEvent DomainEventType.TelegramCommandReceived "/song" argument |> Ok
+                            | _, _, _, _, _, Some argument, _ ->
+                                commandEvent DomainEventType.TelegramCommandReceived "/terms" argument |> Ok
+                            | _, _, _, _, _, _, Some argument ->
+                                commandEvent DomainEventType.TelegramCommandReceived "/paysupport" argument |> Ok
+                            | _ -> Ok Ignored
+                        | _ -> Ok Ignored
+                    | None -> Ok Ignored
 
     let private readBoundedBody (maximumBytes: int) (context: HttpContext) (buffer: byte array) =
         task {
@@ -668,13 +805,34 @@ module ApiEndpoints =
                                     state.RecordError("request.invalid")
                                     do! ApiProblems.write context StatusCodes.Status400BadRequest "request.invalid" "Invalid request" message
                                     return StatusCodes.Status400BadRequest
-                                | Ok mappedEvent ->
-                                    match mappedEvent with
-                                    | None ->
+                                | Ok mappedUpdate ->
+                                    match mappedUpdate with
+                                    | Ignored ->
                                         state.RecordUpdate(update.UpdateId)
                                         context.Response.StatusCode <- StatusCodes.Status204NoContent
                                         return StatusCodes.Status204NoContent
-                                    | Some event ->
+                                    | PreCheckout preCheckout ->
+                                        let workflow = context.RequestServices.GetRequiredService<ITelegramPreCheckoutWorkflow>()
+                                        let! result = workflow.HandleAsync preCheckout context.RequestAborted
+
+                                        match result with
+                                        | Ok () ->
+                                            state.RecordUpdate(update.UpdateId)
+                                            context.Response.StatusCode <- StatusCodes.Status204NoContent
+                                            return StatusCodes.Status204NoContent
+                                        | Error error ->
+                                            state.RecordError("telegram.pre_checkout_unavailable")
+
+                                            do!
+                                                ApiProblems.write
+                                                    context
+                                                    StatusCodes.Status503ServiceUnavailable
+                                                    "telegram.pre_checkout_unavailable"
+                                                    "Telegram pre-checkout unavailable"
+                                                    (BackgroundWorkerError.toMessage error)
+
+                                            return StatusCodes.Status503ServiceUnavailable
+                                    | DurableEvent event ->
                                         let ingestor = context.RequestServices.GetRequiredService<ITelegramUpdateEventIngestor>()
 
                                         let! ingestResult =
@@ -900,6 +1058,270 @@ module ApiEndpoints =
                 return StatusCodes.Status500InternalServerError
         }
 
+    [<Literal>]
+    let private SayModerationMaxBodyBytes = 2 * 1024
+
+    let private sayStatusText = function
+        | SayMessageModerationFilter.Pending -> "pending"
+        | SayMessageModerationFilter.Approved -> "approved"
+        | SayMessageModerationFilter.Rejected -> "rejected"
+
+    let private sayTargetText = function
+        | SayMessageModerationTarget.Approved -> "Approved"
+        | SayMessageModerationTarget.Rejected -> "Rejected"
+
+    let private trySayModerationFilter (context: HttpContext) =
+        let mutable values = StringValues()
+
+        if not (context.Request.Query.TryGetValue("status", &values)) || values.Count <> 1 then
+            None
+        else
+            match values[0] with
+            | "pending" -> Some SayMessageModerationFilter.Pending
+            | "approved" -> Some SayMessageModerationFilter.Approved
+            | "rejected" -> Some SayMessageModerationFilter.Rejected
+            | _ -> None
+
+    let private toAdminSayMessageDto (message: SayMessageForModeration) : AdminSayMessageDto =
+        { Id = message.Id.ToString("D")
+          TelegramUserId =
+              match message.TelegramUserId with
+              | Some telegramUserId -> Nullable<int64>(telegramUserId)
+              | None -> Nullable<int64>()
+          DisplayName = message.DisplayName
+          Text = message.Text
+          AmountStars = message.AmountStars
+          Color = message.Color |> Option.defaultValue null
+          Status = sayStatusText message.Status
+          SubmittedAtUtc = ApiTime.toIsoUtc message.SubmittedAtUtc
+          PaidAtUtc = message.PaidAtUtc |> Option.map ApiTime.toIsoUtc |> Option.defaultValue null
+          ModeratedAtUtc = message.ModeratedAtUtc |> Option.map ApiTime.toIsoUtc |> Option.defaultValue null
+          ModerationReason = message.ModerationReason |> Option.defaultValue null }
+
+    let private sayStatusInvalid context =
+        ApiProblems.write
+            context
+            StatusCodes.Status400BadRequest
+            "say.status.invalid"
+            "Invalid say message status"
+            "Query parameter status must be exactly one of pending, approved, or rejected."
+
+    let private sayRequestInvalid context =
+        ApiProblems.write
+            context
+            StatusCodes.Status400BadRequest
+            "say.request.invalid"
+            "Invalid say message request"
+            "The say message identifier or request body is invalid."
+
+    let private trySayMessageId (context: HttpContext) =
+        let value = context.Request.RouteValues["messageId"]
+        let mutable messageId = Guid.Empty
+
+        if isNull value || not (Guid.TryParse(string value, &messageId)) || messageId = Guid.Empty then
+            None
+        else
+            Some messageId
+
+    let private tryReadSayModerationBody (context: HttpContext) =
+        task {
+            if context.Request.ContentLength.HasValue
+               && context.Request.ContentLength.Value > int64 SayModerationMaxBodyBytes then
+                return None
+            else
+                let buffer = ArrayPool<byte>.Shared.Rent(SayModerationMaxBodyBytes + 1)
+
+                use _bufferLease =
+                    { new IDisposable with
+                        member _.Dispose() = ArrayPool<byte>.Shared.Return(buffer, clearArray = true) }
+
+                let! length = readBoundedBody SayModerationMaxBodyBytes context buffer
+
+                match length with
+                | None -> return None
+                | Some bodyLength ->
+                    try
+                        use document = JsonDocument.Parse(buffer.AsMemory(0, bodyLength))
+                        return Some(document.RootElement.Clone())
+                    with
+                    | :? JsonException -> return None
+        }
+
+    let private isExactEmptyJsonObject (root: JsonElement) =
+        root.ValueKind = JsonValueKind.Object
+        && (root.EnumerateObject() |> Seq.isEmpty)
+
+    let private tryRejectReason (root: JsonElement) =
+        if root.ValueKind <> JsonValueKind.Object then
+            None
+        else
+            let properties = root.EnumerateObject() |> Seq.toList
+
+            match properties with
+            | [ property ] when property.Name = "reason" && property.Value.ValueKind = JsonValueKind.String ->
+                let reason = property.Value.GetString()
+
+                if isNull reason then
+                    None
+                else
+                    let trimmedReason = reason.Trim()
+
+                    if trimmedReason.Length >= 1 && trimmedReason.Length <= 500 then
+                        Some trimmedReason
+                    else
+                        None
+            | _ -> None
+
+    let private adminSayMessages (context: HttpContext) =
+        task {
+            match trySayModerationFilter context with
+            | None ->
+                do! sayStatusInvalid context
+                return StatusCodes.Status400BadRequest
+            | Some filter ->
+                let dataSource = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+                let! result = SayMessageRepository.listForModeration dataSource filter context.RequestAborted
+
+                match result with
+                | Ok messages ->
+                    do! writeOk context (messages |> List.map toAdminSayMessageDto)
+                    return StatusCodes.Status200OK
+                | Error _ ->
+                    do! repositoryReadFailed context
+                    return StatusCodes.Status500InternalServerError
+        }
+
+    let private moderateSayMessage
+        (context: HttpContext)
+        (messageId: Guid)
+        (target: SayMessageModerationTarget)
+        (reason: string option) =
+        task {
+            let dataSource = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+            let idGenerator = context.RequestServices.GetRequiredService<IIdGenerator>()
+            let clock = context.RequestServices.GetRequiredService<IClock>()
+            let moderatedAtUtc = clock.UtcNow
+
+            let! result =
+                DatabaseSession.withTransactionResult
+                    dataSource
+                    (fun connection transaction cancellationToken ->
+                        task {
+                            let! moderation =
+                                SayMessageRepository.moderateInTransaction
+                                    connection
+                                    transaction
+                                    messageId
+                                    target
+                                    reason
+                                    moderatedAtUtc
+                                    cancellationToken
+
+                            match moderation with
+                            | Error repositoryError -> return Error repositoryError
+                            | Ok SayMessageModerationOutcome.Applied ->
+                                let payload =
+                                    JsonSerializer.Serialize(
+                                        {| sayMessageId = messageId.ToString("D")
+                                           status = sayTargetText target
+                                           moderationReason =
+                                               match target with
+                                               | SayMessageModerationTarget.Approved -> null
+                                               | SayMessageModerationTarget.Rejected -> reason |> Option.defaultValue null |},
+                                        ApiJson.options
+                                    )
+
+                                match
+                                    DomainEventEnvelope.create
+                                        idGenerator
+                                        clock
+                                        DomainEventType.SayMessageModerated
+                                        "Web10.Radio.API.Admin"
+                                        None
+                                        None
+                                        payload
+                                with
+                                | Error domainError ->
+                                    return Error(DatabaseError("ApiEndpoints.moderateSayMessage", DomainEventError.toMessage domainError))
+                                | Ok envelope ->
+                                    let! appended =
+                                        OutboxEventRepository.appendInTransaction
+                                            connection
+                                            transaction
+                                            (OutboxMapping.toOutboxEvent envelope)
+                                            cancellationToken
+
+                                    match appended with
+                                    | Ok () -> return Ok SayMessageModerationOutcome.Applied
+                                    | Error repositoryError -> return Error repositoryError
+                            | Ok outcome -> return Ok outcome
+                        })
+                    context.RequestAborted
+
+            match result with
+            | Error _ ->
+                do! repositoryReadFailed context
+                return StatusCodes.Status500InternalServerError
+            | Ok SayMessageModerationOutcome.Applied
+            | Ok SayMessageModerationOutcome.AlreadyApplied ->
+                context.Response.StatusCode <- StatusCodes.Status204NoContent
+                return StatusCodes.Status204NoContent
+            | Ok SayMessageModerationOutcome.NotFound ->
+                do!
+                    ApiProblems.write
+                        context
+                        StatusCodes.Status404NotFound
+                        "say.not_found"
+                        "Say message not found"
+                        "The say message does not exist."
+
+                return StatusCodes.Status404NotFound
+            | Ok SayMessageModerationOutcome.Conflict ->
+                do!
+                    ApiProblems.write
+                        context
+                        StatusCodes.Status409Conflict
+                        "say.state_conflict"
+                        "Say message state conflict"
+                        "The say message cannot be moderated in its current state."
+
+                return StatusCodes.Status409Conflict
+        }
+
+    let private approveSayMessage (context: HttpContext) =
+        task {
+            match trySayMessageId context with
+            | None ->
+                do! sayRequestInvalid context
+                return StatusCodes.Status400BadRequest
+            | Some messageId ->
+                let! body = tryReadSayModerationBody context
+
+                match body with
+                | Some root when isExactEmptyJsonObject root ->
+                    return! moderateSayMessage context messageId SayMessageModerationTarget.Approved None
+                | _ ->
+                    do! sayRequestInvalid context
+                    return StatusCodes.Status400BadRequest
+        }
+
+    let private rejectSayMessage (context: HttpContext) =
+        task {
+            match trySayMessageId context with
+            | None ->
+                do! sayRequestInvalid context
+                return StatusCodes.Status400BadRequest
+            | Some messageId ->
+                let! body = tryReadSayModerationBody context
+
+                match body |> Option.bind tryRejectReason with
+                | Some reason ->
+                    return! moderateSayMessage context messageId SayMessageModerationTarget.Rejected (Some reason)
+                | None ->
+                    do! sayRequestInvalid context
+                    return StatusCodes.Status400BadRequest
+        }
+
     let private adminPlaceholder (context: HttpContext) =
         task {
             do! adminContractUnpinned context
@@ -933,9 +1355,9 @@ module ApiEndpoints =
         map admin logger "GET" "/playlists/{playlistId}/items" "/api/v0/admin/playlists/{playlistId}/items" adminPlaceholder
         map admin logger "POST" "/playlists/{playlistId}/items" "/api/v0/admin/playlists/{playlistId}/items" adminPlaceholder
         map admin logger "PUT" "/playlists/{playlistId}/items" "/api/v0/admin/playlists/{playlistId}/items" adminPlaceholder
-        map admin logger "GET" "/say-messages" "/api/v0/admin/say-messages" adminPlaceholder
-        map admin logger "POST" "/say-messages/{messageId}/approve" "/api/v0/admin/say-messages/{messageId}/approve" adminPlaceholder
-        map admin logger "POST" "/say-messages/{messageId}/reject" "/api/v0/admin/say-messages/{messageId}/reject" adminPlaceholder
+        map admin logger "GET" "/say-messages" "/api/v0/admin/say-messages" adminSayMessages
+        map admin logger "POST" "/say-messages/{messageId}/approve" "/api/v0/admin/say-messages/{messageId}/approve" approveSayMessage
+        map admin logger "POST" "/say-messages/{messageId}/reject" "/api/v0/admin/say-messages/{messageId}/reject" rejectSayMessage
         map admin logger "GET" "/storage" "/api/v0/admin/storage" adminPlaceholder
         map admin logger "PUT" "/storage" "/api/v0/admin/storage" adminPlaceholder
         map admin logger "POST" "/library/scan" "/api/v0/admin/library/scan" adminPlaceholder

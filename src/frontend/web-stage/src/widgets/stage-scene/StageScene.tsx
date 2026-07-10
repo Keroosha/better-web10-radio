@@ -71,6 +71,9 @@ export function StageScene({
             track: { title: nowPlaying.title, artist: nowPlaying.artist },
           };
     const handle = createScene(canvas, options);
+    // NOTE: we intentionally do NOT call handle.resize() — createRadioScene registers its
+    // own window 'resize' listener and the canvas is fixed-fullscreen, so calling it here
+    // would double-handle. The returned resize() stays available for embedded/non-fullscreen use.
     return () => {
       cancelled = true;
       setReady(false);

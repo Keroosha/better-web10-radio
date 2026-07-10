@@ -21,4 +21,8 @@ module MigrationMetadataTests =
         versions
         |> Array.iter (fun version -> Assert.That(version.ToString(), Does.Match("^\\d{12}$")))
 
-        Assert.That(versions, Is.EqualTo(([| 202607080001L; 202607100001L; 202607100002L |] : int64 array) :> obj), "Durable workflow migrations must remain discoverable and ordered after the initial schema.")
+        Assert.That(
+            versions,
+            Is.EqualTo(([| 202607080001L; 202607100001L; 202607100002L; 202607100003L |] : int64 array) :> obj),
+            "Durable workflow and B4 payment migrations must remain discoverable and ordered after the initial schema."
+        )

@@ -13,68 +13,8 @@ open Microsoft.Extensions.Logging
 open Npgsql
 open Web10.Radio.Database
 open Web10.Radio.Database.Repositories
+open Web10.Radio.Telegram
 
-type BackgroundWorkerError =
-    | DomainEventError of DomainEventError
-    | RepositoryError of RepositoryError
-    | UnknownEventType of value: string
-    | InvalidPayload of eventType: string * message: string
-    | PaymentStateRejected of paymentId: Guid
-    | StateTransitionRejected of operation: string * id: Guid
-    | UnexpectedException of operation: string * message: string
-
-module BackgroundWorkerError =
-    let toMessage error =
-        match error with
-        | DomainEventError domainError -> DomainEventError.toMessage domainError
-        | RepositoryError repositoryError -> RepositoryError.toMessage repositoryError
-        | UnknownEventType value -> sprintf "Unknown domain event type: %s." value
-        | InvalidPayload(eventType, message) -> sprintf "Invalid payload for %s: %s" eventType message
-        | PaymentStateRejected paymentId -> sprintf "Payment state rejected for payment %O." paymentId
-        | StateTransitionRejected(operation, id) -> sprintf "State transition rejected: %s for %O." operation id
-        | UnexpectedException(operation, message) -> sprintf "Unexpected background worker exception: %s: %s" operation message
-
-type IDomainEventDispatcher =
-    abstract member DispatchAsync: DomainEventEnvelope -> CancellationToken -> Task<Result<unit, BackgroundWorkerError>>
-
-type IDomainEventPublisher =
-    abstract member PublishDurableAsync: DomainEventEnvelope -> CancellationToken -> Task<Result<unit, BackgroundWorkerError>>
-
-type IPlaybackQueueWorkflow =
-    abstract member HandleAsync: DomainEventEnvelope -> CancellationToken -> Task<Result<unit, BackgroundWorkerError>>
-
-type ILibraryScanWorkflow =
-    abstract member HandleAsync: DomainEventEnvelope -> CancellationToken -> Task<Result<unit, BackgroundWorkerError>>
-type PlaybackCompletion =
-    | Succeeded
-    | Failed of reason: string
-
-type IPlaybackCompletionReporter =
-    abstract member RenewLeaseAsync:
-        queueItemId: Guid ->
-        claimOwner: Guid ->
-        claimAttempt: int ->
-        CancellationToken ->
-            Task<Result<bool, BackgroundWorkerError>>
-
-    abstract member ReportAsync:
-        queueItemId: Guid ->
-        claimOwner: Guid ->
-        claimAttempt: int ->
-        outcome: PlaybackCompletion ->
-        CancellationToken ->
-            Task<Result<bool, BackgroundWorkerError>>
-
-
-
-type ITelegramUpdateEventIngestor =
-    abstract member TryIngestAsync:
-        telegramUpdateId: int64 ->
-        eventType: DomainEventType ->
-        producer: string ->
-        payloadJson: string ->
-        CancellationToken ->
-            Task<Result<bool, BackgroundWorkerError>>
 
 module private JsonPayload =
     let objectWithStrings (fields: (string * string) list) =
@@ -176,20 +116,13 @@ module private EventPublishing =
             do! publisher.PublishDurableAsync envelope cancellationToken
         }
 
-module private OutboxMapping =
-    let toOutboxEvent (envelope: DomainEventEnvelope) =
-        { Id = envelope.EventId
-          EventType = DomainEventType.toString envelope.EventType
-          OccurredAtUtc = envelope.OccurredAtUtc
-          Producer = envelope.Producer
-          CorrelationId = Some envelope.CorrelationId
-          CausationId = envelope.CausationId
-          PayloadJson = envelope.PayloadJson }
 
 module private PaymentAgent =
     type private DonationPaidPayload =
         { PaymentId: Guid
+          TelegramUpdateId: int64
           TelegramPaymentChargeId: string
+          TelegramUserId: int64
           AmountStars: int
           Currency: string }
 
@@ -199,6 +132,10 @@ module private PaymentAgent =
             let! paymentIdText = JsonPayload.tryGetString "paymentId" root |> Result.requireSome (InvalidPayload("DonationPaid", "paymentId is required."))
             let mutable paymentId = Guid.Empty
             do! Guid.TryParse(paymentIdText, &paymentId) |> Result.requireTrue (InvalidPayload("DonationPaid", "paymentId must be a UUID."))
+            let! telegramUpdateId = JsonPayload.tryGetInt64 "telegramUpdateId" root |> Result.requireSome (InvalidPayload("DonationPaid", "telegramUpdateId is required."))
+            do! (telegramUpdateId >= 0L) |> Result.requireTrue (InvalidPayload("DonationPaid", "telegramUpdateId must be non-negative."))
+            let! telegramUserId = JsonPayload.tryGetInt64 "telegramUserId" root |> Result.requireSome (InvalidPayload("DonationPaid", "telegramUserId is required."))
+            do! (telegramUserId > 0L) |> Result.requireTrue (InvalidPayload("DonationPaid", "telegramUserId must be positive."))
             let! telegramPaymentChargeId =
                 JsonPayload.tryGetString "telegramPaymentChargeId" root
                 |> Result.requireSome (InvalidPayload("DonationPaid", "telegramPaymentChargeId is required."))
@@ -209,6 +146,8 @@ module private PaymentAgent =
 
             return
                 { PaymentId = paymentId
+                  TelegramUpdateId = telegramUpdateId
+                  TelegramUserId = telegramUserId
                   TelegramPaymentChargeId = telegramPaymentChargeId
                   AmountStars = amountStars
                   Currency = currency }
@@ -217,17 +156,38 @@ module private PaymentAgent =
     let handle
         (dataSource: NpgsqlDataSource)
         (clock: IClock)
+        (logger: ILogger)
         (envelope: DomainEventEnvelope)
         (cancellationToken: CancellationToken)
         : Task<Result<unit, BackgroundWorkerError>> =
         taskResult {
             let! payload = parseDonationPaid envelope.PayloadJson
-            let! wasMarkedPaid =
-                PaymentRepository.markDonationPaid dataSource payload.PaymentId payload.TelegramPaymentChargeId payload.AmountStars payload.Currency clock.UtcNow cancellationToken
+            let! outcome =
+                PaymentRepository.completePayment
+                    dataSource
+                    payload.PaymentId
+                    payload.TelegramUserId
+                    payload.TelegramPaymentChargeId
+                    payload.AmountStars
+                    payload.Currency
+                    clock.UtcNow
+                    cancellationToken
                 |> TaskResult.mapError RepositoryError
 
-            do! wasMarkedPaid |> Result.requireTrue (PaymentStateRejected payload.PaymentId)
-            return ()
+            match outcome with
+            | Completed _ -> return ()
+            | Rejected reason ->
+                logger.LogWarning(
+                    "Terminal payment rejection for event {eventId}, correlation {correlationId}, Telegram update {telegramUpdateId}, payment {paymentId}, user {telegramUserId}: {reason}.",
+                    envelope.EventId,
+                    envelope.CorrelationId,
+                    payload.TelegramUpdateId,
+                    payload.PaymentId,
+                    payload.TelegramUserId,
+                    reason
+                )
+
+                return ()
         }
 
 module private StreamNodeAgent =
@@ -317,49 +277,10 @@ module private PayloadValidation =
         JsonPayload.tryGetString fieldName root
         |> Result.requireSome (InvalidPayload(eventType, sprintf "%s is required." fieldName))
 
-module private TelegramCommandAgent =
-    let handle (dataSource: NpgsqlDataSource) (envelope: DomainEventEnvelope) cancellationToken =
-        taskResult {
-            let eventType = DomainEventType.toString envelope.EventType
-            let! root = JsonPayload.parseObject eventType envelope.PayloadJson
-            let telegramUserId = JsonPayload.tryGetInt64 "telegramUserId" root
-            let displayName = JsonPayload.tryGetString "displayName" root
 
-            match envelope.EventType with
-            | TrackRequested ->
-                let! query = PayloadValidation.requireString eventType "query" root
-
-                let! _ =
-                    TelegramCommandRepository.createTrackRequest
-                        dataSource
-                        { Id = envelope.EventId
-                          TelegramUserId = telegramUserId
-                          DisplayName = displayName
-                          Query = query
-                          RequestedAtUtc = envelope.OccurredAtUtc
-                          CorrelationId = envelope.CorrelationId }
-                        cancellationToken
-                    |> TaskResult.mapError RepositoryError
-
-                return ()
-            | SayMessageSubmitted ->
-                let! text = PayloadValidation.requireString eventType "text" root
-
-                let! _ =
-                    TelegramCommandRepository.createSayMessage
-                        dataSource
-                        { Id = envelope.EventId
-                          TelegramUserId = telegramUserId
-                          DisplayName = displayName |> Option.defaultValue "Telegram user"
-                          Text = text
-                          SubmittedAtUtc = envelope.OccurredAtUtc }
-                        cancellationToken
-                    |> TaskResult.mapError RepositoryError
-
-                return ()
-            | _ -> return! Error(InvalidPayload(eventType, "event is not handled by TelegramCommandAgent."))
-        }
-
+module private TelegramInvoiceAgent =
+    let handle (workflow: ITelegramBotWorkflow) envelope cancellationToken =
+        workflow.SendInvoiceAsync envelope cancellationToken
 module private PlaybackQueueAgent =
     let handle (workflow: IPlaybackQueueWorkflow) envelope cancellationToken =
         workflow.HandleAsync envelope cancellationToken
@@ -399,6 +320,7 @@ type DomainEventDispatcher
         dataSource: NpgsqlDataSource,
         idGenerator: IIdGenerator,
         clock: IClock,
+        telegramWorkflow: ITelegramBotWorkflow,
         streamNodeState: StreamNodeHeartbeatState,
         playbackWorkflow: IPlaybackQueueWorkflow,
         libraryScanWorkflow: ILibraryScanWorkflow,
@@ -445,11 +367,11 @@ type DomainEventDispatcher
             cancellationToken = stoppingToken
         )
 
-    let paymentAgent = startAgent "PaymentAgent" (PaymentAgent.handle dataSource clock)
+    let paymentAgent = startAgent "PaymentAgent" (PaymentAgent.handle dataSource clock logger)
     let playbackQueueAgent = startAgent "PlaybackQueueAgent" (PlaybackQueueAgent.handle playbackWorkflow)
     let libraryScanAgent = startAgent "LibraryScanAgent" (LibraryScanAgent.handle libraryScanWorkflow)
-    let telegramCommandAgent = startAgent "TelegramCommandAgent" (TelegramCommandAgent.handle dataSource)
-
+    let telegramCommandAgent = startAgent "TelegramCommandAgent" telegramWorkflow.HandleInteractionAsync
+    let telegramInvoiceAgent = startAgent "TelegramInvoiceAgent" (TelegramInvoiceAgent.handle telegramWorkflow)
     let streamNodeAgent =
         startAgent
             "StreamNodeAgent"
@@ -485,8 +407,10 @@ type DomainEventDispatcher
             | StreamNodeHeartbeatReceived
             | StreamNodeFailureDetected -> dispatchToAgent streamNodeAgent envelope cancellationToken
             | TrackRequested
-            | SayMessageSubmitted -> dispatchToAgent telegramCommandAgent envelope cancellationToken
-            | DonationInvoiceCreated
+            | SayMessageSubmitted
+            | TelegramCommandReceived
+            | TelegramCallbackReceived -> dispatchToAgent telegramCommandAgent envelope cancellationToken
+            | DonationInvoiceCreated -> dispatchToAgent telegramInvoiceAgent envelope cancellationToken
             | PaymentRefunded
             | TrackRequestMatched
             | SayMessageModerated
@@ -1404,6 +1328,9 @@ type PlaybackProgramHostedService
 module BackgroundWorkerComposition =
     let addBackgroundWorkers (options: Web10Options) (services: IServiceCollection) : IServiceCollection =
         services.AddSingleton<Web10Options>(options) |> ignore
+        services.AddSingleton<TelegramBotWorkflow>() |> ignore
+        services.AddSingleton<ITelegramBotWorkflow>(fun provider -> provider.GetRequiredService<TelegramBotWorkflow>() :> ITelegramBotWorkflow) |> ignore
+        services.AddSingleton<ITelegramPreCheckoutWorkflow>(fun provider -> provider.GetRequiredService<TelegramBotWorkflow>() :> ITelegramPreCheckoutWorkflow) |> ignore
         services.AddSingleton<LibraryScanHostedService>() |> ignore
         services.AddSingleton<ILibraryScanWorkflow>(fun provider ->
             provider.GetRequiredService<LibraryScanHostedService>() :> ILibraryScanWorkflow)

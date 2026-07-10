@@ -20,6 +20,8 @@ module ConfigurationTests =
           "WEB10_TELEGRAM__BOT_TOKEN"
           "WEB10_TELEGRAM__WEBHOOK_SECRET"
           "WEB10_TELEGRAM__CHANNEL_ID_OR_USERNAME"
+          "WEB10_TELEGRAM__REQUEST_PRICE_STARS"
+          "WEB10_TELEGRAM__SAY_PRICE_STARS"
           "WEB10_STREAM__RTMP_URL"
           "WEB10_STREAM__RTMP_KEY"
           "WEB10_STREAM__STAGE_URL"
@@ -35,6 +37,8 @@ module ConfigurationTests =
               "TELEGRAM:BOT_TOKEN", "123456:AbcdefghijklmnopQRSTuvwx"
               "TELEGRAM:WEBHOOK_SECRET", "webhook-Secret_12345"
               "TELEGRAM:CHANNEL_ID_OR_USERNAME", "@netscapedidnothingwrong"
+              "TELEGRAM:REQUEST_PRICE_STARS", "100"
+              "TELEGRAM:SAY_PRICE_STARS", "50"
               "STREAM:RTMP_URL", "rtmps://dc4-1.rtmp.t.me/s/"
               "STREAM:RTMP_KEY", "rtmp-key-Secret_12345"
               "STREAM:STAGE_URL", "https://stage.web10.radio/"
@@ -130,6 +134,24 @@ module ConfigurationTests =
           { Name = "Telegram channel has invalid syntax"
             Overrides = [ "TELEGRAM:CHANNEL_ID_OR_USERNAME", Some "@bad!" ]
             ExpectedErrorFragments = [ "WEB10_TELEGRAM__CHANNEL_ID_OR_USERNAME" ] }
+          { Name = "Telegram request price is required"
+            Overrides = [ "TELEGRAM:REQUEST_PRICE_STARS", None ]
+            ExpectedErrorFragments = [ "WEB10_TELEGRAM__REQUEST_PRICE_STARS must be a positive 32-bit integer." ] }
+          { Name = "Telegram say price is required"
+            Overrides = [ "TELEGRAM:SAY_PRICE_STARS", None ]
+            ExpectedErrorFragments = [ "WEB10_TELEGRAM__SAY_PRICE_STARS must be a positive 32-bit integer." ] }
+          { Name = "Telegram request price must be an integer"
+            Overrides = [ "TELEGRAM:REQUEST_PRICE_STARS", Some "100.0" ]
+            ExpectedErrorFragments = [ "WEB10_TELEGRAM__REQUEST_PRICE_STARS must be a positive 32-bit integer." ] }
+          { Name = "Telegram say price must be an integer"
+            Overrides = [ "TELEGRAM:SAY_PRICE_STARS", Some "fifty" ]
+            ExpectedErrorFragments = [ "WEB10_TELEGRAM__SAY_PRICE_STARS must be a positive 32-bit integer." ] }
+          { Name = "Telegram request price must be positive"
+            Overrides = [ "TELEGRAM:REQUEST_PRICE_STARS", Some "0" ]
+            ExpectedErrorFragments = [ "WEB10_TELEGRAM__REQUEST_PRICE_STARS must be a positive 32-bit integer." ] }
+          { Name = "Telegram say price must be positive"
+            Overrides = [ "TELEGRAM:SAY_PRICE_STARS", Some "-50" ]
+            ExpectedErrorFragments = [ "WEB10_TELEGRAM__SAY_PRICE_STARS must be a positive 32-bit integer." ] }
           { Name = "S3 bucket has invalid syntax"
             Overrides =
                 [ "STORAGE:TYPE", Some "S3"
@@ -233,6 +255,50 @@ module ConfigurationTests =
 
             requiredEnvironmentVariables
             |> List.iter (fun environmentVariable -> Assert.That(message, Does.Contain(environmentVariable)))
+
+    [<Test>]
+    let ``load reads configured Telegram Stars prices`` () =
+        withTemporaryDirectory (fun root ->
+            match Configuration.load (configurationPairs root |> buildConfiguration) with
+            | Ok options ->
+                Assert.That(options.Telegram.RequestPriceStars, Is.EqualTo(100))
+                Assert.That(options.Telegram.SayPriceStars, Is.EqualTo(50))
+            | Error errors -> Assert.Fail(sprintf "Expected configured Telegram Stars prices to be accepted, but got %s." (joinedErrors errors)))
+
+    [<Test>]
+    let ``load aggregates exact Telegram Stars price diagnostics`` () =
+        withTemporaryDirectory (fun root ->
+            let pairs =
+                configurationPairs root
+                |> Map.remove "TELEGRAM:REQUEST_PRICE_STARS"
+                |> Map.add "TELEGRAM:SAY_PRICE_STARS" "0"
+
+            match Configuration.load (buildConfiguration pairs) with
+            | Ok _ -> Assert.Fail("Expected missing and non-positive Telegram Stars prices to be rejected.")
+            | Error errors ->
+                let expected =
+                    Set.ofList
+                        [ "WEB10_TELEGRAM__REQUEST_PRICE_STARS must be a positive 32-bit integer."
+                          "WEB10_TELEGRAM__SAY_PRICE_STARS must be a positive 32-bit integer." ]
+
+                let hasExactErrors = (errors |> Set.ofList) = expected
+                Assert.That(hasExactErrors, Is.True))
+
+    [<Test>]
+    let ``load rejects every Telegram Stars price validation failure with exact diagnostics`` () =
+        withTemporaryDirectory (fun root ->
+            let baseline = configurationPairs root
+
+            invalidConfigurationCases root
+            |> List.filter (fun case -> case.Name.StartsWith("Telegram ", StringComparison.Ordinal) && case.Name.Contains(" price ", StringComparison.Ordinal))
+            |> List.iter (fun case ->
+                let pairs = baseline |> applyOverrides <| case.Overrides
+
+                match Configuration.load (buildConfiguration pairs) with
+                | Ok _ -> Assert.Fail(sprintf "%s: expected Telegram Stars price validation failure." case.Name)
+                | Error errors ->
+                    let hasExactErrors = errors = case.ExpectedErrorFragments
+                    Assert.That(hasExactErrors, Is.True, sprintf "%s: expected only the exact Telegram Stars price diagnostic." case.Name)))
 
     [<Test>]
     let ``load rejects every semantic invalid configuration category without leaking secrets`` () =

@@ -29,6 +29,22 @@ export function getApiBaseUrl(): string {
   return apiBaseUrl;
 }
 
+// Admin routes (`/api/v0/admin/*`) require `Authorization: Bearer <WEB10_ADMIN__TOKEN>`
+// (backend `Web10Admin` policy). Player routes are unauthenticated and must stay
+// header-free. The token is app-configured once at startup (like the base URL); only
+// requests that opt in with `admin: true` carry it.
+let adminToken: string | null = null;
+
+/** Set (or clear, with `null`) the admin bearer token attached to admin requests. */
+export function setAdminToken(token: string | null): void {
+  adminToken = token;
+}
+
+/** The currently configured admin bearer token (`null` = unset). */
+export function getAdminToken(): string | null {
+  return adminToken;
+}
+
 /** The `fetch` surface we depend on; injectable so tests need no real network. */
 export type FetchImpl = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -63,6 +79,8 @@ export interface ApiRequest<T> {
   readonly signal?: AbortSignal;
   /** Injected `fetch` for tests; defaults to the global. */
   readonly fetchImpl?: FetchImpl;
+  /** When true, attach `Authorization: Bearer <admin token>` (admin routes only). */
+  readonly admin?: boolean;
 }
 
 async function toApiError(res: Response): Promise<ApiError> {
@@ -80,9 +98,13 @@ async function toApiError(res: Response): Promise<ApiError> {
  */
 export async function apiFetch<T>(path: string, req: ApiRequest<T>): Promise<T> {
   const doFetch = req.fetchImpl ?? fetch;
+  const headers: Record<string, string> = { Accept: 'application/json' };
+  if (req.admin === true && adminToken !== null) {
+    headers.Authorization = `Bearer ${adminToken}`;
+  }
   const init: RequestInit = {
     method: req.method ?? 'GET',
-    headers: { Accept: 'application/json' },
+    headers,
     ...(req.signal ? { signal: req.signal } : {}),
   };
   const res = await doFetch(`${apiBaseUrl}${path}`, init);

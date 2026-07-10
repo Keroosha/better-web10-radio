@@ -1,0 +1,1 @@
+export { FollowUsWidget } from './FollowUsWidget';

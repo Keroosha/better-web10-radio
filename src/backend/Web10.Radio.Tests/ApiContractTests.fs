@@ -39,6 +39,8 @@ module ApiContractTests =
               "TELEGRAM:BOT_TOKEN", "123456:AbcdefghijklmnopQRSTuvwx"
               "TELEGRAM:WEBHOOK_SECRET", WebhookSecret
               "TELEGRAM:CHANNEL_ID_OR_USERNAME", "@netscapedidnothingwrong"
+              "TELEGRAM:REQUEST_PRICE_STARS", "100"
+              "TELEGRAM:SAY_PRICE_STARS", "50"
               "STREAM:RTMP_URL", "rtmps://dc4-1.rtmp.t.me/s/"
               "STREAM:RTMP_KEY", "rtmp-key-Secret_12345"
               "STREAM:STAGE_URL", "https://stage.web10.radio/"
@@ -64,6 +66,35 @@ module ApiContractTests =
     type private AuthenticatedTelegramIdentityProbe() =
         interface Web10.Radio.API.ITelegramIdentityProbe with
             member _.IsAuthenticatedBotAsync(_cancellationToken) = Task.FromResult(true)
+    type private RecordingPreCheckoutWorkflow(result: Result<unit, Web10.Radio.API.BackgroundWorkerError>) =
+        let inputs = ConcurrentQueue<Web10.Radio.API.TelegramPreCheckoutInput>()
+
+        member _.Inputs = inputs.ToArray()
+
+        interface Web10.Radio.API.ITelegramPreCheckoutWorkflow with
+            member _.HandleAsync input _cancellationToken =
+                inputs.Enqueue(input)
+                Task.FromResult(result)
+    type private RecordingTelegramBotClient() =
+        let sentTexts = ConcurrentQueue<int64 * string>()
+        let sentInvoices = ConcurrentQueue<Web10.Radio.Telegram.TelegramStarsInvoice>()
+        let ok () : Task<Result<unit, Web10.Radio.Telegram.TelegramBotError>> = Task.FromResult(Ok())
+
+        member _.SentTexts = sentTexts.ToArray()
+        member _.SentInvoices = sentInvoices.ToArray()
+
+        interface Web10.Radio.Telegram.ITelegramBotClient with
+            member _.SendTextAsync(chatId, text, _keyboard, _cancellationToken) =
+                sentTexts.Enqueue(chatId, text)
+                ok ()
+
+            member _.SendInvoiceAsync(invoice, _cancellationToken) =
+                sentInvoices.Enqueue(invoice)
+                ok ()
+
+            member _.AnswerCallbackAsync(_callbackQueryId, _text, _cancellationToken) = ok ()
+
+            member _.AnswerPreCheckoutAsync(_preCheckoutQueryId, _errorMessage, _cancellationToken) = ok ()
 
     type private CapturedLog =
         { Level: LogLevel
@@ -324,6 +355,22 @@ module ApiContractTests =
 
             return! client.SendAsync(request)
         }
+    let private sendAdminJson
+        (client: HttpClient)
+        (authorization: string option)
+        (uri: string)
+        (body: string)
+        =
+        task {
+            use request = new HttpRequestMessage(HttpMethod.Post, uri)
+            request.Content <- new StringContent(body, Encoding.UTF8, "application/json")
+
+            match authorization with
+            | Some value -> request.Headers.TryAddWithoutValidation("Authorization", value) |> ignore
+            | None -> ()
+
+            return! client.SendAsync(request)
+        }
 
     let private sendPlaybackCallback
         (client: HttpClient)
@@ -361,6 +408,41 @@ module ApiContractTests =
             amountStars
             paymentId
             chargeId
+    let private typedPrivateCommandUpdate updateId userId languageCode command =
+        sprintf
+            """{"update_id":%d,"message":{"message_id":10,"date":1783400403,"chat":{"id":%d,"type":"private"},"from":{"id":%d,"is_bot":false,"first_name":"Locale","language_code":"%s"},"text":"%s"}}"""
+            updateId
+            userId
+            userId
+            languageCode
+            command
+
+    let private typedGroupCommandUpdate updateId userId command =
+        sprintf
+            """{"update_id":%d,"message":{"message_id":11,"date":1783400404,"chat":{"id":-100502,"type":"group"},"from":{"id":%d,"is_bot":false,"first_name":"Group"},"text":"%s"}}"""
+            updateId
+            userId
+            command
+
+    let private typedCallbackUpdate updateId userId languageCode callbackData =
+        sprintf
+            """{"update_id":%d,"callback_query":{"id":"callback-%d","from":{"id":%d,"is_bot":false,"first_name":"Callback","language_code":"%s"},"message":{"message_id":12,"date":1783400405,"chat":{"id":%d,"type":"private"}},"data":"%s"}}"""
+            updateId
+            updateId
+            userId
+            languageCode
+            userId
+            callbackData
+
+    let private typedPreCheckoutUpdate updateId userId languageCode amountStars payload =
+        sprintf
+            """{"update_id":%d,"pre_checkout_query":{"id":"precheckout-%d","from":{"id":%d,"is_bot":false,"first_name":"Checkout","language_code":"%s"},"currency":"XTR","total_amount":%d,"invoice_payload":"%s"}}"""
+            updateId
+            updateId
+            userId
+            languageCode
+            amountStars
+            payload
     let private paddedTypedRequestUpdate updateId targetBytes =
         let prefix =
             sprintf
@@ -413,6 +495,14 @@ WHERE "EventType" = @EventType
             let! count = command.ExecuteScalarAsync()
             return Convert.ToInt32(count)
         }
+    let private countActivePaymentRows (connectionString: string) =
+        task {
+            use connection = new NpgsqlConnection(connectionString)
+            do! connection.OpenAsync()
+            use command = new NpgsqlCommand("SELECT count(*) FROM \"Payments\" WHERE \"IsDeleted\" = false;", connection)
+            let! count = command.ExecuteScalarAsync()
+            return Convert.ToInt32(count)
+        }
 
     let private seedDonationPayment connectionString paymentId amountStars =
         task {
@@ -421,8 +511,8 @@ WHERE "EventType" = @EventType
 
             use command =
                 new NpgsqlCommand(
-                    """INSERT INTO "Payments" ("Id", "Purpose", "AmountStars", "Currency", "TelegramInvoicePayload", "Status", "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc")
-VALUES (@PaymentId, 'Donation', @AmountStars, 'XTR', @InvoicePayload, 'InvoiceCreated', false, @NowUtc, @NowUtc);""",
+                    """INSERT INTO "Payments" ("Id", "TelegramUserId", "Purpose", "AmountStars", "Currency", "TelegramInvoicePayload", "Status", "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc")
+VALUES (@PaymentId, 502, 'Donation', @AmountStars, 'XTR', @InvoicePayload, 'InvoiceCreated', false, @NowUtc, @NowUtc);""",
                     connection
                 )
 
@@ -432,6 +522,106 @@ VALUES (@PaymentId, 'Donation', @AmountStars, 'XTR', @InvoicePayload, 'InvoiceCr
             command.Parameters.AddWithValue("NowUtc", DateTimeOffset(2026, 7, 10, 22, 30, 0, TimeSpan.Zero)) |> ignore
             let! _ = command.ExecuteNonQueryAsync()
             return ()
+        }
+    let private seedSayMessage
+        connectionString
+        (messageId: Guid)
+        (telegramUserId: int64 option)
+        displayName
+        text
+        amountStars
+        (color: string option)
+        status
+        (submittedAtUtc: DateTimeOffset)
+        (paidAtUtc: DateTimeOffset option)
+        isDeleted
+        =
+        task {
+            use connection = new NpgsqlConnection(connectionString)
+            do! connection.OpenAsync()
+
+            use command =
+                new NpgsqlCommand(
+                    """INSERT INTO "SayMessages" (
+    "Id", "TelegramUserId", "DisplayName", "Text", "AmountStars", "Color", "Status", "SubmittedAtUtc", "PaidAtUtc", "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc"
+)
+VALUES (
+    @Id, @TelegramUserId, @DisplayName, @Text, @AmountStars, @Color, @Status, @SubmittedAtUtc, @PaidAtUtc, @IsDeleted, @SubmittedAtUtc, @SubmittedAtUtc
+);""",
+                    connection
+                )
+
+            command.Parameters.AddWithValue("Id", messageId) |> ignore
+            command.Parameters.AddWithValue("TelegramUserId", telegramUserId |> Option.map box |> Option.defaultValue DBNull.Value) |> ignore
+            command.Parameters.AddWithValue("DisplayName", displayName) |> ignore
+            command.Parameters.AddWithValue("Text", text) |> ignore
+            command.Parameters.AddWithValue("AmountStars", amountStars) |> ignore
+            command.Parameters.AddWithValue("Color", color |> Option.map box |> Option.defaultValue DBNull.Value) |> ignore
+            command.Parameters.AddWithValue("Status", status) |> ignore
+            command.Parameters.AddWithValue("SubmittedAtUtc", submittedAtUtc) |> ignore
+            command.Parameters.AddWithValue("PaidAtUtc", paidAtUtc |> Option.map box |> Option.defaultValue DBNull.Value) |> ignore
+            command.Parameters.AddWithValue("IsDeleted", isDeleted) |> ignore
+            let! _ = command.ExecuteNonQueryAsync()
+            return ()
+        }
+
+    let private seedPaidSayPayment connectionString (messageId: Guid) amountStars (paidAtUtc: DateTimeOffset) =
+        task {
+            let paymentId = Guid.NewGuid()
+            use connection = new NpgsqlConnection(connectionString)
+            do! connection.OpenAsync()
+
+            use command =
+                new NpgsqlCommand(
+                    """INSERT INTO "Payments" (
+    "Id", "TelegramUserId", "Purpose", "PurposeEntityId", "AmountStars", "Currency", "ProviderToken", "TelegramInvoicePayload", "TelegramPaymentChargeId", "Status", "PaidAtUtc", "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc"
+)
+VALUES (
+    @Id, 7001, 'Say', @PurposeEntityId, @AmountStars, 'XTR', '', @InvoicePayload, @ChargeId, 'Paid', @PaidAtUtc, false, @PaidAtUtc, @PaidAtUtc
+);""",
+                    connection
+                )
+
+            command.Parameters.AddWithValue("Id", paymentId) |> ignore
+            command.Parameters.AddWithValue("PurposeEntityId", messageId) |> ignore
+            command.Parameters.AddWithValue("AmountStars", amountStars) |> ignore
+            command.Parameters.AddWithValue("InvoicePayload", paymentId.ToString("D")) |> ignore
+            command.Parameters.AddWithValue("ChargeId", "paid-say-" + paymentId.ToString("N")) |> ignore
+            command.Parameters.AddWithValue("PaidAtUtc", paidAtUtc) |> ignore
+            let! _ = command.ExecuteNonQueryAsync()
+            return paymentId
+        }
+
+    let private readSayModerationState connectionString (messageId: Guid) =
+        task {
+            use connection = new NpgsqlConnection(connectionString)
+            do! connection.OpenAsync()
+
+            use command =
+                new NpgsqlCommand(
+                    """SELECT
+    "Status",
+    "ModerationReason",
+    (SELECT "Status" FROM "Payments" WHERE "PurposeEntityId" = @Id AND "Purpose" = 'Say' AND "IsDeleted" = false),
+    (SELECT count(*) FROM "OutboxEvents" WHERE "EventType" = 'SayMessageModerated' AND "Payload" ->> 'sayMessageId' = @IdText AND "IsDeleted" = false)
+FROM "SayMessages"
+WHERE "Id" = @Id;""",
+                    connection
+                )
+
+            command.Parameters.AddWithValue("Id", messageId) |> ignore
+            command.Parameters.AddWithValue("IdText", messageId.ToString("D")) |> ignore
+            use! reader = command.ExecuteReaderAsync()
+            let! found = reader.ReadAsync()
+
+            if not found then
+                return raise (AssertionException(sprintf "Expected SayMessages row %O." messageId))
+            else
+                return
+                    reader.GetString(0),
+                    (if reader.IsDBNull 1 then None else Some(reader.GetString 1)),
+                    (if reader.IsDBNull 2 then None else Some(reader.GetString 2)),
+                    reader.GetInt64(3)
         }
 
 
@@ -647,9 +837,6 @@ VALUES (@SayMessageId, 'SSE sender', 'SSE moderation payload', 100, '#e0439a', '
           HttpMethod.Get, "/api/v0/admin/playlists/01920000-0000-7000-8000-000000000111/items", HttpStatusCode.NotImplemented
           HttpMethod.Post, "/api/v0/admin/playlists/01920000-0000-7000-8000-000000000111/items", HttpStatusCode.NotImplemented
           HttpMethod.Put, "/api/v0/admin/playlists/01920000-0000-7000-8000-000000000111/items", HttpStatusCode.NotImplemented
-          HttpMethod.Get, "/api/v0/admin/say-messages?status=pending", HttpStatusCode.NotImplemented
-          HttpMethod.Post, "/api/v0/admin/say-messages/01920000-0000-7000-8000-000000000112/approve", HttpStatusCode.NotImplemented
-          HttpMethod.Post, "/api/v0/admin/say-messages/01920000-0000-7000-8000-000000000112/reject", HttpStatusCode.NotImplemented
           HttpMethod.Get, "/api/v0/admin/storage", HttpStatusCode.NotImplemented
           HttpMethod.Put, "/api/v0/admin/storage", HttpStatusCode.NotImplemented
           HttpMethod.Post, "/api/v0/admin/library/scan", HttpStatusCode.NotImplemented
@@ -675,6 +862,31 @@ LIMIT 1;""",
             command.Parameters.AddWithValue("EventType", eventType) |> ignore
             let! value = command.ExecuteScalarAsync()
             return if isNull value || value = box DBNull.Value then null else string value
+        }
+    let private outboxPayloadForUpdate connectionString eventType telegramUpdateId =
+        task {
+            use connection = new NpgsqlConnection(connectionString)
+            do! connection.OpenAsync()
+
+            use command =
+                new NpgsqlCommand(
+                    """SELECT "Payload"::text
+FROM "OutboxEvents"
+WHERE "EventType" = @EventType
+  AND "Payload" ->> 'telegramUpdateId' = @TelegramUpdateId
+  AND "IsDeleted" = false
+LIMIT 1;""",
+                    connection
+                )
+
+            command.Parameters.AddWithValue("EventType", eventType) |> ignore
+            command.Parameters.AddWithValue("TelegramUpdateId", string telegramUpdateId) |> ignore
+            let! value = command.ExecuteScalarAsync()
+
+            if isNull value || value = box DBNull.Value then
+                return raise (AssertionException(sprintf "Expected %s outbox payload for Telegram update %d." eventType telegramUpdateId))
+            else
+                return string value
         }
 
     [<Test>]
@@ -710,6 +922,267 @@ LIMIT 1;""",
                     let! authorized = sendAdminRequest client (Some(sprintf "Bearer %s" AdminToken)) method' uri
                     use authorized = authorized
                     Assert.That(authorized.StatusCode, Is.EqualTo(expectedAuthorizedStatus), sprintf "%O %s with valid bearer" method' uri)
+            })
+    [<Test>]
+    let ``say moderation routes require bearer authentication before examining status ids or bodies`` () =
+        withApiClient (fun _ client ->
+            task {
+                let messageId = Guid.NewGuid().ToString("D")
+
+                let rejectedCredentials =
+                    [ "missing", []
+                      "wrong", [ "Bearer wrong-admin-token-Secret_123456" ]
+                      "multiple", [ sprintf "Bearer %s" AdminToken; "Bearer another-admin-token-Secret_123456" ] ]
+
+                for method', uri in
+                    [ HttpMethod.Get, "/api/v0/admin/say-messages?status=pending"
+                      HttpMethod.Post, sprintf "/api/v0/admin/say-messages/%s/approve" messageId
+                      HttpMethod.Post, sprintf "/api/v0/admin/say-messages/%s/reject" messageId ] do
+                    for credentialName, authorizations in rejectedCredentials do
+                        let! response = sendAdminRequestWithAuthorizations client authorizations method' uri
+                        use response = response
+                        Assert.That(response.StatusCode, Is.EqualTo(HttpStatusCode.Unauthorized), sprintf "%s %s" credentialName uri)
+                        Assert.That(response.Headers.GetValues("WWW-Authenticate") |> String.concat ",", Is.EqualTo("Bearer"), uri)
+                        do! assertProblemCode "admin.auth.required" response
+            })
+
+    [<Test>]
+    let ``say list requires one exact lowercase moderation status and exposes only paid-pending DTOs`` () =
+        let nowUtc = DateTimeOffset(2026, 7, 10, 18, 0, 0, TimeSpan.Zero)
+
+        withApiClient (fun connectionString client ->
+            task {
+                let unpaidId = Guid.NewGuid()
+                let pendingId = Guid.NewGuid()
+
+                do!
+                    seedSayMessage
+                        connectionString
+                        unpaidId
+                        (Some 7000L)
+                        "Unpaid"
+                        "must not be listed"
+                        50
+                        (Some "#000000")
+                        "PendingPayment"
+                        nowUtc
+                        None
+                        false
+
+                do!
+                    seedSayMessage
+                        connectionString
+                        pendingId
+                        None
+                        "Awaiting moderation"
+                        "paid message"
+                        73
+                        None
+                        "PaidPendingModeration"
+                        (nowUtc.AddMinutes(1.0))
+                        (Some(nowUtc.AddSeconds(30.0)))
+                        false
+
+                let bearer = Some(sprintf "Bearer %s" AdminToken)
+
+                for uri in
+                    [ "/api/v0/admin/say-messages"
+                      "/api/v0/admin/say-messages?status=Pending"
+                      "/api/v0/admin/say-messages?status=pending&status=approved"
+                      "/api/v0/admin/say-messages?status=unknown" ] do
+                    let! invalid = sendAdminRequest client bearer HttpMethod.Get uri
+                    use invalid = invalid
+                    Assert.That(invalid.StatusCode, Is.EqualTo(HttpStatusCode.BadRequest), uri)
+                    do! assertProblemCode "say.status.invalid" invalid
+
+                let! response = sendAdminRequest client bearer HttpMethod.Get "/api/v0/admin/say-messages?status=pending"
+                use response = response
+                Assert.That(response.StatusCode, Is.EqualTo(HttpStatusCode.OK))
+                let! document = jsonDocument response
+                use document = document
+                Assert.That(document.RootElement.ValueKind, Is.EqualTo(JsonValueKind.Array))
+                Assert.That(document.RootElement.GetArrayLength(), Is.EqualTo(1), "PendingPayment is not eligible for moderation listing.")
+                let message = document.RootElement.[0]
+                Assert.That(message |> stringProperty "id", Is.EqualTo(pendingId.ToString("D")))
+                Assert.That(message |> valueKindProperty "telegramUserId", Is.EqualTo(JsonValueKind.Null))
+                Assert.That(message |> stringProperty "displayName", Is.EqualTo("Awaiting moderation"))
+                Assert.That(message |> stringProperty "text", Is.EqualTo("paid message"))
+                Assert.That(message |> intProperty "amountStars", Is.EqualTo(73))
+                Assert.That(message |> valueKindProperty "color", Is.EqualTo(JsonValueKind.Null))
+                Assert.That(message |> stringProperty "status", Is.EqualTo("pending"))
+                Assert.That(message |> stringProperty "submittedAtUtc", Is.EqualTo("2026-07-10T18:01:00.0000000Z"))
+                Assert.That(message |> stringProperty "paidAtUtc", Is.EqualTo("2026-07-10T18:00:30.0000000Z"))
+                Assert.That(message |> valueKindProperty "moderatedAtUtc", Is.EqualTo(JsonValueKind.Null))
+                Assert.That(message |> valueKindProperty "moderationReason", Is.EqualTo(JsonValueKind.Null))
+            })
+
+    [<Test>]
+    let ``say approval and rejection reject malformed exact bodies before state transition`` () =
+        let nowUtc = DateTimeOffset(2026, 7, 10, 18, 30, 0, TimeSpan.Zero)
+
+        withApiClient (fun connectionString client ->
+            task {
+                let messageId = Guid.NewGuid()
+
+                do!
+                    seedSayMessage
+                        connectionString
+                        messageId
+                        (Some 7001L)
+                        "Validation"
+                        "body validation"
+                        50
+                        None
+                        "PaidPendingModeration"
+                        nowUtc
+                        (Some nowUtc)
+                        false
+
+                let bearer = Some(sprintf "Bearer %s" AdminToken)
+                let approveUri = sprintf "/api/v0/admin/say-messages/%O/approve" messageId
+                let rejectUri = sprintf "/api/v0/admin/say-messages/%O/reject" messageId
+                let oversized = "\"" + String.replicate 2049 "x" + "\""
+
+                for uri, body in
+                    [ approveUri, "[]"
+                      approveUri, "{\"extra\":true}"
+                      approveUri, oversized
+                      rejectUri, "{}"
+                      rejectUri, "{\"reason\":\"\"}"
+                      rejectUri, "{\"reason\":\"valid\",\"extra\":true}"
+                      rejectUri, sprintf "{\"reason\":\"%s\"}" (String.replicate 501 "x")
+                      "/api/v0/admin/say-messages/not-a-guid/approve", "{}"
+                      "/api/v0/admin/say-messages/00000000-0000-0000-0000-000000000000/reject", "{\"reason\":\"valid\"}" ] do
+                    let! invalid = sendAdminJson client bearer uri body
+                    use invalid = invalid
+                    Assert.That(invalid.StatusCode, Is.EqualTo(HttpStatusCode.BadRequest), uri)
+                    do! assertProblemCode "say.request.invalid" invalid
+
+                let! state, _, _, eventCount = readSayModerationState connectionString messageId
+                Assert.That(state, Is.EqualTo("PaidPendingModeration"), "Invalid bodies must not moderate the message.")
+                Assert.That(eventCount, Is.EqualTo(0L), "Invalid bodies must not append a moderation event.")
+            })
+    [<Test>]
+    let ``say moderation is idempotent per target appends one exact audit event and only approval reaches player state`` () =
+        let nowUtc = DateTimeOffset(2026, 7, 10, 19, 0, 0, TimeSpan.Zero)
+
+        withApiClientAt nowUtc (fun connectionString _ client ->
+            task {
+                let approvedId = Guid.NewGuid()
+                let rejectedId = Guid.NewGuid()
+                let deletedId = Guid.NewGuid()
+                let bearer = Some(sprintf "Bearer %s" AdminToken)
+
+                for messageId, displayName, text, isDeleted in
+                    [ approvedId, "Approved sender", "visible after moderation", false
+                      rejectedId, "Rejected sender", "hidden after moderation", false
+                      deletedId, "Deleted sender", "deleted moderation", true ] do
+                    do!
+                        seedSayMessage
+                            connectionString
+                            messageId
+                            (Some 7001L)
+                            displayName
+                            text
+                            50
+                            None
+                            "PaidPendingModeration"
+                            nowUtc
+                            (Some nowUtc)
+                            isDeleted
+
+                let! _ = seedPaidSayPayment connectionString approvedId 50 nowUtc
+                let! _ = seedPaidSayPayment connectionString rejectedId 50 nowUtc
+
+                let! missing =
+                    sendAdminJson
+                        client
+                        bearer
+                        (sprintf "/api/v0/admin/say-messages/%O/approve" (Guid.NewGuid()))
+                        "{}"
+
+                use missing = missing
+                Assert.That(missing.StatusCode, Is.EqualTo(HttpStatusCode.NotFound))
+                do! assertProblemCode "say.not_found" missing
+
+                let! deleted =
+                    sendAdminJson
+                        client
+                        bearer
+                        (sprintf "/api/v0/admin/say-messages/%O/reject" deletedId)
+                        "{\"reason\":\"gone\"}"
+
+                use deleted = deleted
+                Assert.That(deleted.StatusCode, Is.EqualTo(HttpStatusCode.NotFound))
+                do! assertProblemCode "say.not_found" deleted
+
+                let approveUri = sprintf "/api/v0/admin/say-messages/%O/approve" approvedId
+                let! firstApproval = sendAdminJson client bearer approveUri "{}"
+                use firstApproval = firstApproval
+                Assert.That(firstApproval.StatusCode, Is.EqualTo(HttpStatusCode.NoContent))
+                let! repeatedApproval = sendAdminJson client bearer approveUri "{}"
+                use repeatedApproval = repeatedApproval
+                Assert.That(repeatedApproval.StatusCode, Is.EqualTo(HttpStatusCode.NoContent), "Same moderation target is a retry-safe transition.")
+                let! oppositeApproval =
+                    sendAdminJson client bearer (sprintf "/api/v0/admin/say-messages/%O/reject" approvedId) "{\"reason\":\"late\"}"
+
+                use oppositeApproval = oppositeApproval
+                Assert.That(oppositeApproval.StatusCode, Is.EqualTo(HttpStatusCode.Conflict))
+                do! assertProblemCode "say.state_conflict" oppositeApproval
+
+                let! approvedStatus, approvedReason, approvedPayment, approvedEvents = readSayModerationState connectionString approvedId
+                Assert.That(approvedStatus, Is.EqualTo("Approved"))
+                Assert.That(approvedReason |> Option.isNone, Is.True)
+                Assert.That(approvedPayment, Is.EqualTo(Some "Paid"), "Moderation must never rewrite the settled payment.")
+                Assert.That(approvedEvents, Is.EqualTo(1L), "Only the first transition appends SayMessageModerated.")
+
+                use eventConnection = new NpgsqlConnection(connectionString)
+                do! eventConnection.OpenAsync()
+
+                use eventCommand =
+                    new NpgsqlCommand(
+                        """SELECT "Producer", "Payload" ->> 'sayMessageId', "Payload" ->> 'status', "Payload" -> 'moderationReason'
+FROM "OutboxEvents"
+WHERE "EventType" = 'SayMessageModerated' AND "Payload" ->> 'sayMessageId' = @Id;""",
+                        eventConnection
+                    )
+
+                eventCommand.Parameters.AddWithValue("Id", approvedId.ToString("D")) |> ignore
+                use! eventReader = eventCommand.ExecuteReaderAsync()
+                let! hasEvent = eventReader.ReadAsync()
+                Assert.That(hasEvent, Is.True)
+                Assert.That(eventReader.GetString(0), Is.EqualTo("Web10.Radio.API.Admin"))
+                Assert.That(eventReader.GetString(1), Is.EqualTo(approvedId.ToString("D")))
+                Assert.That(eventReader.GetString(2), Is.EqualTo("Approved"))
+                Assert.That(eventReader.GetFieldValue<JsonElement>(3).ValueKind, Is.EqualTo(JsonValueKind.Null))
+
+                let rejectUri = sprintf "/api/v0/admin/say-messages/%O/reject" rejectedId
+                let! firstRejection = sendAdminJson client bearer rejectUri "{\"reason\":\"  too loud  \"}"
+                use firstRejection = firstRejection
+                Assert.That(firstRejection.StatusCode, Is.EqualTo(HttpStatusCode.NoContent))
+                let! repeatedRejection = sendAdminJson client bearer rejectUri "{\"reason\":\"too loud\"}"
+                use repeatedRejection = repeatedRejection
+                Assert.That(repeatedRejection.StatusCode, Is.EqualTo(HttpStatusCode.NoContent))
+                let! oppositeRejection = sendAdminJson client bearer (sprintf "/api/v0/admin/say-messages/%O/approve" rejectedId) "{}"
+                use oppositeRejection = oppositeRejection
+                Assert.That(oppositeRejection.StatusCode, Is.EqualTo(HttpStatusCode.Conflict))
+                do! assertProblemCode "say.state_conflict" oppositeRejection
+
+                let! rejectedStatus, rejectedReason, rejectedPayment, rejectedEvents = readSayModerationState connectionString rejectedId
+                Assert.That(rejectedStatus, Is.EqualTo("Rejected"))
+                Assert.That(rejectedReason, Is.EqualTo(Some "too loud"))
+                Assert.That(rejectedPayment, Is.EqualTo(Some "Paid"))
+                Assert.That(rejectedEvents, Is.EqualTo(1L))
+
+                let! playerResponse = client.GetAsync("/api/v0/player/state")
+                use playerResponse = playerResponse
+                Assert.That(playerResponse.StatusCode, Is.EqualTo(HttpStatusCode.OK))
+                let! player = jsonDocument playerResponse
+                use player = player
+                let messages = player.RootElement |> jsonProperty "superChat" |> jsonProperty "messages"
+                let visibleIds = messages.EnumerateArray() |> Seq.map (stringProperty "id") |> Set.ofSeq
+                Assert.That(visibleIds.Contains(approvedId.ToString("D")), Is.True, "Approved paid message must be public immediately.")
+                Assert.That(visibleIds.Contains(rejectedId.ToString("D")), Is.False, "Rejected paid message must stay off the public surface.")
             })
 
     [<Test>]
@@ -826,16 +1299,6 @@ LIMIT 1;""",
             task {
                 do! seedHeartbeat connectionString "Live" (nowUtc.AddSeconds(-30.0))
                 let! bytes = seedCachedPlayingTrack connectionString tempRoot nowUtc
-                use dataSource = NpgsqlDataSource.Create(connectionString)
-                let clock = FixedClock(nowUtc) :> Web10.Radio.API.IClock
-                let! cachedFile = Web10.Radio.API.PlayerStateReadModel.loadStreamFile dataSource clock CancellationToken.None
-
-                match cachedFile with
-                | Ok(Some file) -> Assert.That(File.Exists(file.CachePath), Is.True)
-                | Ok None -> Assert.Fail("The seeded fresh Playing track must be stream-readable before the HTTP request.")
-                | Error error -> Assert.Fail(sprintf "Stream file read model failed: %A" error)
-
-                dataSource.Dispose()
 
                 let! stateResponse = client.GetAsync("/api/v0/player/state")
                 use stateResponse = stateResponse
@@ -1431,4 +1894,152 @@ WHERE "Id" = @PaymentId AND "IsDeleted" = false;""",
                         match check with
                         | Some item -> Assert.That(item |> stringProperty "status", Is.EqualTo(expectedStatus), name)
                         | None -> Assert.Fail(sprintf "Readiness response omitted required %s check." name)
+                })
+
+    [<Test>]
+    let ``pre-checkout webhook maps the verified Telegram actor to replacement workflow and acknowledges success`` () =
+        let workflow = RecordingPreCheckoutWorkflow(Ok())
+
+        withApiClientWithServices
+            (fun services ->
+                services.RemoveAll<Web10.Radio.API.ITelegramPreCheckoutWorkflow>() |> ignore
+                services.AddSingleton<Web10.Radio.API.ITelegramPreCheckoutWorkflow>(workflow) |> ignore)
+            (fun _ _ _ client ->
+                task {
+                    let! response =
+                        sendWebhook
+                            client
+                            (typedPreCheckoutUpdate 9701L 808L "ru-RU" 73 "00000000-0000-0000-0000-000000000701")
+                            [ WebhookSecret ]
+
+                    use response = response
+                    Assert.That(response.StatusCode, Is.EqualTo(HttpStatusCode.NoContent))
+                    Assert.That(workflow.Inputs.Length, Is.EqualTo(1), "The protocol branch must invoke the replacement workflow exactly once.")
+                    let input = workflow.Inputs.[0]
+                    Assert.That(input.TelegramUpdateId, Is.EqualTo(9701L))
+                    Assert.That(input.QueryId, Is.EqualTo("precheckout-9701"))
+                    Assert.That(input.TelegramUserId, Is.EqualTo(808L))
+                    Assert.That(input.LanguageCode, Is.EqualTo(Some "ru-RU"))
+                    Assert.That(input.Currency, Is.EqualTo("XTR"))
+                    Assert.That(input.TotalAmount, Is.EqualTo(73))
+                    Assert.That(input.InvoicePayload, Is.EqualTo("00000000-0000-0000-0000-000000000701"))
+                })
+
+    [<Test>]
+    let ``pre-checkout workflow failure maps to retryable webhook unavailable problem`` () =
+        let workflow =
+            RecordingPreCheckoutWorkflow(
+                Error(Web10.Radio.API.TelegramTransportError("answerPreCheckoutQuery", "timeout"))
+            )
+
+        withApiClientWithServices
+            (fun services ->
+                services.RemoveAll<Web10.Radio.API.ITelegramPreCheckoutWorkflow>() |> ignore
+                services.AddSingleton<Web10.Radio.API.ITelegramPreCheckoutWorkflow>(workflow) |> ignore)
+            (fun _ _ _ client ->
+                task {
+                    let! response =
+                        sendWebhook
+                            client
+                            (typedPreCheckoutUpdate 9702L 809L "en-US" 50 "00000000-0000-0000-0000-000000000702")
+                            [ WebhookSecret ]
+
+                    use response = response
+                    Assert.That(response.StatusCode, Is.EqualTo(HttpStatusCode.ServiceUnavailable))
+                    do! assertProblemCode "telegram.pre_checkout_unavailable" response
+                    Assert.That(workflow.Inputs.Length, Is.EqualTo(1))
+                })
+
+    [<Test>]
+    let ``private localized commands blank required arguments callbacks and successful payments preserve Telegram actor payloads`` () =
+        withApiClient (fun connectionString client ->
+            task {
+                let knownCommands =
+                    [ 9710L, "/start@web10radio", "/start"
+                      9711L, "/help", "/help"
+                      9712L, "/terms", "/terms"
+                      9713L, "/paysupport", "/paysupport"
+                      9714L, "/song", "/song" ]
+
+                for updateId, text, expectedCommand in knownCommands do
+                    let! response = sendWebhook client (typedPrivateCommandUpdate updateId 810L "ru-RU" text) [ WebhookSecret ]
+                    use response = response
+                    Assert.That(response.StatusCode, Is.EqualTo(HttpStatusCode.NoContent), text)
+                    let! payload = outboxPayloadForUpdate connectionString "TelegramCommandReceived" updateId
+                    use document = JsonDocument.Parse(payload)
+                    Assert.That(document.RootElement |> stringProperty "command", Is.EqualTo(expectedCommand))
+                    Assert.That(document.RootElement |> stringProperty "argument", Is.EqualTo(""))
+                    Assert.That((document.RootElement |> jsonProperty "telegramUserId" |> fun value -> value.GetInt64()), Is.EqualTo(810L))
+                    Assert.That(document.RootElement |> stringProperty "languageCode", Is.EqualTo("ru-RU"))
+                    Assert.That(document.RootElement |> boolProperty "isPrivateChat", Is.True)
+
+                for updateId, text, eventType, payloadField in
+                    [ 9715L, "/request", "TrackRequested", "query"
+                      9716L, "/say", "SayMessageSubmitted", "text" ] do
+                    let! response = sendWebhook client (typedPrivateCommandUpdate updateId 811L "ru-RU" text) [ WebhookSecret ]
+                    use response = response
+                    Assert.That(response.StatusCode, Is.EqualTo(HttpStatusCode.NoContent), text)
+                    let! payload = outboxPayloadForUpdate connectionString eventType updateId
+                    use document = JsonDocument.Parse(payload)
+                    Assert.That(document.RootElement |> stringProperty payloadField, Is.EqualTo(""), "Missing required argument remains durable for localized relay feedback.")
+                    Assert.That((document.RootElement |> jsonProperty "telegramUserId" |> fun value -> value.GetInt64()), Is.EqualTo(811L))
+
+                let! callbackResponse = sendWebhook client (typedCallbackUpdate 9717L 812L "ru-RU" "malformed") [ WebhookSecret ]
+                use callbackResponse = callbackResponse
+                Assert.That(callbackResponse.StatusCode, Is.EqualTo(HttpStatusCode.NoContent))
+                let! callbackPayload = outboxPayloadForUpdate connectionString "TelegramCallbackReceived" 9717L
+                use callbackDocument = JsonDocument.Parse(callbackPayload)
+                Assert.That((callbackDocument.RootElement |> jsonProperty "telegramUserId" |> fun value -> value.GetInt64()), Is.EqualTo(812L))
+                Assert.That(callbackDocument.RootElement |> stringProperty "languageCode", Is.EqualTo("ru-RU"))
+                Assert.That(callbackDocument.RootElement |> stringProperty "callbackQueryId", Is.EqualTo("callback-9717"))
+                Assert.That(callbackDocument.RootElement |> stringProperty "rawCallbackData", Is.EqualTo("malformed"))
+
+                let paymentId = Guid.NewGuid()
+                let! paymentResponse = sendWebhook client (typedSuccessfulPaymentUpdate 9718L paymentId "actor-payload-charge" 50) [ WebhookSecret ]
+                use paymentResponse = paymentResponse
+                Assert.That(paymentResponse.StatusCode, Is.EqualTo(HttpStatusCode.NoContent))
+                let! paymentPayload = outboxPayloadForUpdate connectionString "DonationPaid" 9718L
+                use paymentDocument = JsonDocument.Parse(paymentPayload)
+                Assert.That((paymentDocument.RootElement |> jsonProperty "telegramUserId" |> fun value -> value.GetInt64()), Is.EqualTo(502L))
+                Assert.That(paymentDocument.RootElement |> stringProperty "paymentId", Is.EqualTo(paymentId.ToString("D")))
+                Assert.That(paymentDocument.RootElement |> stringProperty "telegramPaymentChargeId", Is.EqualTo("actor-payload-charge"))
+            })
+
+    [<Test>]
+    let ``group private-only request remains durable but relay creates no request payment or invoice`` () =
+        let telegram = RecordingTelegramBotClient()
+
+        withApiClientWithServices
+            (fun services ->
+                services.RemoveAll<IHostedService>() |> ignore
+                services.AddSingleton<Web10.Radio.API.OutboxRelayHostedService>() |> ignore
+                services.RemoveAll<Web10.Radio.Telegram.ITelegramBotClient>() |> ignore
+                services.AddSingleton<Web10.Radio.Telegram.ITelegramBotClient>(telegram) |> ignore)
+            (fun connectionString _ factory client ->
+                task {
+                    let updateId = 9720L
+                    let query = "must remain private"
+                    let! received = sendWebhook client (typedGroupCommandUpdate updateId 813L ("/request " + query)) [ WebhookSecret ]
+                    use received = received
+                    Assert.That(received.StatusCode, Is.EqualTo(HttpStatusCode.NoContent))
+                    let! inboxRows = countInboxRows connectionString updateId "TrackRequested"
+                    Assert.That(inboxRows, Is.EqualTo(1), "Group invocation is retained so the relay can issue the private-chat guidance.")
+
+                    let relay = factory.Services.GetRequiredService<Web10.Radio.API.OutboxRelayHostedService>()
+                    let! relayed = relay.ProcessDueEventsOnceAsync(CancellationToken.None)
+
+                    match relayed with
+                    | Ok 1 -> ()
+                    | Ok count -> Assert.Fail(sprintf "Expected the one group request interaction to relay, got %d events." count)
+                    | Error error -> Assert.Fail(sprintf "Group private-only interaction relay failed: %O" error)
+
+                    let! requestRows = countTrackRequestRows connectionString query
+                    let! paymentRows = countActivePaymentRows connectionString
+                    Assert.That(requestRows, Is.EqualTo(0), "A group request must not create a TrackRequests row.")
+                    Assert.That(paymentRows, Is.EqualTo(0), "A group request must not create a payment order.")
+                    Assert.That(telegram.SentInvoices.Length, Is.EqualTo(0), "A group request must never send an invoice.")
+                    Assert.That(telegram.SentTexts.Length, Is.EqualTo(1))
+                    let chatId, text = telegram.SentTexts.[0]
+                    Assert.That(chatId, Is.EqualTo(-100502L))
+                    Assert.That(text, Is.EqualTo("Open a private chat with the bot for this command."))
                 })

@@ -75,6 +75,27 @@ module BackgroundWorkerTests =
         interface ILibraryScanWorkflow with
             member _.HandleAsync _ _ = Task.FromResult(Ok())
 
+    type private NoopTelegramWorkflow() =
+        interface ITelegramBotWorkflow with
+            member _.HandleInteractionAsync _ _ = Task.FromResult(Ok())
+            member _.SendInvoiceAsync _ _ = Task.FromResult(Ok())
+
+    type private CapturingTelegramWorkflow() =
+        let interactionEvents = ResizeArray<DomainEventType>()
+        let invoiceEvents = ResizeArray<DomainEventType>()
+
+        member _.InteractionEvents = List.ofSeq interactionEvents
+        member _.InvoiceEvents = List.ofSeq invoiceEvents
+
+        interface ITelegramBotWorkflow with
+            member _.HandleInteractionAsync envelope _ =
+                interactionEvents.Add(envelope.EventType)
+                Task.FromResult(Ok())
+
+            member _.SendInvoiceAsync envelope _ =
+                invoiceEvents.Add(envelope.EventType)
+                Task.FromResult(Ok())
+
     type private BlockingRelayDispatcher() =
         let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
         let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
@@ -197,7 +218,9 @@ module BackgroundWorkerTests =
           Telegram =
             { BotToken = "test-bot-token"
               WebhookSecret = "test-webhook-secret"
-              ChannelIdOrUsername = "@web10_test" }
+              ChannelIdOrUsername = "@web10_test"
+              RequestPriceStars = 100
+              SayPriceStars = 50 }
           Stream =
             { RtmpUrl = Uri("rtmp://localhost/live")
               RtmpKey = "test-rtmp-key"
@@ -224,6 +247,58 @@ module BackgroundWorkerTests =
         | Ok value -> value
         | Error error -> Assert.Fail(sprintf "Expected a valid %s test envelope, but got %A." (DomainEventType.toString eventType) error); Unchecked.defaultof<_>
 
+
+    [<Test>]
+    let ``dispatcher routes Telegram interactions and invoice events through their distinct workflow operations`` () =
+        task {
+            let nowUtc = DateTimeOffset(2026, 7, 10, 16, 0, 0, TimeSpan.Zero)
+            let generator = idGenerator ()
+            let workflow = CapturingTelegramWorkflow()
+            let lifetime = TestApplicationLifetime()
+            use dataSource = NpgsqlDataSource.Create("Host=localhost;Database=unused;Username=unused;Password=unused")
+
+            let dispatcher =
+                DomainEventDispatcher(
+                    dataSource,
+                    generator,
+                    clockAt nowUtc,
+                    workflow :> ITelegramBotWorkflow,
+                    StreamNodeHeartbeatState(),
+                    NoopPlaybackWorkflow() :> IPlaybackQueueWorkflow,
+                    NoopLibraryWorkflow() :> ILibraryScanWorkflow,
+                    lifetime :> IHostApplicationLifetime,
+                    NullLogger<DomainEventDispatcher>.Instance
+                )
+                :> IDomainEventDispatcher
+
+            let interactionTypes =
+                [ TrackRequested
+                  SayMessageSubmitted
+                  TelegramCommandReceived
+                  TelegramCallbackReceived ]
+
+            for eventType in interactionTypes do
+                let! result = dispatcher.DispatchAsync(envelope generator (clockAt nowUtc) eventType "{}") CancellationToken.None
+
+                match result with
+                | Ok () -> ()
+                | Error error ->
+                    Assert.Fail(
+                        sprintf
+                            "%s must complete through the interaction workflow, but got %A."
+                            (DomainEventType.toString eventType)
+                            error
+                    )
+
+            let! invoiceResult =
+                dispatcher.DispatchAsync(envelope generator (clockAt nowUtc) DonationInvoiceCreated "{}") CancellationToken.None
+
+            match invoiceResult with
+            | Ok () -> ()
+            | Error error -> Assert.Fail(sprintf "DonationInvoiceCreated must complete through the invoice workflow, but got %A." error)
+            Assert.That(workflow.InteractionEvents, Is.EqualTo(box interactionTypes))
+            Assert.That(workflow.InvoiceEvents, Is.EqualTo(box [ DonationInvoiceCreated ]))
+        }
 
     [<Test>]
     let ``relay drives claimed playback through Played and PlaybackEnded before the next queue item progresses`` () =
@@ -275,6 +350,7 @@ VALUES (@FirstQueueItemId, @FirstTrackId, 'playlist', 'Queued', 0, @NowUtc),
                         dataSource,
                         generator,
                         clock,
+                        NoopTelegramWorkflow() :> ITelegramBotWorkflow,
                         StreamNodeHeartbeatState(),
                         playback :> IPlaybackQueueWorkflow,
                         NoopLibraryWorkflow() :> ILibraryScanWorkflow,
@@ -412,6 +488,194 @@ WHERE "Id" = @QueueItemId;""",
             })
 
     [<Test>]
+    let ``terminal DonationPaid mismatch is processed before a duplicate-deduped valid update completes once`` () =
+        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
+            task {
+                let nowUtc = DateTimeOffset(2026, 7, 10, 18, 30, 0, TimeSpan.Zero)
+                let paymentId = newId ()
+                let telegramUserId = 10101L
+                let validChargeId = "charge-valid"
+                let generator = idGenerator ()
+                let clock = clockAt nowUtc
+                use dataSource = NpgsqlDataSource.Create(connectionString)
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+
+                use payment =
+                    new NpgsqlCommand(
+                        """INSERT INTO "Payments" (
+    "Id", "TelegramUserId", "Purpose", "AmountStars", "Currency", "ProviderToken", "TelegramInvoicePayload", "Status", "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc"
+)
+VALUES (@PaymentId, @TelegramUserId, 'Donation', 50, 'XTR', '', @InvoicePayload, 'InvoiceCreated', false, @NowUtc, @NowUtc);""",
+                        connection
+                    )
+
+                payment.Parameters.AddWithValue("PaymentId", paymentId) |> ignore
+                payment.Parameters.AddWithValue("TelegramUserId", telegramUserId) |> ignore
+                payment.Parameters.AddWithValue("InvoicePayload", paymentId.ToString("D")) |> ignore
+                payment.Parameters.AddWithValue("NowUtc", nowUtc) |> ignore
+                let! _ = payment.ExecuteNonQueryAsync()
+
+                let mismatchPayload =
+                    sprintf
+                        """{"paymentId":"%O","telegramUpdateId":700,"telegramUserId":%d,"telegramPaymentChargeId":"charge-mismatch","amountStars":49,"currency":"XTR"}"""
+                        paymentId
+                        telegramUserId
+
+                let mismatchEvent =
+                    { Id = newId ()
+                      EventType = DomainEventType.toString DonationPaid
+                      OccurredAtUtc = nowUtc.AddMinutes(-1.0)
+                      Producer = "web10.radio.tests"
+                      CorrelationId = None
+                      CausationId = None
+                      PayloadJson = mismatchPayload }
+
+                let! mismatchAppend = OutboxEventRepository.append dataSource mismatchEvent CancellationToken.None
+
+                match mismatchAppend with
+                | Ok () -> ()
+                | Error error -> Assert.Fail(sprintf "The terminal mismatch must enter the durable relay before the valid update, but got %A." error)
+
+                let validPayload =
+                    sprintf
+                        """{"paymentId":"%O","telegramUpdateId":701,"telegramUserId":%d,"telegramPaymentChargeId":"%s","amountStars":50,"currency":"XTR"}"""
+                        paymentId
+                        telegramUserId
+                        validChargeId
+
+                let ingestor = TelegramUpdateEventIngestor(dataSource, generator, clock) :> ITelegramUpdateEventIngestor
+                let! firstIngest = ingestor.TryIngestAsync 701L DonationPaid "web10.radio.tests" validPayload CancellationToken.None
+                let! duplicateIngest = ingestor.TryIngestAsync 701L DonationPaid "web10.radio.tests" validPayload CancellationToken.None
+
+                match firstIngest, duplicateIngest with
+                | Ok true, Ok false -> ()
+                | actual ->
+                    Assert.Fail(
+                        sprintf
+                            "The first successful-payment update must append once and its duplicate must be deduplicated, but got %A."
+                            actual
+                    )
+
+                let lifetime = TestApplicationLifetime()
+                let dispatcher =
+                    DomainEventDispatcher(
+                        dataSource,
+                        generator,
+                        clock,
+                        NoopTelegramWorkflow() :> ITelegramBotWorkflow,
+                        StreamNodeHeartbeatState(),
+                        NoopPlaybackWorkflow() :> IPlaybackQueueWorkflow,
+                        NoopLibraryWorkflow() :> ILibraryScanWorkflow,
+                        lifetime :> IHostApplicationLifetime,
+                        NullLogger<DomainEventDispatcher>.Instance
+                    )
+                    :> IDomainEventDispatcher
+
+                let relay = new OutboxRelayHostedService(dataSource, dispatcher, clock, generator, NullLogger<OutboxRelayHostedService>.Instance)
+                let! mismatchRelay = relay.ProcessDueEventsOnceAsync CancellationToken.None
+                let! validRelay = relay.ProcessDueEventsOnceAsync CancellationToken.None
+                let! noDuplicateRelay = relay.ProcessDueEventsOnceAsync CancellationToken.None
+
+                match mismatchRelay, validRelay, noDuplicateRelay with
+                | Ok 1, Ok 1, Ok 0 -> ()
+                | actual ->
+                    Assert.Fail(
+                        sprintf
+                            "The terminal mismatch must be processed, the later valid payment must run, and the duplicate update must not dispatch, but got %A."
+                            actual
+                    )
+
+                use assertion =
+                    new NpgsqlCommand(
+                        """SELECT
+    (SELECT "Status" FROM "Payments" WHERE "Id" = @PaymentId),
+    (SELECT "TelegramPaymentChargeId" FROM "Payments" WHERE "Id" = @PaymentId),
+    (SELECT count(*) FROM "TelegramUpdateInbox" WHERE "TelegramUpdateId" = 701 AND "EventType" = 'DonationPaid' AND "IsDeleted" = false),
+    (SELECT count(*) FROM "OutboxEvents" WHERE "EventType" = 'DonationPaid' AND "Status" = 'Processed' AND "IsDeleted" = false),
+    (SELECT count(*) FROM "OutboxEvents" WHERE "EventType" = 'DonationPaid' AND "IsDeleted" = false);""",
+                        connection
+                    )
+
+                assertion.Parameters.AddWithValue("PaymentId", paymentId) |> ignore
+                use! reader = assertion.ExecuteReaderAsync()
+                let! hasRow = reader.ReadAsync()
+                Assert.That(hasRow, Is.True)
+                Assert.That(reader.GetString(0), Is.EqualTo("Paid"))
+                Assert.That(reader.GetString(1), Is.EqualTo(validChargeId))
+                Assert.That(reader.GetInt64(2), Is.EqualTo(1L), "The duplicate update must retain one inbox record.")
+                Assert.That(reader.GetInt64(3), Is.EqualTo(2L), "Both the terminal mismatch and the later valid event must be processed.")
+                Assert.That(reader.GetInt64(4), Is.EqualTo(2L), "The duplicate update must not create another outbox row.")
+            })
+
+    [<Test>]
+    let ``DonationPaid repository errors remain retryable outbox failures`` () =
+        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
+            task {
+                let nowUtc = DateTimeOffset(2026, 7, 10, 18, 45, 0, TimeSpan.Zero)
+                let generator = idGenerator ()
+                let clock = clockAt nowUtc
+                let paymentId = newId ()
+                use dataSource = NpgsqlDataSource.Create(connectionString)
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+
+                let payload =
+                    sprintf
+                        """{"paymentId":"%O","telegramUpdateId":702,"telegramUserId":10102,"telegramPaymentChargeId":"charge-retry","amountStars":50,"currency":"XTR"}"""
+                        paymentId
+
+                let event =
+                    { Id = newId ()
+                      EventType = DomainEventType.toString DonationPaid
+                      OccurredAtUtc = nowUtc
+                      Producer = "web10.radio.tests"
+                      CorrelationId = None
+                      CausationId = None
+                      PayloadJson = payload }
+
+                let! append = OutboxEventRepository.append dataSource event CancellationToken.None
+
+                match append with
+                | Ok () -> ()
+                | Error error -> Assert.Fail(sprintf "Expected DonationPaid fixture event to append, but got %A." error)
+
+                use dropPayments = new NpgsqlCommand("DROP TABLE \"Payments\";", connection)
+                let! _ = dropPayments.ExecuteNonQueryAsync()
+
+                let lifetime = TestApplicationLifetime()
+                let dispatcher =
+                    DomainEventDispatcher(
+                        dataSource,
+                        generator,
+                        clock,
+                        NoopTelegramWorkflow() :> ITelegramBotWorkflow,
+                        StreamNodeHeartbeatState(),
+                        NoopPlaybackWorkflow() :> IPlaybackQueueWorkflow,
+                        NoopLibraryWorkflow() :> ILibraryScanWorkflow,
+                        lifetime :> IHostApplicationLifetime,
+                        NullLogger<DomainEventDispatcher>.Instance
+                    )
+                    :> IDomainEventDispatcher
+
+                let relay = new OutboxRelayHostedService(dataSource, dispatcher, clock, generator, NullLogger<OutboxRelayHostedService>.Instance)
+                let! result = relay.ProcessDueEventsOnceAsync CancellationToken.None
+
+                match result with
+                | Error(RepositoryError(DatabaseError("PaymentRepository.completePayment", _))) -> ()
+                | actual -> Assert.Fail(sprintf "Expected the missing Payments table to surface as a retryable repository error, but got %A." actual)
+
+                use assertion = new NpgsqlCommand("SELECT \"Status\", \"Attempts\", \"NextAttemptAtUtc\" IS NOT NULL FROM \"OutboxEvents\" WHERE \"Id\" = @EventId;", connection)
+                assertion.Parameters.AddWithValue("EventId", event.Id) |> ignore
+                use! reader = assertion.ExecuteReaderAsync()
+                let! hasRow = reader.ReadAsync()
+                Assert.That(hasRow, Is.True)
+                Assert.That(reader.GetString(0), Is.EqualTo("Failed"), "A repository failure must remain retryable rather than be terminally processed.")
+                Assert.That(reader.GetInt32(1), Is.EqualTo(1))
+                Assert.That(reader.GetBoolean(2), Is.True)
+            })
+
+    [<Test>]
     let ``row S3 backend overrides Local configuration with exact uncached discoveries and per-page lease renewal`` () =
         DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
             task {
@@ -462,6 +726,7 @@ VALUES (@JobId, @StorageBackendId, 'Queued', @NowUtc, @NowUtc, @NowUtc, false);"
                         dataSource,
                         generator,
                         clock,
+                        NoopTelegramWorkflow() :> ITelegramBotWorkflow,
                         StreamNodeHeartbeatState(),
                         NoopPlaybackWorkflow() :> IPlaybackQueueWorkflow,
                         scanner :> ILibraryScanWorkflow,
@@ -620,6 +885,7 @@ VALUES (@JobId, 'Queued', @NowUtc, @NowUtc, @NowUtc, false);""",
                     dataSource,
                     generator,
                     clockAt nowUtc,
+                    NoopTelegramWorkflow() :> ITelegramBotWorkflow,
                     StreamNodeHeartbeatState(),
                     queueWorkflow :> IPlaybackQueueWorkflow,
                     NoopLibraryWorkflow() :> ILibraryScanWorkflow,

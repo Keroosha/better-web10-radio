@@ -10,6 +10,8 @@ module DomainEventTests =
         [ "TrackRequested"
           "TrackRequestMatched"
           "SayMessageSubmitted"
+          "TelegramCommandReceived"
+          "TelegramCallbackReceived"
           "SayMessageModerated"
           "DonationInvoiceCreated"
           "DonationPaid"

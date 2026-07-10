@@ -50,29 +50,40 @@
 - [x] Dispose renderer, geometries, materials, textures, event listeners, and animation frame on unmount.
 - [x] Preserve mouse parallax behavior and make it no-op when the stream-node disables pointer input (via the `pointerEnabled` seam; wiring to the stream-node's real signal lands with stream-node integration).
 
-### Phase F3 — web-stage overlays and live data
+### Phase F3 — web-stage overlays and live data ✅ (2026-07-10)
 
-- [ ] Implement NOW PLAYING widget using `nowPlaying.title`, `nowPlaying.artist`, live pill, and equalizer bars.
-- [ ] Implement DONATION GOAL widget using Stars amounts, top donator, raised/goal progress, and recent donations.
-- [ ] Implement SUPER CHAT widget using approved `/say` messages only.
-- [ ] Implement FOLLOW US widget using social links, QR image URL, featured social rotation, glyphs, colors, and handles.
-- [ ] Implement donation toast when `player.donation` SSE event arrives.
-- [ ] Implement overlay style variants `aero` and `win9x`.
-- [ ] Implement layout variants `corners`, `sidebar`, and `bottombar`.
-- [ ] Replace mock random timers with API/SSE state. Use empty states when queue, donations, messages, or socials are empty.
-- [ ] Play audio from `/api/v0/player/stream`; when stream is `offline|degraded`, show the stream status and keep the visual stage alive.
+> Live data flows through `entities/player-state` (empty default, reducer, selectors) →
+> `features/stage-state/useStageState` (seed + SSE deltas + 2-disconnect→poll fallback +
+> donation-toast signal). Verified against the running B3 backend: the real
+> `/api/v0/player/state` validates through the Zod schemas with zero drift.
 
-### Phase F4 — Admin app
+- [x] Implement NOW PLAYING widget using `nowPlaying.title`, `nowPlaying.artist`, live pill, and equalizer bars.
+- [x] Implement DONATION GOAL widget using Stars amounts, top donator, raised/goal progress, and recent donations.
+- [x] Implement SUPER CHAT widget using approved `/say` messages only.
+- [x] Implement FOLLOW US widget using social links, QR image URL, featured social rotation, glyphs, colors, and handles.
+- [x] Implement donation toast when `player.donation` SSE event arrives.
+- [x] Implement overlay style variants `aero` and `win9x`.
+- [x] Implement layout variants `corners`, `sidebar`, and `bottombar`.
+- [x] Replace mock random timers with API/SSE state. Use empty states when queue, donations, messages, or socials are empty.
+- [x] Play audio from `/api/v0/player/stream`; when stream is `offline|degraded`, show the stream status and keep the visual stage alive.
+      Capture mode (`?capture=1` / `captureEnabled` prop) mutes/hides browser audio for the stream-node kiosk; viewer mode uses muted-autoplay + an unmute pill.
 
-- [ ] Scaffold Feature-Sliced Design (FSD) layers for `src/frontend/admin`: `app`, `pages`, `widgets`, `features`, `entities`, `shared` imports only from `src/frontend/shared`.
-- [ ] Implement dashboard page with stream status, current track, queue summary, and stream-node heartbeat.
-- [ ] Implement social links management page backed by `/api/v0/admin/social-links`.
-- [ ] Implement donation goal management page backed by `/api/v0/admin/donation-goal`.
-- [ ] Implement playlists page backed by `/api/v0/admin/playlists` and playlist item routes.
-- [ ] Implement storage settings page for `Local` and `S3` values.
-- [ ] Implement `/say` moderation queue with approve/reject actions.
-- [ ] Implement library scan trigger backed by `/api/v0/admin/library/scan`.
-- [ ] Add auth guard placeholder that consumes backend admin auth result; do not invent OAuth/provider UX in this milestone.
+### Phase F4 — Admin app (scaffold started 2026-07-10; write/moderation blocked on backend admin DTOs)
+
+> Started per the "F3 + begin F4" decision. The FSD shell + auth guard + the pages backed
+> by already-pinned routes are done; every route still served as `501 admin.contract_unpinned`
+> renders an explicit placeholder (no invented DTO shapes). The shared client now attaches
+> `Authorization: Bearer <WEB10_ADMIN__TOKEN>` on admin requests (`setAdminToken`).
+
+- [x] Scaffold Feature-Sliced Design (FSD) layers for `src/frontend/admin`: `app`, `pages`, `widgets`, `features`, `entities`, `shared` imports only from `src/frontend/shared`.
+- [x] Implement dashboard page with stream status, current track, queue summary, and stream-node heartbeat. (Heartbeat shown as "unavailable — contract unpinned": its admin route is `501`.)
+- [x] Implement social links management page backed by `/api/v0/admin/social-links`. (Read-only view; PUT is `501`, editing deferred.)
+- [x] Implement donation goal management page backed by `/api/v0/admin/donation-goal`. (Read-only view; PUT is `501`, editing deferred.)
+- [ ] Implement playlists page backed by `/api/v0/admin/playlists` and playlist item routes. (Blocked — `501 admin.contract_unpinned`; placeholder page in place.)
+- [ ] Implement storage settings page for `Local` and `S3` values. (Blocked — placeholder page in place.)
+- [ ] Implement `/say` moderation queue with approve/reject actions. (Blocked — placeholder page in place.)
+- [ ] Implement library scan trigger backed by `/api/v0/admin/library/scan`. (Blocked — placeholder page in place.)
+- [x] Add auth guard placeholder that consumes backend admin auth result; do not invent OAuth/provider UX in this milestone.
 
 ### Phase F5 — Frontend verification and handoff
 

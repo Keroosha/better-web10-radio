@@ -1,0 +1,1 @@
+export { SuperChatWidget } from './SuperChatWidget';

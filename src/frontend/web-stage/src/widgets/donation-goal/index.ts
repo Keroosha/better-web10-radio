@@ -1,0 +1,1 @@
+export { DonationGoalWidget } from './DonationGoalWidget';

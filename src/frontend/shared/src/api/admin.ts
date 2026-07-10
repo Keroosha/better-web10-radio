@@ -17,18 +17,20 @@ import {
 
 const SocialLinkListSchema = z.array(SocialLinkSchema);
 
-/** `GET /api/v0/admin/donation-goal` — current goal, validated. */
+/** `GET /api/v0/admin/donation-goal` — current goal, validated. Requires the admin token. */
 export function getDonationGoal(opts: RequestOptions = {}): Promise<DonationGoal> {
   return apiFetch(`${API_V0_PREFIX}/admin/donation-goal`, {
     schema: DonationGoalSchema,
+    admin: true,
     ...opts,
   });
 }
 
-/** `GET /api/v0/admin/social-links` — configured social links, validated. */
+/** `GET /api/v0/admin/social-links` — configured social links, validated. Requires the admin token. */
 export function getSocialLinks(opts: RequestOptions = {}): Promise<SocialLink[]> {
   return apiFetch(`${API_V0_PREFIX}/admin/social-links`, {
     schema: SocialLinkListSchema,
+    admin: true,
     ...opts,
   });
 }

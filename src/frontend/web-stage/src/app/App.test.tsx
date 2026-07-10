@@ -1,5 +1,5 @@
 import { cleanup, render } from '@testing-library/react';
-import { afterEach, expect, test, vi } from 'vitest';
+import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 
 import { App } from './App';
 
@@ -9,7 +9,21 @@ vi.mock('../widgets/stage-scene/createRadioScene', () => ({
   createRadioScene: () => ({ resize: (): void => {}, dispose: (): void => {} }),
 }));
 
-afterEach(cleanup);
+// The stage-state hook opens an EventSource and seeds via fetch — jsdom has neither in a
+// usable form. Stub both so <App/> mounts against the empty/offline default.
+class FakeEventSource {
+  addEventListener(): void {}
+  close(): void {}
+}
+
+beforeEach(() => {
+  vi.stubGlobal('EventSource', FakeEventSource);
+  vi.stubGlobal('fetch', () => Promise.reject(new Error('no network in test')));
+});
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 test('web-stage app mounts the stage scene', () => {
   const { container, getByText } = render(<App />);

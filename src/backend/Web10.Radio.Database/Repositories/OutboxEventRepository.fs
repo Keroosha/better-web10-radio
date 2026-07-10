@@ -25,7 +25,27 @@ type OutboxEventRecord =
       CorrelationId: Guid option
       CausationId: Guid option
       PayloadJson: string
-      Attempts: int }
+      ClaimOwner: Guid
+      ClaimAttempt: int
+      LeaseExpiresAtUtc: DateTimeOffset }
+
+type OutboxDispatchLease internal (connection: NpgsqlConnection, records: OutboxEventRecord list) =
+    let mutable disposed = 0
+
+    member _.Records = records
+
+    member private _.Release() =
+        if Interlocked.Exchange(&disposed, 1) = 0 then
+            try
+                use command = new NpgsqlCommand("SELECT pg_advisory_unlock(hashtext('web10.radio.outbox-global-dispatch'));", connection)
+                command.ExecuteScalar() |> ignore
+            with _ ->
+                ()
+
+            connection.Dispose()
+
+    interface IDisposable with
+        member this.Dispose() = this.Release()
 
 module OutboxEventRepository =
     let private processingLease = TimeSpan.FromSeconds(30.0)
@@ -41,41 +61,62 @@ VALUES (
 );"""
 
     [<Literal>]
-    let private claimDueSql = """WITH due_events AS (
+    let private tryGlobalDispatchLockSql = """SELECT pg_try_advisory_lock(hashtext('web10.radio.outbox-global-dispatch'));"""
+
+    [<Literal>]
+    let private claimEarliestDueSql = """WITH first_unfinished AS (
     SELECT "Id"
     FROM "OutboxEvents"
     WHERE "IsDeleted" = false
-      AND (
-          ("Status" IN ('Pending', 'Failed') AND ("NextAttemptAtUtc" IS NULL OR "NextAttemptAtUtc" <= @NowUtc))
-          OR ("Status" = 'Processing' AND "UpdatedAtUtc" <= @ProcessingLeaseExpiredBeforeUtc)
-      )
-    ORDER BY "OccurredAtUtc" ASC
-    FOR UPDATE SKIP LOCKED
-    LIMIT @BatchSize
+      AND "Status" <> 'Processed'
+    ORDER BY "OccurredAtUtc" ASC, "CreatedAtUtc" ASC, "Id" ASC
+    FOR UPDATE
+    LIMIT 1
+), due_event AS (
+    SELECT e."Id"
+    FROM "OutboxEvents" e
+    INNER JOIN first_unfinished first ON first."Id" = e."Id"
+    WHERE (
+        (e."Status" IN ('Pending', 'Failed') AND (e."NextAttemptAtUtc" IS NULL OR e."NextAttemptAtUtc" <= @NowUtc))
+        OR (e."Status" = 'Processing' AND (e."ClaimLeaseExpiresAtUtc" IS NULL OR e."ClaimLeaseExpiresAtUtc" <= @NowUtc))
+    )
 )
 UPDATE "OutboxEvents" AS e
 SET "Status" = 'Processing',
     "Attempts" = e."Attempts" + 1,
+    "ClaimOwner" = @ClaimOwner,
+    "ClaimLeaseExpiresAtUtc" = @LeaseExpiresAtUtc,
     "UpdatedAtUtc" = @NowUtc
-FROM due_events
-WHERE e."Id" = due_events."Id"
-RETURNING e."Id", e."EventType", e."OccurredAtUtc", e."Producer", e."CorrelationId", e."CausationId", e."Payload"::text, e."Attempts";"""
+FROM due_event
+WHERE e."Id" = due_event."Id"
+RETURNING e."Id", e."EventType", e."OccurredAtUtc", e."Producer", e."CorrelationId", e."CausationId",
+          e."Payload"::text, e."ClaimOwner", e."Attempts", e."ClaimLeaseExpiresAtUtc";"""
 
     [<Literal>]
     let private markProcessedSql = """UPDATE "OutboxEvents"
 SET "Status" = 'Processed',
     "ProcessedAtUtc" = @ProcessedAtUtc,
+    "ClaimOwner" = NULL,
+    "ClaimLeaseExpiresAtUtc" = NULL,
     "UpdatedAtUtc" = @ProcessedAtUtc
 WHERE "Id" = @EventId
-  AND "IsDeleted" = false;"""
+  AND "IsDeleted" = false
+  AND "Status" = 'Processing'
+  AND "ClaimOwner" = @ClaimOwner
+  AND "Attempts" = @ClaimAttempt;"""
 
     [<Literal>]
     let private markFailedSql = """UPDATE "OutboxEvents"
 SET "Status" = 'Failed',
     "NextAttemptAtUtc" = @NextAttemptAtUtc,
+    "ClaimOwner" = NULL,
+    "ClaimLeaseExpiresAtUtc" = NULL,
     "UpdatedAtUtc" = @FailedAtUtc
 WHERE "Id" = @EventId
-  AND "IsDeleted" = false;"""
+  AND "IsDeleted" = false
+  AND "Status" = 'Processing'
+  AND "ClaimOwner" = @ClaimOwner
+  AND "Attempts" = @ClaimAttempt;"""
 
     let private databaseError operation (ex: exn) = DatabaseError(operation, ex.Message)
 
@@ -95,7 +136,9 @@ WHERE "Id" = @EventId
           CorrelationId = readNullableGuid reader 4
           CausationId = readNullableGuid reader 5
           PayloadJson = reader.GetString(6)
-          Attempts = reader.GetInt32(7) }
+          ClaimOwner = reader.GetGuid(7)
+          ClaimAttempt = reader.GetInt32(8)
+          LeaseExpiresAtUtc = reader.GetFieldValue<DateTimeOffset>(9) }
 
     let appendInTransaction
         (connection: NpgsqlConnection)
@@ -129,59 +172,80 @@ WHERE "Id" = @EventId
             (fun connection transaction cancellationToken -> appendInTransaction connection transaction event cancellationToken)
             cancellationToken
 
-    let claimDue
+    let tryClaimDueOrdered
         (dataSource: NpgsqlDataSource)
+        (claimOwner: Guid)
         (nowUtc: DateTimeOffset)
         (batchSize: int)
         (cancellationToken: CancellationToken)
-        : Task<Result<OutboxEventRecord list, RepositoryError>> =
+        : Task<Result<OutboxDispatchLease option, RepositoryError>> =
         taskResult {
             do! (batchSize > 0) |> Result.requireTrue (InvalidBatchSize batchSize)
 
+            let mutable connection: NpgsqlConnection = null
+            let mutable lockHeld = false
+
             try
-                return!
-                    DatabaseSession.withTransactionResult
-                        dataSource
-                        (fun connection transaction cancellationToken ->
-                            taskResult {
-                                use command = new NpgsqlCommand(claimDueSql, connection, transaction)
-                                command.Parameters.AddWithValue("NowUtc", nowUtc) |> ignore
-                                command.Parameters.AddWithValue("ProcessingLeaseExpiredBeforeUtc", nowUtc - processingLease) |> ignore
-                                command.Parameters.AddWithValue("BatchSize", batchSize) |> ignore
-                                let! reader = command.ExecuteReaderAsync(cancellationToken)
-                                use reader = reader
-                                let records = ResizeArray<OutboxEventRecord>()
-                                let mutable keepReading = true
+                let! openedConnection = dataSource.OpenConnectionAsync(cancellationToken)
+                connection <- openedConnection
+                use lockCommand = new NpgsqlCommand(tryGlobalDispatchLockSql, connection)
+                let! acquired = lockCommand.ExecuteScalarAsync(cancellationToken)
+                lockHeld <- Convert.ToBoolean(acquired)
 
-                                while keepReading do
-                                    let! hasRow = reader.ReadAsync(cancellationToken)
-
-                                    if hasRow then
-                                        records.Add(readRecord reader)
-                                    else
-                                        keepReading <- false
-
-                                return List.ofSeq records
-                            })
-                        cancellationToken
+                if not lockHeld then
+                    connection.Dispose()
+                    connection <- null
+                    return None
+                else
+                    use! transaction = connection.BeginTransactionAsync(cancellationToken)
+                    use command = new NpgsqlCommand(claimEarliestDueSql, connection, transaction)
+                    command.Parameters.AddWithValue("ClaimOwner", claimOwner) |> ignore
+                    command.Parameters.AddWithValue("NowUtc", nowUtc) |> ignore
+                    command.Parameters.AddWithValue("LeaseExpiresAtUtc", nowUtc + processingLease) |> ignore
+                    let! reader = command.ExecuteReaderAsync(cancellationToken)
+                    use reader = reader
+                    let! hasRow = reader.ReadAsync(cancellationToken)
+                    let records = if hasRow then [ readRecord reader ] else []
+                    do! reader.CloseAsync()
+                    do! transaction.CommitAsync(cancellationToken)
+                    let lease = new OutboxDispatchLease(connection, records)
+                    connection <- null
+                    lockHeld <- false
+                    return Some lease
             with ex ->
-                return! Error(databaseError "OutboxEventRepository.claimDue" ex)
+                if not (isNull connection) then
+                    if lockHeld then
+                        try
+                            use unlockCommand =
+                                new NpgsqlCommand("SELECT pg_advisory_unlock(hashtext('web10.radio.outbox-global-dispatch'));", connection)
+
+                            unlockCommand.ExecuteScalar() |> ignore
+                        with _ ->
+                            ()
+
+                    connection.Dispose()
+
+                return! Error(databaseError "OutboxEventRepository.tryClaimDueOrdered" ex)
         }
 
     let markProcessed
         (dataSource: NpgsqlDataSource)
         (eventId: Guid)
+        (claimOwner: Guid)
+        (claimAttempt: int)
         (processedAtUtc: DateTimeOffset)
         (cancellationToken: CancellationToken)
-        : Task<Result<unit, RepositoryError>> =
+        : Task<Result<bool, RepositoryError>> =
         taskResult {
             try
                 use! connection = dataSource.OpenConnectionAsync(cancellationToken)
                 use command = new NpgsqlCommand(markProcessedSql, connection)
                 command.Parameters.AddWithValue("EventId", eventId) |> ignore
+                command.Parameters.AddWithValue("ClaimOwner", claimOwner) |> ignore
+                command.Parameters.AddWithValue("ClaimAttempt", claimAttempt) |> ignore
                 command.Parameters.AddWithValue("ProcessedAtUtc", processedAtUtc) |> ignore
-                let! _ = command.ExecuteNonQueryAsync(cancellationToken)
-                return ()
+                let! affected = command.ExecuteNonQueryAsync(cancellationToken)
+                return affected = 1
             with ex ->
                 return! Error(databaseError "OutboxEventRepository.markProcessed" ex)
         }
@@ -189,19 +253,23 @@ WHERE "Id" = @EventId
     let markFailed
         (dataSource: NpgsqlDataSource)
         (eventId: Guid)
+        (claimOwner: Guid)
+        (claimAttempt: int)
         (nextAttemptAtUtc: DateTimeOffset)
         (failedAtUtc: DateTimeOffset)
         (cancellationToken: CancellationToken)
-        : Task<Result<unit, RepositoryError>> =
+        : Task<Result<bool, RepositoryError>> =
         taskResult {
             try
                 use! connection = dataSource.OpenConnectionAsync(cancellationToken)
                 use command = new NpgsqlCommand(markFailedSql, connection)
                 command.Parameters.AddWithValue("EventId", eventId) |> ignore
+                command.Parameters.AddWithValue("ClaimOwner", claimOwner) |> ignore
+                command.Parameters.AddWithValue("ClaimAttempt", claimAttempt) |> ignore
                 command.Parameters.AddWithValue("NextAttemptAtUtc", nextAttemptAtUtc) |> ignore
                 command.Parameters.AddWithValue("FailedAtUtc", failedAtUtc) |> ignore
-                let! _ = command.ExecuteNonQueryAsync(cancellationToken)
-                return ()
+                let! affected = command.ExecuteNonQueryAsync(cancellationToken)
+                return affected = 1
             with ex ->
                 return! Error(databaseError "OutboxEventRepository.markFailed" ex)
         }

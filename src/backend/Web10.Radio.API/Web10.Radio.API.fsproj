@@ -8,6 +8,7 @@
   <ItemGroup>
     <Compile Include="Configuration.fs" />
     <Compile Include="Application.fs" />
+    <Compile Include="S3Storage.fs" />
     <Compile Include="Events.fs" />
     <Compile Include="BackgroundWorkers.fs" />
     <Compile Include="Health.fs" />
@@ -24,6 +25,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="AWSSDK.S3" Version="4.0.100.3" />
     <PackageReference Include="Dodo.Primitives" Version="5.0.0" />
     <PackageReference Include="FsToolkit.ErrorHandling" Version="5.2.0" />
     <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.16.0" />

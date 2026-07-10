@@ -2,7 +2,6 @@ namespace Web10.Radio.Tests
 
 open System
 open System.Threading
-open System.Threading.Tasks
 open Npgsql
 open NUnit.Framework
 open Web10.Radio.API
@@ -21,146 +20,125 @@ module OutboxEventRepositoryTests =
           CausationId = None
           PayloadJson = "{\"queueItemId\":\"018f12f0-4d20-7000-8000-000000000001\"}" }
 
+    let private claim description result =
+        match result with
+        | Ok(Some lease) -> lease
+        | actual -> Assert.Fail(sprintf "Expected %s to acquire the global outbox dispatch lease, but got %A." description actual); Unchecked.defaultof<_>
+
+    let private assertOkTrue description result =
+        match result with
+        | Ok true -> ()
+        | actual -> Assert.Fail(sprintf "Expected %s to return Ok true, but got %A." description actual)
+
+    let private assertOkFalse description result =
+        match result with
+        | Ok false -> ()
+        | actual -> Assert.Fail(sprintf "Expected %s to return Ok false, but got %A." description actual)
+
     [<Test>]
-    let ``append claimDue concurrency invalid batch and markProcessed persist expected outbox state`` () =
+    let ``global outbox lease excludes overlapping relays and does not skip the earliest unfinished event`` () =
         DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
             task {
                 use dataSource = NpgsqlDataSource.Create(connectionString)
-                let eventId = newId ()
-                let occurredAtUtc = DateTimeOffset(2026, 7, 8, 10, 0, 0, TimeSpan.Zero)
-                let claimedAtUtc = occurredAtUtc.AddSeconds(5.0)
-                let processedAtUtc = occurredAtUtc.AddSeconds(10.0)
+                let occurredAtUtc = DateTimeOffset(2026, 7, 10, 10, 0, 0, TimeSpan.Zero)
+                let firstEventId = newId ()
+                let secondEventId = newId ()
+                let firstOwner = newId ()
+                let secondOwner = newId ()
 
-                let! appendResult = OutboxEventRepository.append dataSource (eventToAppend eventId occurredAtUtc) CancellationToken.None
-                match appendResult with
-                | Ok () -> ()
-                | actual -> Assert.Fail(sprintf "Expected append to succeed, but got %A." actual)
+                for event in [ eventToAppend firstEventId occurredAtUtc; eventToAppend secondEventId (occurredAtUtc.AddMilliseconds(1.0)) ] do
+                    let! appended = OutboxEventRepository.append dataSource event CancellationToken.None
+                    match appended with
+                    | Ok () -> ()
+                    | actual -> Assert.Fail(sprintf "Expected append to succeed, but got %A." actual)
 
-                use connection = new NpgsqlConnection(connectionString)
-                do! connection.OpenAsync()
+                let! firstLeaseResult =
+                    OutboxEventRepository.tryClaimDueOrdered dataSource firstOwner occurredAtUtc 1 CancellationToken.None
 
-                use pendingCommand =
-                    new NpgsqlCommand(
-                        """SELECT "Status", "Attempts", "Payload"::text
-FROM "OutboxEvents"
-WHERE "Id" = @EventId;""",
-                        connection
-                    )
+                let firstLease = claim "the first relay" firstLeaseResult
+                Assert.That(firstLease.Records |> List.length, Is.EqualTo(1))
+                Assert.That((firstLease.Records |> List.exactlyOne).Id, Is.EqualTo(firstEventId))
 
-                pendingCommand.Parameters.AddWithValue("EventId", eventId) |> ignore
-                let! pendingReader = pendingCommand.ExecuteReaderAsync()
-                use pendingReader = pendingReader
-                let! hasPendingRow = pendingReader.ReadAsync()
-                Assert.That(hasPendingRow, Is.True)
-                Assert.That(pendingReader.GetString(0), Is.EqualTo("Pending"))
-                Assert.That(pendingReader.GetInt32(1), Is.EqualTo(0))
-                Assert.That(pendingReader.GetString(2), Does.Contain("queueItemId"))
-                do! pendingReader.CloseAsync()
+                let! overlappingClaim =
+                    OutboxEventRepository.tryClaimDueOrdered dataSource secondOwner occurredAtUtc 1 CancellationToken.None
 
-                let claimTasks =
-                    [| for _ in 1..4 ->
-                           OutboxEventRepository.claimDue dataSource claimedAtUtc 1 CancellationToken.None |]
+                match overlappingClaim with
+                | Ok None -> ()
+                | actual -> Assert.Fail(sprintf "A direct publisher or second relay must not dispatch while the first relay owns the session lease, but got %A." actual)
+                (firstLease :> IDisposable).Dispose()
 
-                let! claimResults = Task.WhenAll(claimTasks)
-                let claimedLists =
-                    claimResults
-                    |> Array.map (function
-                        | Ok records -> records
-                        | Error error -> Assert.Fail(sprintf "claimDue should not fail, but got %A." error); [])
+                let! blockedByEarlierProcessing =
+                    OutboxEventRepository.tryClaimDueOrdered dataSource secondOwner (occurredAtUtc.AddSeconds(1.0)) 1 CancellationToken.None
 
-                let claimedRecords = claimedLists |> Array.collect List.toArray
-                Assert.That(claimedRecords.Length, Is.EqualTo(1))
-                Assert.That(claimedRecords[0].Id, Is.EqualTo(eventId))
-                Assert.That(claimedRecords[0].Attempts, Is.EqualTo(1))
-                Assert.That(claimedLists |> Array.filter List.isEmpty |> Array.length, Is.EqualTo(3))
+                let emptyLease = claim "the relay after the first lease released" blockedByEarlierProcessing
+                Assert.That(emptyLease.Records, Is.Empty, "The second event must not overtake the earlier Processing event.")
+                (emptyLease :> IDisposable).Dispose()
 
-                use processingCommand =
-                    new NpgsqlCommand(
-                        """SELECT "Status", "Attempts", "UpdatedAtUtc"
-FROM "OutboxEvents"
-WHERE "Id" = @EventId;""",
-                        connection
-                    )
+                let! firstProcessed =
+                    OutboxEventRepository.markProcessed dataSource firstEventId firstOwner 1 (occurredAtUtc.AddSeconds(2.0)) CancellationToken.None
 
-                processingCommand.Parameters.AddWithValue("EventId", eventId) |> ignore
-                let! processingReader = processingCommand.ExecuteReaderAsync()
-                use processingReader = processingReader
-                let! hasProcessingRow = processingReader.ReadAsync()
-                Assert.That(hasProcessingRow, Is.True)
-                Assert.That(processingReader.GetString(0), Is.EqualTo("Processing"))
-                Assert.That(processingReader.GetInt32(1), Is.EqualTo(1))
-                Assert.That(processingReader.GetFieldValue<DateTimeOffset>(2), Is.EqualTo(claimedAtUtc))
-                do! processingReader.CloseAsync()
+                assertOkTrue "the first owner terminal update" firstProcessed
 
-                let! invalidBatchResult = OutboxEventRepository.claimDue dataSource claimedAtUtc 0 CancellationToken.None
-                match invalidBatchResult with
-                | Error(InvalidBatchSize 0) -> ()
-                | actual -> Assert.Fail(sprintf "Expected invalid batch size error, but got %A." actual)
+                let! nextLeaseResult =
+                    OutboxEventRepository.tryClaimDueOrdered dataSource secondOwner (occurredAtUtc.AddSeconds(3.0)) 1 CancellationToken.None
 
-                let! markProcessedResult = OutboxEventRepository.markProcessed dataSource eventId processedAtUtc CancellationToken.None
-                match markProcessedResult with
-                | Ok () -> ()
-                | actual -> Assert.Fail(sprintf "Expected markProcessed to succeed, but got %A." actual)
-
-                use processedCommand =
-                    new NpgsqlCommand(
-                        """SELECT "Status", "ProcessedAtUtc", "UpdatedAtUtc"
-FROM "OutboxEvents"
-WHERE "Id" = @EventId;""",
-                        connection
-                    )
-
-                processedCommand.Parameters.AddWithValue("EventId", eventId) |> ignore
-                let! processedReader = processedCommand.ExecuteReaderAsync()
-                use processedReader = processedReader
-                let! hasProcessedRow = processedReader.ReadAsync()
-                Assert.That(hasProcessedRow, Is.True)
-                Assert.That(processedReader.GetString(0), Is.EqualTo("Processed"))
-                Assert.That(processedReader.GetFieldValue<DateTimeOffset>(1), Is.EqualTo(processedAtUtc))
-                Assert.That(processedReader.GetFieldValue<DateTimeOffset>(2), Is.EqualTo(processedAtUtc))
+                let nextLease = claim "the second event after the first completed" nextLeaseResult
+                Assert.That(nextLease.Records |> List.length, Is.EqualTo(1))
+                Assert.That((nextLease.Records |> List.exactlyOne).Id, Is.EqualTo(secondEventId))
+                (nextLease :> IDisposable).Dispose()
             })
 
     [<Test>]
-    let ``claimDue only reclaims Processing rows after processing lease expires`` () =
+    let ``expired outbox attempt cannot overwrite the replacement owner terminal state`` () =
         DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
             task {
                 use dataSource = NpgsqlDataSource.Create(connectionString)
+                let occurredAtUtc = DateTimeOffset(2026, 7, 10, 11, 0, 0, TimeSpan.Zero)
                 let eventId = newId ()
-                let occurredAtUtc = DateTimeOffset(2026, 7, 8, 11, 0, 0, TimeSpan.Zero)
-                let claimedAtUtc = occurredAtUtc.AddSeconds(5.0)
-
-                let! appendResult = OutboxEventRepository.append dataSource (eventToAppend eventId occurredAtUtc) CancellationToken.None
-                match appendResult with
+                let firstOwner = newId ()
+                let replacementOwner = newId ()
+                let! appended = OutboxEventRepository.append dataSource (eventToAppend eventId occurredAtUtc) CancellationToken.None
+                match appended with
                 | Ok () -> ()
                 | actual -> Assert.Fail(sprintf "Expected append to succeed, but got %A." actual)
 
-                let! firstClaim = OutboxEventRepository.claimDue dataSource claimedAtUtc 1 CancellationToken.None
-                match firstClaim with
-                | Ok [ record ] ->
-                    Assert.That(record.Id, Is.EqualTo(eventId))
-                    Assert.That(record.Attempts, Is.EqualTo(1))
-                | actual -> Assert.Fail(sprintf "Expected first claim to return the outbox event once, but got %A." actual)
+                let! firstLeaseResult =
+                    OutboxEventRepository.tryClaimDueOrdered dataSource firstOwner occurredAtUtc 1 CancellationToken.None
 
-                let! notExpiredClaim = OutboxEventRepository.claimDue dataSource (claimedAtUtc.AddSeconds(29.0)) 1 CancellationToken.None
-                match notExpiredClaim with
-                | Ok [] -> ()
-                | actual -> Assert.Fail(sprintf "Expected processing lease to block reclaim at T+29s, but got %A." actual)
+                let firstLease = claim "the original attempt" firstLeaseResult
+                let firstRecord = firstLease.Records |> List.exactlyOne
+                (firstLease :> IDisposable).Dispose()
 
-                let! expiredClaim = OutboxEventRepository.claimDue dataSource (claimedAtUtc.AddSeconds(31.0)) 1 CancellationToken.None
-                match expiredClaim with
-                | Ok [ record ] ->
-                    Assert.That(record.Id, Is.EqualTo(eventId))
-                    Assert.That(record.Attempts, Is.EqualTo(2))
-                | actual -> Assert.Fail(sprintf "Expected processing lease to allow reclaim at T+31s, but got %A." actual)
+                let! replacementLeaseResult =
+                    OutboxEventRepository.tryClaimDueOrdered dataSource replacementOwner (occurredAtUtc.AddSeconds(31.0)) 1 CancellationToken.None
+
+                let replacementLease = claim "the lease-expired replacement attempt" replacementLeaseResult
+                let replacementRecord = replacementLease.Records |> List.exactlyOne
+                Assert.That(replacementRecord.Id, Is.EqualTo(eventId))
+                Assert.That(replacementRecord.ClaimAttempt, Is.EqualTo(firstRecord.ClaimAttempt + 1))
+
+                let! staleSuccess =
+                    OutboxEventRepository.markProcessed dataSource eventId firstRecord.ClaimOwner firstRecord.ClaimAttempt (occurredAtUtc.AddSeconds(32.0)) CancellationToken.None
+
+                let! staleFailure =
+                    OutboxEventRepository.markFailed dataSource eventId firstRecord.ClaimOwner firstRecord.ClaimAttempt (occurredAtUtc.AddMinutes(1.0)) (occurredAtUtc.AddSeconds(32.0)) CancellationToken.None
+
+                assertOkFalse "the stale owner success fence" staleSuccess
+                assertOkFalse "the stale owner failure fence" staleFailure
+
+                let! replacementSuccess =
+                    OutboxEventRepository.markProcessed dataSource eventId replacementRecord.ClaimOwner replacementRecord.ClaimAttempt (occurredAtUtc.AddSeconds(33.0)) CancellationToken.None
+
+                assertOkTrue "the replacement owner success fence" replacementSuccess
+                (replacementLease :> IDisposable).Dispose()
 
                 use connection = new NpgsqlConnection(connectionString)
                 do! connection.OpenAsync()
                 use command =
                     new NpgsqlCommand(
-                        """SELECT "Status", "Attempts", "UpdatedAtUtc"
+                        """SELECT "Status", "Attempts", "ProcessedAtUtc", "NextAttemptAtUtc"
 FROM "OutboxEvents"
-WHERE "Id" = @EventId
-  AND "IsDeleted" = false;""",
+WHERE "Id" = @EventId;""",
                         connection
                     )
 
@@ -169,7 +147,8 @@ WHERE "Id" = @EventId
                 use reader = reader
                 let! hasRow = reader.ReadAsync()
                 Assert.That(hasRow, Is.True)
-                Assert.That(reader.GetString(0), Is.EqualTo("Processing"))
+                Assert.That(reader.GetString(0), Is.EqualTo("Processed"))
                 Assert.That(reader.GetInt32(1), Is.EqualTo(2))
-                Assert.That(reader.GetFieldValue<DateTimeOffset>(2), Is.EqualTo(claimedAtUtc.AddSeconds(31.0)))
+                Assert.That(reader.GetFieldValue<DateTimeOffset>(2), Is.EqualTo(occurredAtUtc.AddSeconds(33.0)))
+                Assert.That(reader.IsDBNull(3), Is.True, "The stale failure must not install a retry schedule on the replacement attempt.")
             })

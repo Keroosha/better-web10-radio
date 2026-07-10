@@ -5,13 +5,13 @@
 ## 1. Контракты и ограничения
 
 - [x] Read `docs/SPEC.md` sections 5 through 12 before coding.
-- [x] Implement exactly the `/api/v0/player/*`, `/api/v0/telegram/*`, and `/api/v0/admin/*` routes listed in `SPEC.md`.
+- [x] Register every `/api/v0/player/*`, `/api/v0/telegram/*`, internal `/api/v0/stream-node/*`, and `/api/v0/admin/*` route pattern listed in `SPEC.md`; admin methods whose request/response contract is not pinned remain explicit `501 admin.contract_unpinned` placeholders.
 - [x] Keep `Web10.Radio.Telegram` on Funogram.
 - [x] Use F# for backend projects.
 - [x] Use ADO.NET only for PostgreSQL access; no ORM and no Dapper.
 - [x] Use soft delete with `IsDeleted`; never delete domain data with `DELETE` from application code.
 - [x] Use `SELECT ... FOR UPDATE SKIP LOCKED` for queue/work claiming.
-- [x] Fail application startup on invalid config.
+- [x] Fail application startup when required configuration is missing or a value violates an implemented validator.
 - [ ] Use DI composition and high-performance structured logging.
 - [ ] Add OTEL traces/metrics for API, Telegram, queue, payment, and stream-node flows.
 - [x] Ban Alpine/libmusl Docker images; use Debian/Ubuntu images for non-.NET infrastructure.
@@ -24,8 +24,8 @@
 - [x] Reference `Web10.Radio.Telegram` and `Web10.Radio.Database` from `Web10.Radio.API`.
 - [x] Add container packaging for API and stream-node.
 - [x] Add configuration binding types for all `WEB10_*` keys from `SPEC.md`.
-- [x] Validate config at startup and terminate with actionable error messages when invalid.
-- [x] Configure DI module registration order: Database, Application services, Telegram adapter, Background workers, API endpoints, Observability.
+- [x] Validate required config before host startup, aggregate actionable errors, and terminate before binding a port when validation fails.
+- [x] Before `builder.Build()`, register Database, application services, Telegram adapter, background workers, API authentication/authorization services, health checks, and observability; after `Build()`, add authentication/authorization middleware, then map health and `/api/v0/*` endpoints.
 - [x] Configure health endpoints for API, Telegram adapter, PostgreSQL, storage, and stream-node heartbeat.
 
 ### Phase B1 — Database, migrations, repositories
@@ -35,20 +35,21 @@
 - [x] Create first migration for the tables listed in `SPEC.md`.
 - [x] Add `IsDeleted BOOLEAN NOT NULL DEFAULT false`, `CreatedAtUtc`, and `UpdatedAtUtc` to mutable tables.
 - [x] Create partial indexes for active rows where useful using `WHERE "IsDeleted" = false`.
+- [x] Enforce active track-file path uniqueness with explicit NULL semantics and forward-migrate legacy duplicates by rewiring references and soft-deleting orphan tracks.
 - [x] Implement ADO.NET connection/transaction helpers.
 - [x] Implement repository helpers that make soft-delete filtering the default.
 - [x] Implement queue claim transaction using the exact SQL pattern from `SPEC.md`.
 - [x] Add integration tests proving concurrent queue workers do not claim the same `PlaybackQueue` row.
-- [x] Add integration tests proving soft-deleted rows do not appear in normal reads.
+- [x] Add integration tests proving soft-deleted rows and parents do not appear in normal reads or cached playback joins.
 
 ### Phase B2 — Domain events and background workers
 
 - [x] Define event envelope fields from `SPEC.md` in F# domain types.
-- [x] Implement in-process event dispatch with `MailboxProcessor` agents for payment, queue, library scan, and stream-node event handling.
-- [x] Persist outbox events before side effects that must survive process restarts.
-- [x] Deduplicate Telegram updates using `TelegramUpdateInbox` before emitting domain events.
-- [x] Implement library scanner job that discovers tracks from configured storage backends and emits `TrackDiscovered`.
-- [x] Implement playback program worker that claims queue items with `FOR UPDATE SKIP LOCKED`, updates metadata, and emits playback events.
+- [x] Implement in-process event dispatch with host-lifetime-bound `MailboxProcessor` agents for payment, Telegram command state, queue, library scan, and stream-node event handling.
+- [x] Persist outbox events before restart-sensitive effects, with global ordering, claim owner/attempt fencing, and relay-only dispatch.
+- [x] Deduplicate Telegram updates using `TelegramUpdateInbox` before emitting domain events; `/request` and `/say` durable events create idempotent domain rows instead of no-op dispatch.
+- [x] Implement library scanner discovery for Local files and page-streamed S3 object metadata, renew the fenced scan lease per page, filter supported audio extensions, and emit `TrackDiscovered`; S3 discovery remains uncached until a separate cache path downloads the object.
+- [x] Implement playback program claim/start plus 30-second fenced lease renewal and authoritative `Played|Failed` completion callbacks; terminal state and `PlaybackEnded` append commit atomically, and stale attempts recover without blocking the queue.
 - [x] Implement cache path for tracks needed for streaming; cache misses are explicit `degraded` state, not silent fallback.
 
 ### Phase B3 — HTTP API
@@ -58,11 +59,12 @@
 - [x] Implement `GET /api/v0/player/stream` returning audio when live and problem details when unavailable.
 - [x] Implement `GET /api/v0/player/song` returning current track link/fallback payload.
 - [x] Implement `GET /api/v0/player/health` returning stream health summary.
-- [x] Implement `POST /api/v0/telegram/webhook` with secret-token validation and update dedupe.
-- [x] Implement `GET /api/v0/telegram/health`.
+- [x] Implement `POST /api/v0/telegram/webhook` with strict secret/body validation, typed Funogram parsing, transactional update/event dedupe, and durable command-state dispatch.
+- [x] Implement `GET /api/v0/telegram/health` with monotonic last update/error state.
+- [x] Implement authenticated stream-node playback lease/completion callbacks with owner/attempt fencing and bounded bodies.
 - [ ] Implement all admin routes listed in `SPEC.md`.
 - [x] Add route-level logging fields: route, status, traceId, correlationId, elapsedMs.
-- [x] Add API integration tests for player state, admin GET/placeholder routes, Telegram webhook dedupe, and problem-details errors.
+- [x] Add API integration tests for player state/SSE/range streaming, complete admin auth matrix, typed Telegram webhook dedupe and domain effects, stream-node callback fencing/body limits, health routes, and problem-details errors.
 
 ### Phase B4 — Telegram bot and Stars payments
 
@@ -98,8 +100,8 @@
 - [ ] Add LoggerMessage source-generated/high-performance logging wrappers or equivalent low-allocation logging pattern.
 - [ ] Add OTEL tracing and metrics for API, Telegram updates, payment flow, queue claims, library scans, and stream-node callbacks.
 - [ ] Add Docker Compose for PostgreSQL, API, frontend placeholder/service URL, stream-node, and optional observability collector.
-- [x] Add Docker Compose smoke path for PostgreSQL, separate migrator, and API startup.
-- [x] Verify Docker Compose applies migration `202607080001` before API startup and `/health/*` endpoints respond.
+- [x] Add Docker Compose smoke path for PostgreSQL, separate migrator, API startup, and a chiseled-compatible managed API liveness healthcheck.
+- [x] Verify `docker compose up --build --wait --wait-timeout 120 api` applies migrations `202607080001`, `202607100001`, and `202607100002`, reaches healthy API liveness, and permits immediate `/health/*` requests without `sleep`.
 - [x] Document backend Compose smoke commands, migration check, and Docker image policy.
 - [ ] Add NUnit integration tests for database, API, Telegram, and stream-node contracts.
 - [ ] Verify all apps can run in containers with required config.

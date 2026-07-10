@@ -13,11 +13,51 @@ open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Diagnostics.HealthChecks
 open Npgsql
 open Web10.Radio.Telegram
+open Funogram.Types
+
+[<RequireQualifiedAccess>]
+module PersistedHeartbeatFreshness =
+    let maxAge = TimeSpan.FromSeconds(30.0)
+
+    let isFresh (nowUtc: DateTimeOffset) (heartbeatAtUtc: DateTimeOffset) =
+        heartbeatAtUtc <= nowUtc && nowUtc - heartbeatAtUtc <= maxAge
 
 type ApiHealthCheck() =
     interface IHealthCheck with
         member _.CheckHealthAsync(_context: HealthCheckContext, _cancellationToken: CancellationToken) =
             HealthCheckResult.Healthy("api reachable") |> Task.FromResult
+
+[<RequireQualifiedAccess>]
+module private ReadinessProbe =
+    let timeout = TimeSpan.FromSeconds(5.0)
+    let localMarker = ReadOnlyMemory<byte>([| 0uy |])
+
+    let createTimeoutToken (cancellationToken: CancellationToken) =
+        let linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+        linked.CancelAfter(timeout)
+        linked
+
+type ITelegramIdentityProbe =
+    abstract member IsAuthenticatedBotAsync: cancellationToken: CancellationToken -> Task<bool>
+
+type FunogramTelegramIdentityProbe(config: BotConfig) =
+    interface ITelegramIdentityProbe with
+        member _.IsAuthenticatedBotAsync(cancellationToken: CancellationToken) =
+            task {
+                use timeout = ReadinessProbe.createTimeoutToken cancellationToken
+
+                let! response =
+                    Funogram.Telegram.Api.getMe
+                    |> Funogram.Api.api config
+                    |> fun workflow -> Async.StartAsTask(workflow, cancellationToken = timeout.Token)
+
+                cancellationToken.ThrowIfCancellationRequested()
+
+                return
+                    match response with
+                    | Ok identity -> identity.IsBot
+                    | Error _ -> false
+            }
 
 type PostgresHealthCheck(dataSource: NpgsqlDataSource) =
     interface IHealthCheck with
@@ -29,59 +69,144 @@ type PostgresHealthCheck(dataSource: NpgsqlDataSource) =
                     use command = new NpgsqlCommand("SELECT 1", connection)
                     let! _ = command.ExecuteScalarAsync(cancellationToken)
                     return HealthCheckResult.Healthy("postgresql reachable")
-                with ex ->
+                with
+                | :? OperationCanceledException when cancellationToken.IsCancellationRequested ->
+                    return! Task.FromCanceled<HealthCheckResult>(cancellationToken)
+                | ex ->
                     return HealthCheckResult.Unhealthy("postgresql unreachable", ex)
             }
 
-type TelegramAdapterHealthCheck(state: ITelegramAdapterState) =
+type TelegramAdapterHealthCheck(identityProbe: ITelegramIdentityProbe) =
     interface IHealthCheck with
-        member _.CheckHealthAsync(_context: HealthCheckContext, _cancellationToken: CancellationToken) =
-            let snapshot = state.Snapshot()
+        member _.CheckHealthAsync(_context: HealthCheckContext, cancellationToken: CancellationToken) =
+            task {
+                try
+                    let! authenticated = identityProbe.IsAuthenticatedBotAsync(cancellationToken)
+                    cancellationToken.ThrowIfCancellationRequested()
 
-            if snapshot.IsConfigured then
-                HealthCheckResult.Healthy("telegram adapter configured")
-            else
-                HealthCheckResult.Unhealthy("telegram adapter not configured")
-            |> Task.FromResult
+                    if authenticated then
+                        return HealthCheckResult.Healthy("telegram getMe authenticated bot identity")
+                    else
+                        return HealthCheckResult.Unhealthy("telegram getMe authentication failed")
+                with
+                | :? OperationCanceledException when cancellationToken.IsCancellationRequested ->
+                    return! Task.FromCanceled<HealthCheckResult>(cancellationToken)
+                | _ ->
+                    return HealthCheckResult.Unhealthy("telegram getMe probe failed")
+            }
 
-type StorageHealthCheck(options: StorageOptions) =
+type StorageHealthCheck(options: StorageOptions, s3: IS3ObjectEnumerator) =
+    let checkLocalWriteability (cancellationToken: CancellationToken) =
+        task {
+            use timeout = ReadinessProbe.createTimeoutToken cancellationToken
+            timeout.Token.ThrowIfCancellationRequested()
+
+            let path = Path.Combine(options.LocalRoot, $".web10-readiness-{Guid.NewGuid():N}.tmp")
+            let mutable created = false
+
+            try
+                do!
+                    task {
+                        use stream =
+                            new FileStream(
+                                path,
+                                FileMode.CreateNew,
+                                FileAccess.Write,
+                                FileShare.None,
+                                1,
+                                FileOptions.Asynchronous
+                            )
+
+                        created <- true
+                        do! stream.WriteAsync(ReadinessProbe.localMarker, timeout.Token)
+                        do! stream.FlushAsync(timeout.Token)
+                    }
+
+                File.Delete(path)
+                created <- false
+            finally
+                if created then
+                    try
+                        File.Delete(path)
+                    with _ ->
+                        ()
+        }
+
     interface IHealthCheck with
-        member _.CheckHealthAsync(_context: HealthCheckContext, _cancellationToken: CancellationToken) =
-            match options.Type with
-            | Local ->
-                if Directory.Exists(options.LocalRoot) then
-                    HealthCheckResult.Healthy("local storage root exists")
-                else
-                    HealthCheckResult.Unhealthy("WEB10_STORAGE__LOCAL_ROOT does not exist")
-            | S3 ->
-                HealthCheckResult.Degraded(
-                    sprintf
-                        "S3 bucket %s configured; connectivity check is implemented with the storage backend phase"
-                        options.S3Bucket
-                )
-            |> Task.FromResult
+        member _.CheckHealthAsync(_context: HealthCheckContext, cancellationToken: CancellationToken) =
+            task {
+                try
+                    match options.Type with
+                    | Local ->
+                        if not (Directory.Exists(options.LocalRoot)) then
+                            return HealthCheckResult.Unhealthy("local storage root does not exist")
+                        else
+                            do! checkLocalWriteability cancellationToken
+                            cancellationToken.ThrowIfCancellationRequested()
+                            return HealthCheckResult.Healthy("local storage create/write/delete succeeded")
+                    | S3 ->
+                        use timeout = ReadinessProbe.createTimeoutToken cancellationToken
+                        do! s3.ProbeBucketAsync(options.S3Bucket, timeout.Token)
+                        cancellationToken.ThrowIfCancellationRequested()
+                        return HealthCheckResult.Healthy("S3 authenticated bucket list probe succeeded")
+                with
+                | :? OperationCanceledException when cancellationToken.IsCancellationRequested ->
+                    return! Task.FromCanceled<HealthCheckResult>(cancellationToken)
+                | _ ->
+                    return
+                        match options.Type with
+                        | Local -> HealthCheckResult.Unhealthy("local storage create/write/delete failed")
+                        | S3 -> HealthCheckResult.Unhealthy("S3 authenticated bucket list probe failed or timed out")
+            }
 
+type StreamNodeHeartbeatHealthCheck(dataSource: NpgsqlDataSource, clock: IClock) =
+    [<Literal>]
+    let latestHeartbeatSql = """SELECT "Status", "HeartbeatAtUtc", "FailureReason"
+FROM "StreamNodeHeartbeats"
+WHERE "IsDeleted" = false
+ORDER BY "HeartbeatAtUtc" DESC, "CreatedAtUtc" DESC
+LIMIT 1;"""
 
-type StreamNodeHeartbeatHealthCheck(state: StreamNodeHeartbeatState, clock: IClock) =
     interface IHealthCheck with
-        member _.CheckHealthAsync(_context: HealthCheckContext, _cancellationToken: CancellationToken) =
-            let result =
-                match state.LastHeartbeatUtc, state.LastFailure with
-                | None, _ ->
-                    HealthCheckResult.Degraded("stream-node heartbeat not received yet")
-                | Some _, Some failure ->
-                    HealthCheckResult.Degraded(sprintf "stream-node reported failure: %s" failure)
-                | Some heartbeatUtc, None when clock.UtcNow - heartbeatUtc <= TimeSpan.FromSeconds(30.0) ->
-                    HealthCheckResult.Healthy("stream-node heartbeat fresh")
-                | Some _, None ->
-                    HealthCheckResult.Degraded("stream-node heartbeat stale")
+        member _.CheckHealthAsync(_context: HealthCheckContext, cancellationToken: CancellationToken) =
+            task {
+                try
+                    use! connection = dataSource.OpenConnectionAsync(cancellationToken)
+                    use command = new NpgsqlCommand(latestHeartbeatSql, connection)
+                    let! reader = command.ExecuteReaderAsync(cancellationToken)
+                    use reader = reader
+                    let! hasRow = reader.ReadAsync(cancellationToken)
 
-            result |> Task.FromResult
+                    if not hasRow then
+                        return HealthCheckResult.Degraded("stream-node heartbeat not received yet")
+                    else
+                        let status = reader.GetString(0)
+                        let heartbeatAtUtc = reader.GetFieldValue<DateTimeOffset>(1)
+                        let hasFailure = not (reader.IsDBNull(2))
+
+                        if not (PersistedHeartbeatFreshness.isFresh clock.UtcNow heartbeatAtUtc) then
+                            return HealthCheckResult.Degraded("stream-node persisted heartbeat stale")
+                        elif hasFailure then
+                            return HealthCheckResult.Degraded("stream-node reported failure")
+                        else
+                            return
+                                match status with
+                                | "Live"
+                                | "Starting" -> HealthCheckResult.Healthy("stream-node persisted heartbeat fresh")
+                                | _ -> HealthCheckResult.Degraded($"stream-node status {status.ToLowerInvariant()}")
+                with
+                | :? OperationCanceledException when cancellationToken.IsCancellationRequested ->
+                    return! Task.FromCanceled<HealthCheckResult>(cancellationToken)
+                | ex ->
+                    return HealthCheckResult.Unhealthy("stream-node persisted heartbeat unavailable", ex)
+            }
 
 module HealthComposition =
     let addHealthChecks (options: Web10Options) (services: IServiceCollection) : IServiceCollection =
         services.AddSingleton<StorageOptions>(options.Storage) |> ignore
+        services |> S3StorageComposition.addS3ObjectStorage options.Storage |> ignore
         services.AddSingleton<StreamNodeHeartbeatState>() |> ignore
+        services.AddSingleton<ITelegramIdentityProbe, FunogramTelegramIdentityProbe>() |> ignore
 
         services
             .AddHealthChecks()

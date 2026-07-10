@@ -16,11 +16,13 @@
     <Compile Include="PlaybackQueueRepositoryTests.fs" />
     <Compile Include="DatabaseSessionResultTests.fs" />
     <Compile Include="RepositoryErrorTests.fs" />
+    <Compile Include="AuditRegressionTests.fs" />
     <Compile Include="OutboxEventRepositoryTests.fs" />
     <Compile Include="TelegramUpdateInboxRepositoryTests.fs" />
     <Compile Include="LibraryScanRepositoryTests.fs" />
     <Compile Include="PaymentRepositoryTests.fs" />
     <Compile Include="PlaybackQueueRepositoryB2Tests.fs" />
+    <Compile Include="HealthOperabilityTests.fs" />
     <Compile Include="BackgroundWorkerTests.fs" />
     <Compile Include="ApiContractTests.fs" />
   </ItemGroup>

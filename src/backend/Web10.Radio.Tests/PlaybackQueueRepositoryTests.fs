@@ -9,61 +9,74 @@ open Web10.Radio.Database.Repositories
 
 module PlaybackQueueRepositoryTests =
     [<Test>]
-    let ``concurrent queue claims never return the same row`` () =
+    let ``simultaneous queue claims create exactly one active owner`` () =
         DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
             task {
                 let trackId = Guid.NewGuid()
                 let firstQueueId = Guid.NewGuid()
                 let secondQueueId = Guid.NewGuid()
-                let firstRequestedAt = DateTimeOffset(2026, 7, 8, 0, 0, 0, TimeSpan.Zero)
-                let secondRequestedAt = firstRequestedAt.AddMinutes(1.0)
-                let fixedClaimedAt = DateTimeOffset(2026, 7, 8, 0, 1, 0, TimeSpan.Zero)
+                let requestedAtUtc = DateTimeOffset(2026, 7, 10, 12, 0, 0, TimeSpan.Zero)
+                let claimedAtUtc = requestedAtUtc.AddMinutes(1.0)
+                let leaseExpiresAtUtc = claimedAtUtc.AddSeconds(30.0)
 
                 use connection = new NpgsqlConnection(connectionString)
                 do! connection.OpenAsync()
-
                 use insertCommand =
                     new NpgsqlCommand(
                         """INSERT INTO "Tracks" ("Id", "Title", "Artist", "IsDeleted")
 VALUES (@TrackId, 'Queue title', 'Queue artist', false);
 
 INSERT INTO "PlaybackQueue" ("Id", "TrackId", "Source", "Status", "Priority", "RequestedAtUtc")
-VALUES (@FirstQueueId, @TrackId, 'playlist', 'Queued', 0, @FirstRequestedAt),
-       (@SecondQueueId, @TrackId, 'playlist', 'Queued', 0, @SecondRequestedAt);""",
+VALUES (@FirstQueueId, @TrackId, 'playlist', 'Queued', 0, @RequestedAtUtc),
+       (@SecondQueueId, @TrackId, 'playlist', 'Queued', 0, @SecondRequestedAtUtc);""",
                         connection
                     )
 
                 insertCommand.Parameters.AddWithValue("TrackId", trackId) |> ignore
                 insertCommand.Parameters.AddWithValue("FirstQueueId", firstQueueId) |> ignore
                 insertCommand.Parameters.AddWithValue("SecondQueueId", secondQueueId) |> ignore
-                insertCommand.Parameters.AddWithValue("FirstRequestedAt", firstRequestedAt) |> ignore
-                insertCommand.Parameters.AddWithValue("SecondRequestedAt", secondRequestedAt) |> ignore
+                insertCommand.Parameters.AddWithValue("RequestedAtUtc", requestedAtUtc) |> ignore
+                insertCommand.Parameters.AddWithValue("SecondRequestedAtUtc", requestedAtUtc.AddMilliseconds(1.0)) |> ignore
                 let! _ = insertCommand.ExecuteNonQueryAsync()
 
                 use dataSource = NpgsqlDataSource.Create(connectionString)
+                let start = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+                let owners = [| Guid.NewGuid(); Guid.NewGuid(); Guid.NewGuid() |]
 
-                let claimTasks =
-                    [| for _ in 1..4 ->
-                           PlaybackQueueRepository.claimNext dataSource fixedClaimedAt CancellationToken.None |]
+                let claim owner =
+                    task {
+                        do! start.Task
+                        return! PlaybackQueueRepository.claimNextDetailed dataSource owner claimedAtUtc leaseExpiresAtUtc CancellationToken.None
+                    }
 
+                let claimTasks = owners |> Array.map claim
+                start.SetResult(())
                 let! results = Task.WhenAll(claimTasks)
-                let claimedIds = results |> Array.choose id
-                let noneCount = results |> Array.filter Option.isNone |> Array.length
 
-                Assert.That(Array.length claimedIds, Is.EqualTo(2))
-                Assert.That(noneCount, Is.EqualTo(2))
-                Assert.That(claimedIds |> Array.distinct |> Array.length, Is.EqualTo(2))
+                let claimed =
+                    results
+                    |> Array.choose (function
+                        | Ok(Some item) -> Some item
+                        | Ok None -> None
+                        | Error error -> Assert.Fail(sprintf "Expected claim to complete without repository error, but got %A." error); None)
 
-                use claimedCountCommand =
+                Assert.That(claimed, Has.Length.EqualTo(1), "The one-active-item invariant must hold even when all callers are released together.")
+                Assert.That(claimed[0].QueueItemId, Is.EqualTo(firstQueueId), "The ordered head is the only item eligible for the winning claim.")
+
+                use stateCommand =
                     new NpgsqlCommand(
-                        """SELECT count(*)
+                        """SELECT
+    count(*) FILTER (WHERE "Status" IN ('Claimed', 'Playing')),
+    count(*) FILTER (WHERE "Status" = 'Queued')
 FROM "PlaybackQueue"
-WHERE "Status" = 'Claimed'
-  AND "ClaimedAtUtc" = @ClaimedAtUtc;""",
+WHERE "IsDeleted" = false;""",
                         connection
                     )
 
-                claimedCountCommand.Parameters.AddWithValue("ClaimedAtUtc", fixedClaimedAt) |> ignore
-                let! claimedCount = claimedCountCommand.ExecuteScalarAsync()
-                Assert.That(Convert.ToInt32(claimedCount), Is.EqualTo(2))
+                let! reader = stateCommand.ExecuteReaderAsync()
+                use reader = reader
+                let! hasRow = reader.ReadAsync()
+                Assert.That(hasRow, Is.True)
+                Assert.That(reader.GetInt64(0), Is.EqualTo(1L))
+                Assert.That(reader.GetInt64(1), Is.EqualTo(1L))
             })

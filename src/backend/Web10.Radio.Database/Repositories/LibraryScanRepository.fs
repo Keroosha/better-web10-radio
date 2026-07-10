@@ -17,7 +17,10 @@ type StorageBackendRecord =
 
 type LibraryScanJobRecord =
     { Id: Guid
-      StorageBackendId: Guid option }
+      StorageBackendId: Guid option
+      ClaimOwner: Guid
+      ClaimAttempt: int
+      LeaseExpiresAtUtc: DateTimeOffset }
 
 type DiscoveredTrackFile =
     { TrackId: Guid
@@ -38,35 +41,70 @@ module LibraryScanRepository =
     SELECT "Id"
     FROM "LibraryScanJobs"
     WHERE "IsDeleted" = false
-      AND "Status" = 'Queued'
-    ORDER BY "RequestedAtUtc" ASC, "CreatedAtUtc" ASC
+      AND (@JobId IS NULL OR "Id" = @JobId)
+      AND (
+          "Status" = 'Queued'
+          OR (
+              "Status" = 'Running'
+              AND ("ClaimLeaseExpiresAtUtc" IS NULL OR "ClaimLeaseExpiresAtUtc" <= @StartedAtUtc)
+          )
+      )
+    ORDER BY
+        CASE WHEN "Status" = 'Running' THEN 0 ELSE 1 END,
+        "RequestedAtUtc" ASC,
+        "CreatedAtUtc" ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1
 )
 UPDATE "LibraryScanJobs" AS job
 SET "Status" = 'Running',
+    "ClaimOwner" = @ClaimOwner,
+    "ClaimAttempt" = job."ClaimAttempt" + 1,
+    "ClaimLeaseExpiresAtUtc" = @LeaseExpiresAtUtc,
     "StartedAtUtc" = @StartedAtUtc,
+    "FinishedAtUtc" = NULL,
+    "FailureReason" = NULL,
     "UpdatedAtUtc" = @StartedAtUtc
 FROM next_job
 WHERE job."Id" = next_job."Id"
-RETURNING job."Id", job."StorageBackendId";"""
+RETURNING job."Id", job."StorageBackendId", job."ClaimOwner", job."ClaimAttempt", job."ClaimLeaseExpiresAtUtc";"""
 
     [<Literal>]
     let private completeJobSql = """UPDATE "LibraryScanJobs"
 SET "Status" = 'Completed',
     "FinishedAtUtc" = @FinishedAtUtc,
+    "ClaimOwner" = NULL,
+    "ClaimLeaseExpiresAtUtc" = NULL,
     "UpdatedAtUtc" = @FinishedAtUtc
 WHERE "Id" = @JobId
-  AND "IsDeleted" = false;"""
+  AND "IsDeleted" = false
+  AND "Status" = 'Running'
+  AND "ClaimOwner" = @ClaimOwner
+  AND "ClaimAttempt" = @ClaimAttempt;"""
 
     [<Literal>]
     let private failJobSql = """UPDATE "LibraryScanJobs"
 SET "Status" = 'Failed',
     "FinishedAtUtc" = @FinishedAtUtc,
     "FailureReason" = @FailureReason,
+    "ClaimOwner" = NULL,
+    "ClaimLeaseExpiresAtUtc" = NULL,
     "UpdatedAtUtc" = @FinishedAtUtc
 WHERE "Id" = @JobId
-  AND "IsDeleted" = false;"""
+  AND "IsDeleted" = false
+  AND "Status" = 'Running'
+  AND "ClaimOwner" = @ClaimOwner
+  AND "ClaimAttempt" = @ClaimAttempt;"""
+
+    [<Literal>]
+    let private renewJobLeaseSql = """UPDATE "LibraryScanJobs"
+SET "ClaimLeaseExpiresAtUtc" = @LeaseExpiresAtUtc,
+    "UpdatedAtUtc" = @RenewedAtUtc
+WHERE "Id" = @JobId
+  AND "IsDeleted" = false
+  AND "Status" = 'Running'
+  AND "ClaimOwner" = @ClaimOwner
+  AND "ClaimAttempt" = @ClaimAttempt;"""
 
     [<Literal>]
     let private getStorageBackendSql = """SELECT "Id", "Name", "Type", "LocalRoot", "S3Bucket"
@@ -100,7 +138,22 @@ VALUES (@TrackId, @Title, @Artist, NULL, NULL, NULL, false, @DiscoveredAtUtc, @D
 VALUES (
     @TrackFileId, @TrackId, @StorageBackendId, @StoragePath, @CachePath, @ContentType, @SizeBytes, @IsCached,
     false, @DiscoveredAtUtc, @DiscoveredAtUtc
-);"""
+)
+ON CONFLICT DO NOTHING
+RETURNING "Id";"""
+
+    [<Literal>]
+    let private softDeleteUnreferencedTrackSql = """UPDATE "Tracks"
+SET "IsDeleted" = true,
+    "UpdatedAtUtc" = @DeletedAtUtc
+WHERE "Id" = @TrackId
+  AND "IsDeleted" = false
+  AND NOT EXISTS (
+      SELECT 1
+      FROM "TrackFiles"
+      WHERE "TrackId" = @TrackId
+        AND "IsDeleted" = false
+  );"""
 
     let private databaseError operation (ex: exn) = DatabaseError(operation, ex.Message)
 
@@ -125,9 +178,19 @@ VALUES (
     let private readNullableString (reader: NpgsqlDataReader) ordinal =
         if reader.IsDBNull(ordinal) then None else Some(reader.GetString(ordinal))
 
-    let claimNextJob
+    let private readJob (reader: NpgsqlDataReader) =
+        { Id = reader.GetGuid(0)
+          StorageBackendId = readNullableGuid reader 1
+          ClaimOwner = reader.GetGuid(2)
+          ClaimAttempt = reader.GetInt32(3)
+          LeaseExpiresAtUtc = reader.GetFieldValue<DateTimeOffset>(4) }
+
+    let private claimJob
         (dataSource: NpgsqlDataSource)
+        (jobId: Guid option)
+        (claimOwner: Guid)
         (startedAtUtc: DateTimeOffset)
+        (leaseExpiresAtUtc: DateTimeOffset)
         (cancellationToken: CancellationToken)
         : Task<Result<LibraryScanJobRecord option, RepositoryError>> =
         taskResult {
@@ -138,38 +201,81 @@ VALUES (
                         (fun connection transaction cancellationToken ->
                             taskResult {
                                 use command = new NpgsqlCommand(claimNextJobSql, connection, transaction)
+                                addNullableUuid command "JobId" jobId
+                                command.Parameters.AddWithValue("ClaimOwner", claimOwner) |> ignore
                                 command.Parameters.AddWithValue("StartedAtUtc", startedAtUtc) |> ignore
+                                command.Parameters.AddWithValue("LeaseExpiresAtUtc", leaseExpiresAtUtc) |> ignore
                                 let! reader = command.ExecuteReaderAsync(cancellationToken)
                                 use reader = reader
                                 let! hasRow = reader.ReadAsync(cancellationToken)
-
-                                if hasRow then
-                                    return
-                                        Some
-                                            { Id = reader.GetGuid(0)
-                                              StorageBackendId = readNullableGuid reader 1 }
-                                else
-                                    return None
+                                return if hasRow then Some(readJob reader) else None
                             })
                         cancellationToken
             with ex ->
-                return! Error(databaseError "LibraryScanRepository.claimNextJob" ex)
+                return! Error(databaseError "LibraryScanRepository.claimJob" ex)
+        }
+
+    let claimNextJob
+        (dataSource: NpgsqlDataSource)
+        (claimOwner: Guid)
+        (startedAtUtc: DateTimeOffset)
+        (leaseExpiresAtUtc: DateTimeOffset)
+        (cancellationToken: CancellationToken)
+        : Task<Result<LibraryScanJobRecord option, RepositoryError>> =
+        claimJob dataSource None claimOwner startedAtUtc leaseExpiresAtUtc cancellationToken
+
+    let claimJobById
+        (dataSource: NpgsqlDataSource)
+        (jobId: Guid)
+        (claimOwner: Guid)
+        (startedAtUtc: DateTimeOffset)
+        (leaseExpiresAtUtc: DateTimeOffset)
+        (cancellationToken: CancellationToken)
+        : Task<Result<LibraryScanJobRecord option, RepositoryError>> =
+        claimJob dataSource (Some jobId) claimOwner startedAtUtc leaseExpiresAtUtc cancellationToken
+
+    let renewJobLease
+        (dataSource: NpgsqlDataSource)
+        (jobId: Guid)
+        (claimOwner: Guid)
+        (claimAttempt: int)
+        (leaseExpiresAtUtc: DateTimeOffset)
+        (renewedAtUtc: DateTimeOffset)
+        (cancellationToken: CancellationToken)
+        : Task<Result<bool, RepositoryError>> =
+        taskResult {
+            try
+                use! connection = dataSource.OpenConnectionAsync(cancellationToken)
+                use command = new NpgsqlCommand(renewJobLeaseSql, connection)
+                command.Parameters.AddWithValue("JobId", jobId) |> ignore
+                command.Parameters.AddWithValue("ClaimOwner", claimOwner) |> ignore
+                command.Parameters.AddWithValue("ClaimAttempt", claimAttempt) |> ignore
+                command.Parameters.AddWithValue("LeaseExpiresAtUtc", leaseExpiresAtUtc) |> ignore
+                command.Parameters.AddWithValue("RenewedAtUtc", renewedAtUtc) |> ignore
+                let! affected = command.ExecuteNonQueryAsync(cancellationToken)
+                return affected = 1
+            with ex ->
+                return! Error(databaseError "LibraryScanRepository.renewJobLease" ex)
         }
 
     let completeJobInTransaction
         (connection: NpgsqlConnection)
         (transaction: NpgsqlTransaction)
         (jobId: Guid)
+        (claimOwner: Guid)
+        (claimAttempt: int)
         (finishedAtUtc: DateTimeOffset)
         (cancellationToken: CancellationToken)
-        : Task<Result<unit, RepositoryError>> =
+        : Task<Result<bool, RepositoryError>> =
         taskResult {
             try
                 use command = new NpgsqlCommand(completeJobSql, connection, transaction)
                 command.Parameters.AddWithValue("JobId", jobId) |> ignore
+                command.Parameters.AddWithValue("ClaimOwner", claimOwner) |> ignore
+                command.Parameters.AddWithValue("ClaimAttempt", claimAttempt) |> ignore
                 command.Parameters.AddWithValue("FinishedAtUtc", finishedAtUtc) |> ignore
-                let! _ = command.ExecuteNonQueryAsync(cancellationToken)
-                return ()
+                let! affected = command.ExecuteNonQueryAsync(cancellationToken)
+                return affected = 1
             with ex ->
                 return! Error(databaseError "LibraryScanRepository.completeJobInTransaction" ex)
         }
@@ -177,30 +283,37 @@ VALUES (
     let completeJob
         (dataSource: NpgsqlDataSource)
         (jobId: Guid)
+        (claimOwner: Guid)
+        (claimAttempt: int)
         (finishedAtUtc: DateTimeOffset)
         (cancellationToken: CancellationToken)
-        : Task<Result<unit, RepositoryError>> =
+        : Task<Result<bool, RepositoryError>> =
         DatabaseSession.withTransactionResult
             dataSource
-            (fun connection transaction cancellationToken -> completeJobInTransaction connection transaction jobId finishedAtUtc cancellationToken)
+            (fun connection transaction cancellationToken ->
+                completeJobInTransaction connection transaction jobId claimOwner claimAttempt finishedAtUtc cancellationToken)
             cancellationToken
 
     let failJobInTransaction
         (connection: NpgsqlConnection)
         (transaction: NpgsqlTransaction)
         (jobId: Guid)
+        (claimOwner: Guid)
+        (claimAttempt: int)
         (finishedAtUtc: DateTimeOffset)
         (failureReason: string)
         (cancellationToken: CancellationToken)
-        : Task<Result<unit, RepositoryError>> =
+        : Task<Result<bool, RepositoryError>> =
         taskResult {
             try
                 use command = new NpgsqlCommand(failJobSql, connection, transaction)
                 command.Parameters.AddWithValue("JobId", jobId) |> ignore
+                command.Parameters.AddWithValue("ClaimOwner", claimOwner) |> ignore
+                command.Parameters.AddWithValue("ClaimAttempt", claimAttempt) |> ignore
                 command.Parameters.AddWithValue("FinishedAtUtc", finishedAtUtc) |> ignore
                 command.Parameters.AddWithValue("FailureReason", failureReason) |> ignore
-                let! _ = command.ExecuteNonQueryAsync(cancellationToken)
-                return ()
+                let! affected = command.ExecuteNonQueryAsync(cancellationToken)
+                return affected = 1
             with ex ->
                 return! Error(databaseError "LibraryScanRepository.failJobInTransaction" ex)
         }
@@ -208,13 +321,16 @@ VALUES (
     let failJob
         (dataSource: NpgsqlDataSource)
         (jobId: Guid)
+        (claimOwner: Guid)
+        (claimAttempt: int)
         (finishedAtUtc: DateTimeOffset)
         (failureReason: string)
         (cancellationToken: CancellationToken)
-        : Task<Result<unit, RepositoryError>> =
+        : Task<Result<bool, RepositoryError>> =
         DatabaseSession.withTransactionResult
             dataSource
-            (fun connection transaction cancellationToken -> failJobInTransaction connection transaction jobId finishedAtUtc failureReason cancellationToken)
+            (fun connection transaction cancellationToken ->
+                failJobInTransaction connection transaction jobId claimOwner claimAttempt finishedAtUtc failureReason cancellationToken)
             cancellationToken
 
     let getStorageBackend
@@ -270,31 +386,35 @@ VALUES (
         (cancellationToken: CancellationToken)
         : Task<Result<bool, RepositoryError>> =
         taskResult {
-            let! exists = activeTrackFileExists connection transaction trackFile.StorageBackendId trackFile.StoragePath cancellationToken
+            try
+                use trackCommand = new NpgsqlCommand(insertTrackSql, connection, transaction)
+                trackCommand.Parameters.AddWithValue("TrackId", trackFile.TrackId) |> ignore
+                trackCommand.Parameters.AddWithValue("Title", trackFile.Title) |> ignore
+                trackCommand.Parameters.AddWithValue("Artist", trackFile.Artist) |> ignore
+                trackCommand.Parameters.AddWithValue("DiscoveredAtUtc", trackFile.DiscoveredAtUtc) |> ignore
+                let! _ = trackCommand.ExecuteNonQueryAsync(cancellationToken)
 
-            if exists then
-                return false
-            else
-                try
-                    use trackCommand = new NpgsqlCommand(insertTrackSql, connection, transaction)
-                    trackCommand.Parameters.AddWithValue("TrackId", trackFile.TrackId) |> ignore
-                    trackCommand.Parameters.AddWithValue("Title", trackFile.Title) |> ignore
-                    trackCommand.Parameters.AddWithValue("Artist", trackFile.Artist) |> ignore
-                    trackCommand.Parameters.AddWithValue("DiscoveredAtUtc", trackFile.DiscoveredAtUtc) |> ignore
-                    let! _ = trackCommand.ExecuteNonQueryAsync(cancellationToken)
+                use trackFileCommand = new NpgsqlCommand(insertTrackFileSql, connection, transaction)
+                trackFileCommand.Parameters.AddWithValue("TrackFileId", trackFile.TrackFileId) |> ignore
+                trackFileCommand.Parameters.AddWithValue("TrackId", trackFile.TrackId) |> ignore
+                addNullableUuid trackFileCommand "StorageBackendId" trackFile.StorageBackendId
+                trackFileCommand.Parameters.AddWithValue("StoragePath", trackFile.StoragePath) |> ignore
+                addNullableText trackFileCommand "CachePath" trackFile.CachePath
+                addNullableText trackFileCommand "ContentType" trackFile.ContentType
+                addNullableInt64 trackFileCommand "SizeBytes" trackFile.SizeBytes
+                trackFileCommand.Parameters.AddWithValue("IsCached", trackFile.IsCached) |> ignore
+                trackFileCommand.Parameters.AddWithValue("DiscoveredAtUtc", trackFile.DiscoveredAtUtc) |> ignore
+                let! inserted = trackFileCommand.ExecuteScalarAsync(cancellationToken)
 
-                    use trackFileCommand = new NpgsqlCommand(insertTrackFileSql, connection, transaction)
-                    trackFileCommand.Parameters.AddWithValue("TrackFileId", trackFile.TrackFileId) |> ignore
-                    trackFileCommand.Parameters.AddWithValue("TrackId", trackFile.TrackId) |> ignore
-                    addNullableUuid trackFileCommand "StorageBackendId" trackFile.StorageBackendId
-                    trackFileCommand.Parameters.AddWithValue("StoragePath", trackFile.StoragePath) |> ignore
-                    addNullableText trackFileCommand "CachePath" trackFile.CachePath
-                    addNullableText trackFileCommand "ContentType" trackFile.ContentType
-                    addNullableInt64 trackFileCommand "SizeBytes" trackFile.SizeBytes
-                    trackFileCommand.Parameters.AddWithValue("IsCached", trackFile.IsCached) |> ignore
-                    trackFileCommand.Parameters.AddWithValue("DiscoveredAtUtc", trackFile.DiscoveredAtUtc) |> ignore
-                    let! _ = trackFileCommand.ExecuteNonQueryAsync(cancellationToken)
-                    return true
-                with ex ->
-                    return! Error(databaseError "LibraryScanRepository.insertDiscoveredTrackInTransaction" ex)
+                match inserted with
+                | null
+                | :? DBNull ->
+                    use softDeleteCommand = new NpgsqlCommand(softDeleteUnreferencedTrackSql, connection, transaction)
+                    softDeleteCommand.Parameters.AddWithValue("TrackId", trackFile.TrackId) |> ignore
+                    softDeleteCommand.Parameters.AddWithValue("DeletedAtUtc", trackFile.DiscoveredAtUtc) |> ignore
+                    let! _ = softDeleteCommand.ExecuteNonQueryAsync(cancellationToken)
+                    return false
+                | _ -> return true
+            with ex ->
+                return! Error(databaseError "LibraryScanRepository.insertDiscoveredTrackInTransaction" ex)
         }

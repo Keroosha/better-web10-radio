@@ -236,6 +236,13 @@ LIMIT 1;"""
               BitrateKbps = 0
               StartedAtUtc = ApiTime.toIsoUtc nowUtc
               OfflineReason = "stream-node not connected" }
+        | Some heartbeat when not (PersistedHeartbeatFreshness.isFresh nowUtc heartbeat.HeartbeatAtUtc) ->
+            { Status = "offline"
+              PublicAudioUrl = "/api/v0/player/stream"
+              RtmpRelay = "telegram"
+              BitrateKbps = 0
+              StartedAtUtc = ApiTime.toIsoUtc heartbeat.HeartbeatAtUtc
+              OfflineReason = "stream-node heartbeat stale" }
         | Some heartbeat ->
             let status = mapStreamStatus heartbeat.Status
             let offlineReason =
@@ -256,6 +263,13 @@ LIMIT 1;"""
               BitrateKbps = bitrate
               StartedAtUtc = ApiTime.toIsoUtc heartbeat.HeartbeatAtUtc
               OfflineReason = offlineReason }
+
+    let private isStreamReadableHeartbeat (clock: IClock) heartbeat =
+        PersistedHeartbeatFreshness.isFresh clock.UtcNow heartbeat.HeartbeatAtUtc
+        && match mapStreamStatus heartbeat.Status with
+           | "live"
+           | "degraded" -> true
+           | _ -> false
 
     let private loadLatestHeartbeat (connection: NpgsqlConnection) (cancellationToken: CancellationToken) =
         task {
@@ -540,23 +554,29 @@ LIMIT 1;"""
                 return Error(databaseError "PlayerStateReadModel.loadSocialLinks" ex)
         }
 
-    let loadStreamFile (dataSource: NpgsqlDataSource) (cancellationToken: CancellationToken) : Task<Result<StreamFileDto option, RepositoryError>> =
+    let loadStreamFile (dataSource: NpgsqlDataSource) (clock: IClock) (cancellationToken: CancellationToken) : Task<Result<StreamFileDto option, RepositoryError>> =
         task {
             try
                 use! connection = dataSource.OpenConnectionAsync(cancellationToken)
-                use command = new NpgsqlCommand(streamFileSql, connection)
-                let! reader = command.ExecuteReaderAsync(cancellationToken)
-                use reader = reader
-                let! hasRow = reader.ReadAsync(cancellationToken)
+                let! heartbeat = loadLatestHeartbeat connection cancellationToken
 
-                if hasRow then
-                    return
-                        Ok(
-                            Some
-                                { CachePath = reader.GetString(0)
-                                  ContentType = readNullableString reader 1 |> Option.defaultValue "audio/mpeg" }
-                        )
-                else
+                match heartbeat with
+                | Some current when isStreamReadableHeartbeat clock current ->
+                    use command = new NpgsqlCommand(streamFileSql, connection)
+                    let! reader = command.ExecuteReaderAsync(cancellationToken)
+                    use reader = reader
+                    let! hasRow = reader.ReadAsync(cancellationToken)
+
+                    if hasRow then
+                        return
+                            Ok(
+                                Some
+                                    { CachePath = reader.GetString(0)
+                                      ContentType = readNullableString reader 1 |> Option.defaultValue "audio/mpeg" }
+                            )
+                    else
+                        return Ok None
+                | _ ->
                     return Ok None
             with ex ->
                 return Error(databaseError "PlayerStateReadModel.loadStreamFile" ex)

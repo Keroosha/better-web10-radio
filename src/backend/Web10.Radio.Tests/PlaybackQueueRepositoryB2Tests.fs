@@ -11,145 +11,251 @@ module PlaybackQueueRepositoryB2Tests =
     let private newId () =
         (UuidV7IdGenerator() :> IIdGenerator).NewId()
 
+    let private claim description result =
+        match result with
+        | Ok(Some item) -> item
+        | actual -> Assert.Fail(sprintf "Expected %s to claim a queue item, but got %A." description actual); Unchecked.defaultof<_>
+
+    let private assertOkTrue description result =
+        match result with
+        | Ok true -> ()
+        | actual -> Assert.Fail(sprintf "Expected %s to return Ok true, but got %A." description actual)
+
+    let private assertOkFalse description result =
+        match result with
+        | Ok false -> ()
+        | actual -> Assert.Fail(sprintf "Expected %s to return Ok false, but got %A." description actual)
+
     [<Test>]
-    let ``detailed claim finds newest cached file and markPlaying persists started state`` () =
+    let ``Playing to Played releases the active queue slot for the next ordered item`` () =
         DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
             task {
-                let trackId = newId ()
-                let olderTrackFileId = newId ()
-                let newestTrackFileId = newId ()
-                let queueItemId = newId ()
-                let requestedAtUtc = DateTimeOffset(2026, 7, 8, 14, 0, 0, TimeSpan.Zero)
-                let olderUpdatedAtUtc = requestedAtUtc.AddMinutes(-10.0)
-                let newestUpdatedAtUtc = requestedAtUtc.AddMinutes(-1.0)
-                let claimedAtUtc = requestedAtUtc.AddSeconds(30.0)
-                let startedAtUtc = requestedAtUtc.AddSeconds(45.0)
-                let newestCachePath = "/cache/newest.mp3"
+                let firstTrackId = newId ()
+                let secondTrackId = newId ()
+                let firstQueueItemId = newId ()
+                let secondQueueItemId = newId ()
+                let firstOwner = newId ()
+                let secondOwner = newId ()
+                let requestedAtUtc = DateTimeOffset(2026, 7, 10, 13, 0, 0, TimeSpan.Zero)
 
                 use connection = new NpgsqlConnection(connectionString)
                 do! connection.OpenAsync()
                 use insertCommand =
                     new NpgsqlCommand(
                         """INSERT INTO "Tracks" ("Id", "Title", "Artist", "IsDeleted")
-VALUES (@TrackId, 'Cached title', 'Cached artist', false);
+VALUES (@FirstTrackId, 'First title', 'Artist', false),
+       (@SecondTrackId, 'Second title', 'Artist', false);
 
-INSERT INTO "TrackFiles" (
-    "Id", "TrackId", "StoragePath", "CachePath", "ContentType", "SizeBytes", "IsCached", "CreatedAtUtc", "UpdatedAtUtc", "IsDeleted"
-)
-VALUES
-    (@OlderTrackFileId, @TrackId, '/music/older.mp3', '/cache/older.mp3', 'audio/mpeg', 1000, true, @OlderUpdatedAtUtc, @OlderUpdatedAtUtc, false),
-    (@NewestTrackFileId, @TrackId, '/music/newest.mp3', @NewestCachePath, 'audio/mpeg', 1000, true, @NewestUpdatedAtUtc, @NewestUpdatedAtUtc, false);
-
-INSERT INTO "PlaybackQueue" ("Id", "TrackId", "Source", "Status", "Priority", "RequestedAtUtc", "CreatedAtUtc", "UpdatedAtUtc", "IsDeleted")
-VALUES (@QueueItemId, @TrackId, 'playlist', 'Queued', 10, @RequestedAtUtc, @RequestedAtUtc, @RequestedAtUtc, false);""",
+INSERT INTO "PlaybackQueue" ("Id", "TrackId", "Source", "Status", "Priority", "RequestedAtUtc")
+VALUES (@FirstQueueItemId, @FirstTrackId, 'playlist', 'Queued', 0, @RequestedAtUtc),
+       (@SecondQueueItemId, @SecondTrackId, 'playlist', 'Queued', 0, @SecondRequestedAtUtc);""",
                         connection
                     )
 
-                insertCommand.Parameters.AddWithValue("TrackId", trackId) |> ignore
-                insertCommand.Parameters.AddWithValue("OlderTrackFileId", olderTrackFileId) |> ignore
-                insertCommand.Parameters.AddWithValue("NewestTrackFileId", newestTrackFileId) |> ignore
-                insertCommand.Parameters.AddWithValue("QueueItemId", queueItemId) |> ignore
-                insertCommand.Parameters.AddWithValue("OlderUpdatedAtUtc", olderUpdatedAtUtc) |> ignore
-                insertCommand.Parameters.AddWithValue("NewestUpdatedAtUtc", newestUpdatedAtUtc) |> ignore
-                insertCommand.Parameters.AddWithValue("NewestCachePath", newestCachePath) |> ignore
+                insertCommand.Parameters.AddWithValue("FirstTrackId", firstTrackId) |> ignore
+                insertCommand.Parameters.AddWithValue("SecondTrackId", secondTrackId) |> ignore
+                insertCommand.Parameters.AddWithValue("FirstQueueItemId", firstQueueItemId) |> ignore
+                insertCommand.Parameters.AddWithValue("SecondQueueItemId", secondQueueItemId) |> ignore
                 insertCommand.Parameters.AddWithValue("RequestedAtUtc", requestedAtUtc) |> ignore
+                insertCommand.Parameters.AddWithValue("SecondRequestedAtUtc", requestedAtUtc.AddSeconds(1.0)) |> ignore
                 let! _ = insertCommand.ExecuteNonQueryAsync()
 
                 use dataSource = NpgsqlDataSource.Create(connectionString)
-                let! claimResult = PlaybackQueueRepository.claimNextDetailed dataSource claimedAtUtc CancellationToken.None
-                match claimResult with
-                | Ok(Some claimedItem) ->
-                    Assert.That(claimedItem.QueueItemId, Is.EqualTo(queueItemId))
-                    Assert.That(claimedItem.TrackId, Is.EqualTo(Some trackId))
-                | actual -> Assert.Fail(sprintf "Expected queue item to be claimed, but got %A." actual)
+                let firstClaimedAtUtc = requestedAtUtc.AddSeconds(10.0)
+                let firstClaim =
+                    PlaybackQueueRepository.claimNextDetailed dataSource firstOwner firstClaimedAtUtc (firstClaimedAtUtc.AddSeconds(30.0)) CancellationToken.None
 
-                let! cacheResult = PlaybackQueueRepository.findCachedTrackFile dataSource trackId CancellationToken.None
-                match cacheResult with
-                | Ok(Some cachePath) -> Assert.That(cachePath, Is.EqualTo(newestCachePath))
-                | actual -> Assert.Fail(sprintf "Expected newest cache path, but got %A." actual)
+                let! firstClaim = firstClaim
+                let firstItem = claim "the first item" firstClaim
+                Assert.That(firstItem.QueueItemId, Is.EqualTo(firstQueueItemId))
 
-                let! markPlayingResult = PlaybackQueueRepository.markPlaying dataSource queueItemId startedAtUtc CancellationToken.None
-                match markPlayingResult with
-                | Ok true -> ()
-                | actual -> Assert.Fail(sprintf "Expected markPlaying to update claimed row, but got %A." actual)
+                let! started =
+                    PlaybackQueueRepository.markPlaying
+                        dataSource
+                        firstItem.QueueItemId
+                        firstItem.ClaimOwner
+                        firstItem.ClaimAttempt
+                        (requestedAtUtc.AddSeconds(11.0))
+                        (requestedAtUtc.AddSeconds(41.0))
+                        CancellationToken.None
+
+                assertOkTrue "the owned Playing transition" started
+
+                let! played =
+                    PlaybackQueueRepository.markPlayed
+                        dataSource
+                        firstItem.QueueItemId
+                        firstItem.ClaimOwner
+                        firstItem.ClaimAttempt
+                        (requestedAtUtc.AddSeconds(12.0))
+                        CancellationToken.None
+
+                assertOkTrue "the owned Played completion" played
+
+                let! secondClaim =
+                    PlaybackQueueRepository.claimNextDetailed
+                        dataSource
+                        secondOwner
+                        (requestedAtUtc.AddSeconds(13.0))
+                        (requestedAtUtc.AddSeconds(43.0))
+                        CancellationToken.None
+
+                let secondItem = claim "the next item after a successful completion" secondClaim
+                Assert.That(secondItem.QueueItemId, Is.EqualTo(secondQueueItemId))
 
                 use command =
                     new NpgsqlCommand(
-                        """SELECT "Status", "ClaimedAtUtc", "StartedAtUtc", "UpdatedAtUtc"
+                        """SELECT "Status", "FinishedAtUtc"
 FROM "PlaybackQueue"
 WHERE "Id" = @QueueItemId;""",
                         connection
                     )
 
-                command.Parameters.AddWithValue("QueueItemId", queueItemId) |> ignore
+                command.Parameters.AddWithValue("QueueItemId", firstQueueItemId) |> ignore
                 let! reader = command.ExecuteReaderAsync()
                 use reader = reader
                 let! hasRow = reader.ReadAsync()
                 Assert.That(hasRow, Is.True)
-                Assert.That(reader.GetString(0), Is.EqualTo("Playing"))
-                Assert.That(reader.GetFieldValue<DateTimeOffset>(1), Is.EqualTo(claimedAtUtc))
-                Assert.That(reader.GetFieldValue<DateTimeOffset>(2), Is.EqualTo(startedAtUtc))
-                Assert.That(reader.GetFieldValue<DateTimeOffset>(3), Is.EqualTo(startedAtUtc))
+                Assert.That(reader.GetString(0), Is.EqualTo("Played"))
+                Assert.That(reader.GetFieldValue<DateTimeOffset>(1), Is.EqualTo(requestedAtUtc.AddSeconds(12.0)))
             })
 
     [<Test>]
-    let ``cache miss markFailed persists failure reason on claimed queue item`` () =
+    let ``expired pre-start claim is reclaimed, stale owner cannot start, and authoritative failure releases next item`` () =
         DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
             task {
-                let trackId = newId ()
-                let queueItemId = newId ()
-                let requestedAtUtc = DateTimeOffset(2026, 7, 8, 15, 0, 0, TimeSpan.Zero)
-                let claimedAtUtc = requestedAtUtc.AddSeconds(30.0)
-                let finishedAtUtc = requestedAtUtc.AddSeconds(45.0)
+                let recoverableTrackId = newId ()
+                let nextTrackId = newId ()
+                let recoverableQueueItemId = newId ()
+                let nextQueueItemId = newId ()
+                let firstOwner = newId ()
+                let replacementOwner = newId ()
+                let nextOwner = newId ()
+                let requestedAtUtc = DateTimeOffset(2026, 7, 10, 14, 0, 0, TimeSpan.Zero)
 
                 use connection = new NpgsqlConnection(connectionString)
                 do! connection.OpenAsync()
                 use insertCommand =
                     new NpgsqlCommand(
                         """INSERT INTO "Tracks" ("Id", "Title", "Artist", "IsDeleted")
-VALUES (@TrackId, 'Missing cache title', 'Missing cache artist', false);
-
-INSERT INTO "PlaybackQueue" (
-    "Id", "TrackId", "Source", "Status", "Priority", "RequestedAtUtc", "ClaimedAtUtc", "CreatedAtUtc", "UpdatedAtUtc", "IsDeleted"
-)
-VALUES (@QueueItemId, @TrackId, 'playlist', 'Claimed', 0, @RequestedAtUtc, @ClaimedAtUtc, @RequestedAtUtc, @ClaimedAtUtc, false);""",
+VALUES (@RecoverableTrackId, 'Recoverable title', 'Artist', false),
+       (@NextTrackId, 'Next title', 'Artist', false);
+INSERT INTO "PlaybackQueue" ("Id", "TrackId", "Source", "Status", "Priority", "RequestedAtUtc")
+VALUES (@RecoverableQueueItemId, @RecoverableTrackId, 'playlist', 'Queued', 0, @RequestedAtUtc),
+       (@NextQueueItemId, @NextTrackId, 'playlist', 'Queued', 0, @NextRequestedAtUtc);""",
                         connection
                     )
 
-                insertCommand.Parameters.AddWithValue("TrackId", trackId) |> ignore
-                insertCommand.Parameters.AddWithValue("QueueItemId", queueItemId) |> ignore
-                insertCommand.Parameters.AddWithValue("RequestedAtUtc", requestedAtUtc) |> ignore
-                insertCommand.Parameters.AddWithValue("ClaimedAtUtc", claimedAtUtc) |> ignore
+                for name, value in
+                    [ "RecoverableTrackId", box recoverableTrackId
+                      "NextTrackId", box nextTrackId
+                      "RecoverableQueueItemId", box recoverableQueueItemId
+                      "NextQueueItemId", box nextQueueItemId
+                      "RequestedAtUtc", box requestedAtUtc
+                      "NextRequestedAtUtc", box (requestedAtUtc.AddSeconds(1.0)) ] do
+                    insertCommand.Parameters.AddWithValue(name, value) |> ignore
+
                 let! _ = insertCommand.ExecuteNonQueryAsync()
-
                 use dataSource = NpgsqlDataSource.Create(connectionString)
-                let! cacheResult = PlaybackQueueRepository.findCachedTrackFile dataSource trackId CancellationToken.None
-                match cacheResult with
-                | Ok None -> ()
-                | actual -> Assert.Fail(sprintf "Expected no cached track file, but got %A." actual)
+                let! firstClaim =
+                    PlaybackQueueRepository.claimNextDetailed dataSource firstOwner requestedAtUtc (requestedAtUtc.AddSeconds(30.0)) CancellationToken.None
 
-                let! markFailedResult =
-                    PlaybackQueueRepository.markFailed dataSource queueItemId finishedAtUtc "cache path unavailable" CancellationToken.None
+                let firstItem = claim "the original pre-start worker" firstClaim
+                Assert.That(firstItem.QueueItemId, Is.EqualTo(recoverableQueueItemId))
 
-                match markFailedResult with
-                | Ok true -> ()
-                | actual -> Assert.Fail(sprintf "Expected markFailed to update claimed row, but got %A." actual)
+                let! replacementClaim =
+                    PlaybackQueueRepository.claimNextDetailed
+                        dataSource
+                        replacementOwner
+                        (requestedAtUtc.AddSeconds(31.0))
+                        (requestedAtUtc.AddMinutes(1.0))
+                        CancellationToken.None
+
+                let replacementItem = claim "the worker reclaiming an expired pre-start claim" replacementClaim
+                Assert.That(replacementItem.QueueItemId, Is.EqualTo(recoverableQueueItemId))
+                Assert.That(replacementItem.ClaimAttempt, Is.EqualTo(firstItem.ClaimAttempt + 1))
+
+                let! staleStart =
+                    PlaybackQueueRepository.markPlaying
+                        dataSource
+                        recoverableQueueItemId
+                        firstItem.ClaimOwner
+                        firstItem.ClaimAttempt
+                        (requestedAtUtc.AddSeconds(32.0))
+                        (requestedAtUtc.AddMinutes(1.0))
+                        CancellationToken.None
+
+                assertOkFalse "the stale pre-start owner's Playing transition" staleStart
+
+                let! staleFailure =
+                    PlaybackQueueRepository.markFailed
+                        dataSource
+                        recoverableQueueItemId
+                        firstItem.ClaimOwner
+                        firstItem.ClaimAttempt
+                        (requestedAtUtc.AddSeconds(32.0))
+                        "old worker failed"
+                        CancellationToken.None
+
+                assertOkFalse "the stale pre-start owner's Failed transition" staleFailure
+
+                let! replacementFailed =
+                    PlaybackQueueRepository.markFailed
+                        dataSource
+                        recoverableQueueItemId
+                        replacementItem.ClaimOwner
+                        replacementItem.ClaimAttempt
+                        (requestedAtUtc.AddSeconds(33.0))
+                        "replacement cache failure"
+                        CancellationToken.None
+
+                assertOkTrue "the authoritative replacement failure transition" replacementFailed
+
+                let! nextClaim =
+                    PlaybackQueueRepository.claimNextDetailed
+                        dataSource
+                        nextOwner
+                        (requestedAtUtc.AddSeconds(34.0))
+                        (requestedAtUtc.AddMinutes(2.0))
+                        CancellationToken.None
+
+                let nextItem = claim "the ordered item released by authoritative failure" nextClaim
+                Assert.That(nextItem.QueueItemId, Is.EqualTo(nextQueueItemId))
+                Assert.That(nextItem.ClaimAttempt, Is.EqualTo(1))
 
                 use command =
                     new NpgsqlCommand(
-                        """SELECT "Status", "FinishedAtUtc", "FailureReason", "UpdatedAtUtc"
+                        """SELECT "Status", "ClaimAttempt", "FailureReason", "FinishedAtUtc"
 FROM "PlaybackQueue"
 WHERE "Id" = @QueueItemId;""",
                         connection
                     )
 
-                command.Parameters.AddWithValue("QueueItemId", queueItemId) |> ignore
+                command.Parameters.AddWithValue("QueueItemId", recoverableQueueItemId) |> ignore
                 let! reader = command.ExecuteReaderAsync()
                 use reader = reader
                 let! hasRow = reader.ReadAsync()
                 Assert.That(hasRow, Is.True)
                 Assert.That(reader.GetString(0), Is.EqualTo("Failed"))
-                Assert.That(reader.GetFieldValue<DateTimeOffset>(1), Is.EqualTo(finishedAtUtc))
-                Assert.That(reader.GetString(2), Is.EqualTo("cache path unavailable"))
-                Assert.That(reader.GetFieldValue<DateTimeOffset>(3), Is.EqualTo(finishedAtUtc))
+                Assert.That(reader.GetInt32(1), Is.EqualTo(replacementItem.ClaimAttempt))
+                Assert.That(reader.GetString(2), Is.EqualTo("replacement cache failure"))
+                Assert.That(reader.GetFieldValue<DateTimeOffset>(3), Is.EqualTo(requestedAtUtc.AddSeconds(33.0)))
+            })
+
+    [<Test>]
+    let ``cached file whose parent Track is soft deleted is not playable`` () =
+        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
+            task {
+                let trackId = newId ()
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+                use command = new NpgsqlCommand("""INSERT INTO "Tracks" ("Id", "Title", "Artist", "IsDeleted") VALUES (@TrackId, 'Deleted parent', 'Regression', true); INSERT INTO "TrackFiles" ("Id", "TrackId", "StoragePath", "CachePath", "IsCached", "IsDeleted") VALUES (@TrackFileId, @TrackId, '/library/deleted.mp3', '/cache/deleted.mp3', true, false);""", connection)
+                command.Parameters.AddWithValue("TrackId", trackId) |> ignore
+                command.Parameters.AddWithValue("TrackFileId", newId ()) |> ignore
+                let! _ = command.ExecuteNonQueryAsync()
+                use dataSource = NpgsqlDataSource.Create(connectionString)
+                let! result = PlaybackQueueRepository.findCachedTrackFile dataSource trackId CancellationToken.None
+                match result with
+                | Ok None -> ()
+                | actual -> Assert.Fail(sprintf "Expected an active file with a soft-deleted parent Track to be excluded, but got %A." actual)
             })

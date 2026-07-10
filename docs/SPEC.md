@@ -81,7 +81,7 @@ flowchart LR
 - Все timestamps — UTC ISO-8601 strings ending with `Z`.
 - `amountStars`, `raisedStars`, `goalStars` — integer Telegram Stars, not cents.
 - Public player routes read-only и unauthenticated, если deployment later не поставит их behind CDN/internal network.
-- Admin routes require admin authentication. В v0 auth documented as token/session-based without selecting OAuth yet.
+- Все `/api/v0/admin/*` routes require the exact header contract `Authorization: Bearer <WEB10_ADMIN__TOKEN>` under named policy `Web10Admin`. Missing, malformed, multiple or wrong `Authorization` values return HTTP `401`, `WWW-Authenticate: Bearer`, and RFC 7807 code `admin.auth.required`; a valid token reaches the handler.
 - Telegram webhook route validates Telegram secret token before accepting updates.
 - REST errors use RFC 7807-style problem details with `traceId`, `code`, and `message` fields. Example shape: `{ "type": "https://web10.radio/problems/stream-unavailable", "title": "Stream unavailable", "status": 503, "traceId": "...", "code": "stream.unavailable", "message": "Stream is offline" }`.
 
@@ -185,6 +185,19 @@ SSE route contract:
 | --- | --- | --- |
 | `POST` | `/api/v0/telegram/webhook` | Accept Telegram Bot API update webhook. |
 | `GET` | `/api/v0/telegram/health` | Bot adapter health and last update id. |
+
+### Stream-node callback routes
+
+Эти routes internal-to-deployment и требуют exact `Authorization: Bearer <WEB10_STREAM__CALLBACK_TOKEN>` under policy `Web10StreamNode`; token не совпадает с admin token или Telegram RTMP key.
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/v0/stream-node/playback/{queueItemId}/lease` | Renew the active fenced playback lease. |
+| `POST` | `/api/v0/stream-node/playback/{queueItemId}/completion` | Authoritatively finish active playback as played or failed. |
+
+Lease body: `{ "claimOwner": "uuid-v7", "claimAttempt": 1 }`. Completion body adds `status: "played|failed"`; failed completion also requires non-empty `failureReason`. Body size is limited to 4096 bytes. Missing/wrong auth returns `401`; malformed/oversized body returns `400|413`; stale owner/attempt returns `409`; accepted callback returns `204`.
+
+`PlaybackStarted` carries `queueItemId`, `claimOwner`, `claimAttempt`, `trackId` and `cachePath`. The stream-node renews its 30-second lease at least every 10 seconds while playback is active. Completion transaction fences `(queueItemId, claimOwner, claimAttempt, Playing)`, writes `Played|Failed`, and appends `PlaybackEnded` atomically. Expired attempts cannot renew or complete; the playback worker reclaims them after restart/crash.
 
 ### Admin routes
 
@@ -317,40 +330,53 @@ The selected row is updated to `Claimed` in the same transaction before playback
 
 ## 9. Configuration, secrets, DI, logging, OTEL
 
-Required configuration keys:
+Обязательные для любого запуска configuration keys:
 
 - `WEB10_POSTGRES__CONNECTION_STRING`
 - `WEB10_TELEGRAM__BOT_TOKEN`
 - `WEB10_TELEGRAM__WEBHOOK_SECRET`
 - `WEB10_TELEGRAM__CHANNEL_ID_OR_USERNAME=@netscapedidnothingwrong`
+- `WEB10_ADMIN__TOKEN`
 - `WEB10_STREAM__RTMP_URL`
 - `WEB10_STREAM__RTMP_KEY`
 - `WEB10_STREAM__STAGE_URL`
+- `WEB10_STREAM__CALLBACK_TOKEN`
 - `WEB10_STORAGE__TYPE=Local|S3`
-- `WEB10_STORAGE__LOCAL_ROOT`
-- `WEB10_STORAGE__S3_BUCKET`
 - `WEB10_OTEL__EXPORTER_OTLP_ENDPOINT`
 - `WEB10_DATA_PROTECTION__KEY_RING_PATH`
 
-Startup rules:
+Selected-storage contract:
 
-- API fails fast on missing/invalid required config.
-- URL/config parsing happens at startup, not first request.
-- Telegram token and RTMP key are config/Docker secrets in v0, not database rows.
-- If a later admin feature stores secrets in PostgreSQL, the secret payload is protected with ASP.NET Core Data Protection and the key ring is persisted outside the container filesystem.
+- При `WEB10_STORAGE__TYPE=Local` обязателен `WEB10_STORAGE__LOCAL_ROOT`; `WEB10_STORAGE__S3_BUCKET`, `WEB10_STORAGE__S3_REGION`, `WEB10_STORAGE__S3_SERVICE_URL` и true-value `WEB10_STORAGE__S3_FORCE_PATH_STYLE` должны быть unset.
+- При `WEB10_STORAGE__TYPE=S3` обязательны `WEB10_STORAGE__S3_BUCKET` и `WEB10_STORAGE__S3_REGION`; `WEB10_STORAGE__LOCAL_ROOT` должен быть unset.
+- `WEB10_STORAGE__S3_SERVICE_URL` optional и, если задан, должен быть absolute `http`/`https` URI для S3-compatible service.
+- `WEB10_STORAGE__S3_FORCE_PATH_STYLE` optional, принимает exact `true|false` и по умолчанию равен `false`; его включают для S3-compatible endpoints, которым нужен path-style addressing.
+- S3 client uses the AWS SDK default credential chain. Region остается explicit signing region; при custom `WEB10_STORAGE__S3_SERVICE_URL` client также задает `AuthenticationRegion` из `WEB10_STORAGE__S3_REGION` и применяет configured path-style mode.
+- `WEB10_STORAGE__TYPE` selects the default backend. An enabled non-default S3 `StorageBackends` row takes its bucket from PostgreSQL and resolves credentials and region through the standard AWS SDK provider chains (`AWS_REGION`/profile/workload metadata); this path does not reuse Local settings or require `WEB10_STORAGE__TYPE=S3`.
+- S3 library scan paginates `ListObjectsV2` incrementally, renews the fenced scan-job lease before processing every page, filters supported audio extensions, records object key/size metadata and emits `TrackDiscovered`; it never materializes the full bucket listing in memory. Discovery does not download/cache the object: S3 tracks remain `CachePath=None`, `IsCached=false` until a separate cache path materializes them.
 
+Реализованные startup validation rules:
+
+- API агрегирует ошибки и fails before host build/port binding, если обязательный key отсутствует или пуст.
+- `WEB10_POSTGRES__CONNECTION_STRING` парсится как Npgsql connection string.
+- `WEB10_STREAM__RTMP_URL` разрешает только `rtmp`/`rtmps`; `WEB10_STREAM__STAGE_URL`, `WEB10_OTEL__EXPORTER_OTLP_ENDPOINT` и optional `WEB10_STORAGE__S3_SERVICE_URL` — только absolute `http`/`https` URI.
+- Telegram bot token, webhook secret и channel id/username проверяются синтаксически; `WEB10_STREAM__RTMP_KEY` должен быть nontrivial whitespace-free secret минимум из 16 символов, а `WEB10_STREAM__CALLBACK_TOKEN` и `WEB10_ADMIN__TOKEN` — bearer-safe secrets минимум из 24 символов с exact alphabet `A-Za-z0-9_-`.
+- Local storage root и Data Protection key-ring path проверяются как creatable/writable directories; S3 bucket, region и взаимоисключающие Local/S3 fields проверяются до `Build()`.
+- Telegram token, stream callback token, admin token и RTMP key являются config/Docker secrets, а не database rows. Если later admin feature хранит secrets в PostgreSQL, payload защищается ASP.NET Core Data Protection, а key ring сохраняется вне container filesystem.
 
 Правила Container/Docker Compose:
 
 - Docker images не должны быть Alpine/libmusl based. Для non-.NET infrastructure используются Debian/Ubuntu-based images, даже если они больше.
 - .NET final/runtime images используют Microsoft .NET chiseled variants. Текущие backend runtime tags используют `10.0-noble-chiseled`; SDK build stages остаются на официальных non-Alpine SDK images, потому что Microsoft не публикует chiseled SDK images.
 - `compose.yaml` — текущий backend infrastructure smoke path: PostgreSQL `postgres:17`, one-shot `Web10.Radio.Migrator`, затем `Web10.Radio.API`.
-- Compose startup order: PostgreSQL healthcheck → migrator successful completion → API startup. Migrator обязан применить pending FluentMigrator migrations до старта API.
+- Compose startup order: PostgreSQL healthcheck → migrator successful completion → API startup and API liveness healthcheck. Bounded `docker compose up --wait --wait-timeout` возвращает success только после healthy API; ad hoc `sleep` не входит в smoke contract.
+- В chiseled API container healthcheck выполняет exact managed command `dotnet Web10.Radio.API.dll --health-check http://127.0.0.1:8080/health/live`; image не предполагает наличие shell, `curl` или `wget`, а probe exit code отражает HTTP success.
 - Текущий compose smoke намеренно не закрывает full v0 Compose target с frontend, stream-node и observability collector; это остается для later Docker verification phase.
 
-DI rules aligned with ASP.NET guidance:
+DI rules aligned with ASP.NET lifecycle:
 
-- Register related module services through module registration functions.
+- До `builder.Build()` service-registration chain имеет порядок: Database → application services → Telegram adapter → background workers → API authentication/authorization services → health checks → observability.
+- После `Build()` вызываются `UseAuthentication()` и `UseAuthorization()`, затем отдельно mapping-ятся health endpoints и `/api/v0/*` endpoints; endpoint mapping не является DI registration stage.
 - Use constructor injection, not service locator.
 - Use scoped repositories/transactions for request work.
 - Do not inject scoped services into singletons without an explicit scope factory.

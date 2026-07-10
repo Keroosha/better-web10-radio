@@ -1,9 +1,12 @@
 namespace Web10.Radio.Tests
 
 open System
-open System.IO
 open System.Threading
-open Microsoft.Extensions.DependencyInjection
+open System.Threading.Tasks
+open System.Collections.Generic
+open Amazon.Runtime
+open Amazon.S3
+open Amazon.S3.Model
 open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Logging.Abstractions
@@ -12,12 +15,173 @@ open NUnit.Framework
 open Web10.Radio.API
 open Web10.Radio.Database
 open Web10.Radio.Database.Repositories
-open Web10.Radio.Telegram
 
 module BackgroundWorkerTests =
+    type private PagedAmazonS3Client() =
+        inherit AmazonS3Client(AnonymousAWSCredentials(), AmazonS3Config(ServiceURL = "http://localhost", ForcePathStyle = true))
+
+        let continuationTokens = ResizeArray<string option>()
+
+        member _.ContinuationTokens = List.ofSeq continuationTokens
+
+        override _.ListObjectsV2Async(request: ListObjectsV2Request, cancellationToken: CancellationToken) =
+            cancellationToken.ThrowIfCancellationRequested()
+            continuationTokens.Add(if isNull request.ContinuationToken then None else Some request.ContinuationToken)
+            let response = ListObjectsV2Response()
+            let item = S3Object()
+
+            if isNull request.ContinuationToken then
+                item.Key <- "first.mp3"
+                item.Size <- Nullable 101L
+                response.IsTruncated <- Nullable true
+                response.NextContinuationToken <- "page-2"
+            else
+                item.Key <- "second.flac"
+                item.Size <- Nullable 202L
+                response.IsTruncated <- Nullable false
+
+            response.S3Objects <- ResizeArray [ item ]
+            Task.FromResult(response)
+
     type private FixedClock(nowUtc: DateTimeOffset) =
         interface IClock with
             member _.UtcNow = nowUtc
+    type private SteppingClock(initialUtc: DateTimeOffset) =
+        let mutable nextUtc = initialUtc
+
+        interface IClock with
+            member _.UtcNow =
+                let currentUtc = nextUtc
+                nextUtc <- nextUtc.AddMinutes(1.0)
+                currentUtc
+
+
+    type private TestApplicationLifetime() =
+        let stopping = new CancellationTokenSource()
+        member _.Stop() = stopping.Cancel()
+
+
+        interface IHostApplicationLifetime with
+            member _.ApplicationStarted = CancellationToken.None
+            member _.ApplicationStopping = stopping.Token
+            member _.ApplicationStopped = CancellationToken.None
+            member _.StopApplication() = stopping.Cancel()
+
+    type private NoopPlaybackWorkflow() =
+        interface IPlaybackQueueWorkflow with
+            member _.HandleAsync _ _ = Task.FromResult(Ok())
+
+    type private NoopLibraryWorkflow() =
+        interface ILibraryScanWorkflow with
+            member _.HandleAsync _ _ = Task.FromResult(Ok())
+
+    type private BlockingRelayDispatcher() =
+        let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let mutable calls = 0
+
+        member _.Entered = entered.Task
+        member _.Release() = release.TrySetResult(()) |> ignore
+        member _.Calls = Volatile.Read(&calls)
+
+        interface IDomainEventDispatcher with
+            member _.DispatchAsync _ _ =
+                task {
+                    Interlocked.Increment(&calls) |> ignore
+                    entered.TrySetResult(()) |> ignore
+                    do! release.Task
+                    return Ok()
+                }
+
+    type private PagedS3Enumerator(pages: S3ObjectDescriptor list list) =
+        let mutable calls = 0
+
+        member _.Calls = Volatile.Read(&calls)
+
+        interface IS3ObjectEnumerator with
+            member _.VisitPagesAsync(_, visitPage, cancellationToken) =
+                task {
+                    cancellationToken.ThrowIfCancellationRequested()
+
+                    for page in pages do
+                        Interlocked.Increment(&calls) |> ignore
+                        do! visitPage (page |> List.toArray :> Collections.Generic.IReadOnlyList<S3ObjectDescriptor>) cancellationToken
+                }
+                :> Task
+
+            member _.ProbeBucketAsync(_, cancellationToken) =
+                cancellationToken.ThrowIfCancellationRequested()
+                Task.CompletedTask
+
+    type private LeaseObservingS3Enumerator(dataSource: NpgsqlDataSource, jobId: Guid, pages: S3ObjectDescriptor list list) =
+        let observedLeaseExpirations = ResizeArray<DateTimeOffset>()
+        let mutable calls = 0
+
+        member _.Calls = Volatile.Read(&calls)
+        member _.ObservedLeaseExpirations = List.ofSeq observedLeaseExpirations
+
+        interface IS3ObjectEnumerator with
+            member _.VisitPagesAsync(_, visitPage, cancellationToken) =
+                task {
+                    cancellationToken.ThrowIfCancellationRequested()
+
+                    for page in pages do
+                        Interlocked.Increment(&calls) |> ignore
+                        do! visitPage (page |> List.toArray :> Collections.Generic.IReadOnlyList<S3ObjectDescriptor>) cancellationToken
+
+                        use! connection = dataSource.OpenConnectionAsync(cancellationToken)
+                        use command = new NpgsqlCommand("SELECT \"ClaimLeaseExpiresAtUtc\" FROM \"LibraryScanJobs\" WHERE \"Id\" = @JobId;", connection)
+                        command.Parameters.AddWithValue("JobId", jobId) |> ignore
+                        use! reader = command.ExecuteReaderAsync(cancellationToken)
+                        let! hasRow = reader.ReadAsync(cancellationToken)
+
+                        if not hasRow then
+                            return raise (InvalidOperationException("The scan job disappeared before its page callback completed."))
+
+                        observedLeaseExpirations.Add(reader.GetFieldValue<DateTimeOffset>(0))
+                }
+                :> Task
+
+            member _.ProbeBucketAsync(_, cancellationToken) =
+                cancellationToken.ThrowIfCancellationRequested()
+                Task.CompletedTask
+
+    type private BlockingS3Enumerator() =
+        let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+
+        member _.Entered = entered.Task
+
+        interface IS3ObjectEnumerator with
+            member _.VisitPagesAsync(_, _, cancellationToken) =
+                let pending = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+                entered.TrySetResult(()) |> ignore
+                cancellationToken.Register(fun () -> pending.TrySetCanceled(cancellationToken) |> ignore) |> ignore
+                pending.Task :> Task
+
+            member _.ProbeBucketAsync(_, cancellationToken) =
+                cancellationToken.ThrowIfCancellationRequested()
+                Task.CompletedTask
+
+    type private BlockingQueueWorkflow() =
+        let entered = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let release = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        let mutable calls = 0
+
+        member _.Entered = entered.Task
+        member _.Release() = release.TrySetResult(()) |> ignore
+        member _.Calls = Volatile.Read(&calls)
+
+        interface IPlaybackQueueWorkflow with
+            member _.HandleAsync _ _ =
+                task {
+                    let call = Interlocked.Increment(&calls)
+
+                    if call = 1 then
+                        entered.TrySetResult(()) |> ignore
+                        do! release.Task
+
+                    return Ok()
+                }
 
     let private newId () =
         (UuidV7IdGenerator() :> IIdGenerator).NewId()
@@ -28,45 +192,7 @@ module BackgroundWorkerTests =
     let private clockAt value =
         FixedClock(value) :> IClock
 
-    let private createDispatcher dataSource idGenerator clock streamNodeState =
-        DomainEventDispatcher(
-            dataSource,
-            idGenerator,
-            clock,
-            streamNodeState,
-            NullLogger<DomainEventDispatcher>.Instance
-        )
-        :> IDomainEventDispatcher
-
-    let private createPublisher dataSource dispatcher clock =
-        DomainEventPublisher(dataSource, dispatcher, clock, NullLogger<DomainEventPublisher>.Instance) :> IDomainEventPublisher
-
-    type private ObservingFailingDispatcher(dataSource: NpgsqlDataSource) =
-        let mutable observedPersistedRow = false
-
-        member _.ObservedPersistedRow = observedPersistedRow
-
-        interface IDomainEventDispatcher with
-            member _.DispatchAsync envelope cancellationToken =
-                task {
-                    use! connection = dataSource.OpenConnectionAsync(cancellationToken)
-                    use command =
-                        new NpgsqlCommand(
-                            """SELECT count(*)
-FROM "OutboxEvents"
-WHERE "Id" = @EventId
-  AND "Status" = 'Pending'
-  AND "IsDeleted" = false;""",
-                            connection
-                        )
-
-                    command.Parameters.AddWithValue("EventId", envelope.EventId) |> ignore
-                    let! count = command.ExecuteScalarAsync(cancellationToken)
-                    observedPersistedRow <- (count :?> int64) = 1L
-                    return Error(InvalidPayload(DomainEventType.toString envelope.EventType, "forced dispatcher failure"))
-                }
-
-    let private testOptions connectionString localRoot =
+    let private testOptions connectionString storageType localRoot bucket =
         { Postgres = { ConnectionString = connectionString }
           Telegram =
             { BotToken = "test-bot-token"
@@ -75,781 +201,492 @@ WHERE "Id" = @EventId
           Stream =
             { RtmpUrl = Uri("rtmp://localhost/live")
               RtmpKey = "test-rtmp-key"
-              StageUrl = Uri("http://localhost/stage") }
+              StageUrl = Uri("http://localhost/stage")
+              CallbackToken = "test-callback-token-Secret_12345" }
           Storage =
-            { Type = Local
+            { Type = storageType
               LocalRoot = localRoot
-              S3Bucket = "unused-test-bucket" }
+              S3Bucket = bucket
+              S3Region = "us-east-1"
+              S3ServiceUrl = None
+              S3ForcePathStyle = false }
+          Admin = { Token = "test-admin-token" }
           Otel = { ExporterOtlpEndpoint = Uri("http://localhost:4317") }
           DataProtection = { KeyRingPath = "/tmp/web10-radio-tests-keys" } }
-
-    let private addParameter (name: string) (value: obj) (command: NpgsqlCommand) =
-        command.Parameters.AddWithValue(name, value) |> ignore
 
     let private assertOkTrue description result =
         match result with
         | Ok true -> ()
         | actual -> Assert.Fail(sprintf "Expected %s to return Ok true, but got %A." description actual)
 
-    let private assertOkFalse description result =
-        match result with
-        | Ok false -> ()
-        | actual -> Assert.Fail(sprintf "Expected %s to return Ok false, but got %A." description actual)
+    let private envelope generator clock eventType payload =
+        match DomainEventEnvelope.create generator clock eventType "web10.radio.tests" None None payload with
+        | Ok value -> value
+        | Error error -> Assert.Fail(sprintf "Expected a valid %s test envelope, but got %A." (DomainEventType.toString eventType) error); Unchecked.defaultof<_>
+
 
     [<Test>]
-    let ``Telegram update ingestor appends by update and event type pair and suppresses duplicate pair`` () =
+    let ``relay drives claimed playback through Played and PlaybackEnded before the next queue item progresses`` () =
         DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
             task {
-                use dataSource = NpgsqlDataSource.Create(connectionString)
-                let generator = idGenerator ()
-                let clock = clockAt (DateTimeOffset(2026, 7, 8, 16, 0, 0, TimeSpan.Zero))
-                let streamNodeState = StreamNodeHeartbeatState()
-                let dispatcher = createDispatcher dataSource generator clock streamNodeState
-                let publisher = createPublisher dataSource dispatcher clock
-                let ingestor =
-                    TelegramUpdateEventIngestor(
-                        dataSource,
-                        generator,
-                        clock,
-                        publisher,
-                        NullLogger<TelegramUpdateEventIngestor>.Instance
-                    )
-                    :> ITelegramUpdateEventIngestor
-
-                let trackRequestPayloadJson = "{\"query\":\"Artist - Title\"}"
-                let sayMessagePayloadJson = "{\"text\":\"hello\"}"
-                let! firstResult =
-                    ingestor.TryIngestAsync 9001L DomainEventType.TrackRequested "web10.radio.tests" trackRequestPayloadJson CancellationToken.None
-
-                let! duplicateTrackRequestResult =
-                    ingestor.TryIngestAsync 9001L DomainEventType.TrackRequested "web10.radio.tests" trackRequestPayloadJson CancellationToken.None
-
-                let! differentEventTypeResult =
-                    ingestor.TryIngestAsync 9001L DomainEventType.SayMessageSubmitted "web10.radio.tests" sayMessagePayloadJson CancellationToken.None
-
-                let! duplicateSayMessageResult =
-                    ingestor.TryIngestAsync 9001L DomainEventType.SayMessageSubmitted "web10.radio.tests" sayMessagePayloadJson CancellationToken.None
-
-                assertOkTrue "first Telegram update ingest" firstResult
-                assertOkFalse "duplicate Telegram update ingest for same update id and event type" duplicateTrackRequestResult
-                assertOkTrue "Telegram update ingest with same update id and different event type" differentEventTypeResult
-                assertOkFalse "duplicate Telegram update ingest for second event type" duplicateSayMessageResult
-
-                use connection = new NpgsqlConnection(connectionString)
-                do! connection.OpenAsync()
-                use command =
-                    new NpgsqlCommand(
-                        """SELECT
-    (SELECT count(*) FROM "TelegramUpdateInbox" WHERE "TelegramUpdateId" = @TelegramUpdateId AND "EventType" = 'TrackRequested' AND "IsDeleted" = false),
-    (SELECT count(*) FROM "TelegramUpdateInbox" WHERE "TelegramUpdateId" = @TelegramUpdateId AND "EventType" = 'SayMessageSubmitted' AND "IsDeleted" = false),
-    (SELECT count(*) FROM "OutboxEvents" WHERE "EventType" = 'TrackRequested' AND "Status" = 'Processed' AND "IsDeleted" = false),
-    (SELECT count(*) FROM "OutboxEvents" WHERE "EventType" = 'SayMessageSubmitted' AND "Status" = 'Processed' AND "IsDeleted" = false);""",
-                        connection
-                    )
-
-                addParameter "TelegramUpdateId" 9001L command
-                let! reader = command.ExecuteReaderAsync()
-                use reader = reader
-                let! hasRow = reader.ReadAsync()
-                Assert.That(hasRow, Is.True)
-                Assert.That(reader.GetInt64(0), Is.EqualTo(1L))
-                Assert.That(reader.GetInt64(1), Is.EqualTo(1L))
-                Assert.That(reader.GetInt64(2), Is.EqualTo(1L))
-                Assert.That(reader.GetInt64(3), Is.EqualTo(1L))
-            })
-
-    [<Test>]
-    let ``local library scan imports Artist Title mp3 emits TrackDiscovered and completes job`` () =
-        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
-            task {
-                let tempRoot = Directory.CreateTempSubdirectory("web10-radio-library-scan-")
-                let filePath = Path.Combine(tempRoot.FullName, "Artist - Title.mp3")
-
-                try
-                    File.WriteAllBytes(filePath, [| 0uy; 1uy; 2uy; 3uy |])
-                    let jobId = newId ()
-                    let requestedAtUtc = DateTimeOffset(2026, 7, 8, 17, 0, 0, TimeSpan.Zero)
-                    let processedAtUtc = requestedAtUtc.AddMinutes(1.0)
-
-                    use connection = new NpgsqlConnection(connectionString)
-                    do! connection.OpenAsync()
-                    use insertJobCommand =
-                        new NpgsqlCommand(
-                            """INSERT INTO "LibraryScanJobs" ("Id", "Status", "RequestedAtUtc", "CreatedAtUtc", "UpdatedAtUtc", "IsDeleted")
-VALUES (@JobId, 'Queued', @RequestedAtUtc, @RequestedAtUtc, @RequestedAtUtc, false);""",
-                            connection
-                        )
-
-                    addParameter "JobId" jobId insertJobCommand
-                    addParameter "RequestedAtUtc" requestedAtUtc insertJobCommand
-                    let! _ = insertJobCommand.ExecuteNonQueryAsync()
-
-                    use dataSource = NpgsqlDataSource.Create(connectionString)
-                    let generator = idGenerator ()
-                    let clock = clockAt processedAtUtc
-                    let streamNodeState = StreamNodeHeartbeatState()
-                    let dispatcher = createDispatcher dataSource generator clock streamNodeState
-                    let publisher = createPublisher dataSource dispatcher clock
-                    let service =
-                        new LibraryScanHostedService(
-                            dataSource,
-                            publisher,
-                            generator,
-                            clock,
-                            testOptions connectionString tempRoot.FullName,
-                            NullLogger<LibraryScanHostedService>.Instance
-                        )
-
-                    let! processResult = service.ProcessOneJobAsync(CancellationToken.None)
-                    assertOkTrue "local library scan job processing" processResult
-
-                    use assertCommand =
-                        new NpgsqlCommand(
-                            """SELECT
-    (SELECT count(*) FROM "Tracks" WHERE "Artist" = 'Artist' AND "Title" = 'Title' AND "IsDeleted" = false),
-    (SELECT count(*)
-     FROM "TrackFiles" tf
-     INNER JOIN "Tracks" t ON t."Id" = tf."TrackId"
-     WHERE t."Artist" = 'Artist'
-       AND t."Title" = 'Title'
-       AND tf."StorageBackendId" IS NULL
-       AND tf."StoragePath" = @FilePath
-       AND tf."CachePath" = @FilePath
-       AND tf."IsCached" = true
-       AND tf."ContentType" = 'audio/mpeg'
-       AND tf."SizeBytes" = @SizeBytes
-       AND tf."IsDeleted" = false),
-    (SELECT count(*) FROM "OutboxEvents" WHERE "EventType" = 'TrackDiscovered' AND "IsDeleted" = false),
-    (SELECT "Status" FROM "LibraryScanJobs" WHERE "Id" = @JobId AND "IsDeleted" = false),
-    (SELECT "FinishedAtUtc" FROM "LibraryScanJobs" WHERE "Id" = @JobId AND "IsDeleted" = false);""",
-                            connection
-                        )
-
-                    addParameter "FilePath" filePath assertCommand
-                    addParameter "SizeBytes" (FileInfo(filePath).Length) assertCommand
-                    addParameter "JobId" jobId assertCommand
-                    let! reader = assertCommand.ExecuteReaderAsync()
-                    use reader = reader
-                    let! hasRow = reader.ReadAsync()
-                    Assert.That(hasRow, Is.True)
-                    Assert.That(reader.GetInt64(0), Is.EqualTo(1L))
-                    Assert.That(reader.GetInt64(1), Is.EqualTo(1L))
-                    Assert.That(reader.GetInt64(2), Is.EqualTo(1L))
-                    Assert.That(reader.GetString(3), Is.EqualTo("Completed"))
-                    Assert.That(reader.GetFieldValue<DateTimeOffset>(4), Is.EqualTo(processedAtUtc))
-                finally
-                    tempRoot.Delete(true)
-            })
-
-    [<Test>]
-    let ``playback cache miss fails queue emits stream failure and records degraded heartbeat`` () =
-        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
-            task {
-                let trackId = newId ()
-                let queueItemId = newId ()
-                let requestedAtUtc = DateTimeOffset(2026, 7, 8, 18, 0, 0, TimeSpan.Zero)
-                let processedAtUtc = requestedAtUtc.AddSeconds(30.0)
-
-                use connection = new NpgsqlConnection(connectionString)
-                do! connection.OpenAsync()
-                use insertCommand =
-                    new NpgsqlCommand(
-                        """INSERT INTO "Tracks" ("Id", "Title", "Artist", "CreatedAtUtc", "UpdatedAtUtc", "IsDeleted")
-VALUES (@TrackId, 'Uncached title', 'Uncached artist', @RequestedAtUtc, @RequestedAtUtc, false);
-
-INSERT INTO "PlaybackQueue" (
-    "Id", "TrackId", "Source", "Status", "Priority", "RequestedAtUtc", "CreatedAtUtc", "UpdatedAtUtc", "IsDeleted"
-)
-VALUES (@QueueItemId, @TrackId, 'playlist', 'Queued', 0, @RequestedAtUtc, @RequestedAtUtc, @RequestedAtUtc, false);""",
-                        connection
-                    )
-
-                addParameter "TrackId" trackId insertCommand
-                addParameter "QueueItemId" queueItemId insertCommand
-                addParameter "RequestedAtUtc" requestedAtUtc insertCommand
-                let! _ = insertCommand.ExecuteNonQueryAsync()
-
-                use dataSource = NpgsqlDataSource.Create(connectionString)
-                let generator = idGenerator ()
-                let clock = clockAt processedAtUtc
-                let streamNodeState = StreamNodeHeartbeatState()
-                let dispatcher = createDispatcher dataSource generator clock streamNodeState
-                let publisher = createPublisher dataSource dispatcher clock
-                let service =
-                    new PlaybackProgramHostedService(
-                        dataSource,
-                        publisher,
-                        generator,
-                        clock,
-                        NullLogger<PlaybackProgramHostedService>.Instance
-                    )
-
-                let! processResult = service.ProcessOneQueueItemAsync(CancellationToken.None)
-                assertOkTrue "playback cache-miss processing" processResult
-
-                use assertCommand =
-                    new NpgsqlCommand(
-                        """SELECT
-    (SELECT "Status" FROM "PlaybackQueue" WHERE "Id" = @QueueItemId AND "IsDeleted" = false),
-    (SELECT "FailureReason" FROM "PlaybackQueue" WHERE "Id" = @QueueItemId AND "IsDeleted" = false),
-    (SELECT count(*) FROM "StreamNodeHeartbeats" WHERE "Status" = 'Degraded' AND "FailureReason" = 'cache path unavailable' AND "IsDeleted" = false),
-    (SELECT count(*) FROM "OutboxEvents" WHERE "EventType" = 'StreamNodeFailureDetected' AND "IsDeleted" = false);""",
-                        connection
-                    )
-
-                addParameter "QueueItemId" queueItemId assertCommand
-                let! reader = assertCommand.ExecuteReaderAsync()
-                use reader = reader
-                let! hasRow = reader.ReadAsync()
-                Assert.That(hasRow, Is.True)
-                Assert.That(reader.GetString(0), Is.EqualTo("Failed"))
-                Assert.That(reader.GetString(1), Is.EqualTo("cache path unavailable"))
-                Assert.That(reader.GetInt64(2), Is.EqualTo(1L))
-                Assert.That(reader.GetInt64(3), Is.EqualTo(1L))
-                Assert.That(streamNodeState.LastHeartbeatUtc, Is.EqualTo(Some processedAtUtc))
-                Assert.That(streamNodeState.LastFailure, Is.EqualTo(Some "cache path unavailable"))
-            })
-
-    [<Test>]
-    let ``outbox relay dispatches valid PlaybackStarted event and marks it processed`` () =
-        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
-            task {
-                use dataSource = NpgsqlDataSource.Create(connectionString)
-                let generator = idGenerator ()
-                let occurredAtUtc = DateTimeOffset(2026, 7, 8, 19, 0, 0, TimeSpan.Zero)
-                let processedAtUtc = occurredAtUtc.AddSeconds(5.0)
-                let eventId = newId ()
-                let queueItemId = newId ()
-                let trackId = newId ()
-                let payloadJson =
-                    sprintf
-                        "{\"queueItemId\":\"%O\",\"trackId\":\"%O\",\"cachePath\":\"/cache/artist-title.mp3\"}"
-                        queueItemId
-                        trackId
-
-                let! appendResult =
-                    OutboxEventRepository.append
-                        dataSource
-                        { Id = eventId
-                          EventType = "PlaybackStarted"
-                          OccurredAtUtc = occurredAtUtc
-                          Producer = "web10.radio.tests"
-                          CorrelationId = Some(newId ())
-                          CausationId = None
-                          PayloadJson = payloadJson }
-                        CancellationToken.None
-
-                match appendResult with
-                | Ok () -> ()
-                | actual -> Assert.Fail(sprintf "Expected outbox append to succeed, but got %A." actual)
-
-                let clock = clockAt processedAtUtc
-                let streamNodeState = StreamNodeHeartbeatState()
-                let dispatcher = createDispatcher dataSource generator clock streamNodeState
-                let services = ServiceCollection()
-                services.AddSingleton<NpgsqlDataSource>(dataSource) |> ignore
-                services.AddSingleton<IClock>(clock) |> ignore
-                services.AddSingleton<IIdGenerator>(generator) |> ignore
-                services.AddSingleton<StreamNodeHeartbeatState>(streamNodeState) |> ignore
-                services.AddSingleton<IDomainEventDispatcher>(dispatcher) |> ignore
-                use provider = services.BuildServiceProvider()
-                let relay =
-                    new OutboxRelayHostedService(
-                        provider.GetRequiredService<IServiceScopeFactory>(),
-                        NullLogger<OutboxRelayHostedService>.Instance
-                    )
-
-                let! relayResult = relay.ProcessDueEventsOnceAsync(CancellationToken.None)
-                match relayResult with
-                | Ok 1 -> ()
-                | actual -> Assert.Fail(sprintf "Expected outbox relay to process one event, but got %A." actual)
-
-                use connection = new NpgsqlConnection(connectionString)
-                do! connection.OpenAsync()
-                use command =
-                    new NpgsqlCommand(
-                        """SELECT "Status", "Attempts", "ProcessedAtUtc", "UpdatedAtUtc"
-FROM "OutboxEvents"
-WHERE "Id" = @EventId
-  AND "IsDeleted" = false;""",
-                        connection
-                    )
-
-                addParameter "EventId" eventId command
-                let! reader = command.ExecuteReaderAsync()
-                use reader = reader
-                let! hasRow = reader.ReadAsync()
-                Assert.That(hasRow, Is.True)
-                Assert.That(reader.GetString(0), Is.EqualTo("Processed"))
-                Assert.That(reader.GetInt32(1), Is.EqualTo(1))
-                Assert.That(reader.GetFieldValue<DateTimeOffset>(2), Is.EqualTo(processedAtUtc))
-                Assert.That(reader.GetFieldValue<DateTimeOffset>(3), Is.EqualTo(processedAtUtc))
-            })
-
-    [<Test>]
-    let ``invalid DonationPaid payload returns InvalidPayload without mutating payments`` () =
-        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
-            task {
-                use dataSource = NpgsqlDataSource.Create(connectionString)
-                let generator = idGenerator ()
-                let clock = clockAt (DateTimeOffset(2026, 7, 8, 20, 0, 0, TimeSpan.Zero))
-                let streamNodeState = StreamNodeHeartbeatState()
-                let dispatcher = createDispatcher dataSource generator clock streamNodeState
-
-                let envelopeResult =
-                    DomainEventEnvelope.create generator clock DomainEventType.DonationPaid "web10.radio.tests" None None "{}"
-
-                let envelope =
-                    match envelopeResult with
-                    | Ok envelope -> envelope
-                    | Error error -> Assert.Fail(sprintf "Expected envelope creation to accept object payload, but got %A." error); Unchecked.defaultof<_>
-
-                let! dispatchResult = dispatcher.DispatchAsync envelope CancellationToken.None
-                match dispatchResult with
-                | Error(InvalidPayload("DonationPaid", message)) -> Assert.That(message, Is.EqualTo("paymentId is required."))
-                | actual -> Assert.Fail(sprintf "Expected invalid DonationPaid payload error, but got %A." actual)
-
-                use connection = new NpgsqlConnection(connectionString)
-                do! connection.OpenAsync()
-                use command = new NpgsqlCommand("""SELECT count(*) FROM "Payments" WHERE "IsDeleted" = false;""", connection)
-                let! paymentCount = command.ExecuteScalarAsync()
-                Assert.That(paymentCount :?> int64, Is.EqualTo(0L))
-            })
-
-    [<Test>]
-    let ``bad stream-node heartbeat status flows through dispatcher as repository error without recording heartbeat`` () =
-        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
-            task {
-                use dataSource = NpgsqlDataSource.Create(connectionString)
-                let generator = idGenerator ()
-                let heartbeatAtUtc = DateTimeOffset(2026, 7, 8, 21, 0, 0, TimeSpan.Zero)
-                let clock = clockAt heartbeatAtUtc
-                let streamNodeState = StreamNodeHeartbeatState()
-                let dispatcher = createDispatcher dataSource generator clock streamNodeState
-                let payloadJson = "{\"status\":\"Exploded\",\"metadata\":{\"node\":\"test\"}}"
-
-                let envelopeResult =
-                    DomainEventEnvelope.create
-                        generator
-                        clock
-                        DomainEventType.StreamNodeHeartbeatReceived
-                        "web10.radio.tests"
-                        None
-                        None
-                        payloadJson
-
-                let envelope =
-                    match envelopeResult with
-                    | Ok envelope -> envelope
-                    | Error error -> Assert.Fail(sprintf "Expected envelope creation to accept object payload, but got %A." error); Unchecked.defaultof<_>
-
-                let! dispatchResult = dispatcher.DispatchAsync envelope CancellationToken.None
-                match dispatchResult with
-                | Error(RepositoryError(InvalidStreamNodeStatus "Exploded")) -> ()
-                | actual -> Assert.Fail(sprintf "Expected invalid stream-node status repository error, but got %A." actual)
-
-                use connection = new NpgsqlConnection(connectionString)
-                do! connection.OpenAsync()
-                use command = new NpgsqlCommand("""SELECT count(*) FROM "StreamNodeHeartbeats" WHERE "IsDeleted" = false;""", connection)
-                let! heartbeatCount = command.ExecuteScalarAsync()
-                Assert.That(heartbeatCount :?> int64, Is.EqualTo(0L))
-                Assert.That(streamNodeState.LastHeartbeatUtc, Is.EqualTo(None))
-                Assert.That(streamNodeState.LastFailure, Is.EqualTo(None))
-            })
-
-    [<Test>]
-    let ``outbox relay keeps processing batch after unknown event type and leaves no claimed tail stranded`` () =
-        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
-            task {
-                use dataSource = NpgsqlDataSource.Create(connectionString)
-                let generator = idGenerator ()
-                let occurredAtUtc = DateTimeOffset(2026, 7, 8, 22, 0, 0, TimeSpan.Zero)
-                let processedAtUtc = occurredAtUtc.AddSeconds(5.0)
-                let unknownEventId = newId ()
-                let heartbeatEventId = newId ()
-
-                for eventToAppend in
-                    [ { Id = unknownEventId
-                        EventType = "UnexpectedB2Event"
-                        OccurredAtUtc = occurredAtUtc
-                        Producer = "web10.radio.tests"
-                        CorrelationId = Some(newId ())
-                        CausationId = None
-                        PayloadJson = "{}" }
-                      { Id = heartbeatEventId
-                        EventType = "StreamNodeHeartbeatReceived"
-                        OccurredAtUtc = occurredAtUtc.AddMilliseconds(1.0)
-                        Producer = "web10.radio.tests"
-                        CorrelationId = Some(newId ())
-                        CausationId = None
-                        PayloadJson = "{\"status\":\"Live\",\"metadata\":{\"node\":\"relay-test\"}}" } ] do
-                    let! appendResult = OutboxEventRepository.append dataSource eventToAppend CancellationToken.None
-                    match appendResult with
-                    | Ok () -> ()
-                    | actual -> Assert.Fail(sprintf "Expected outbox append to succeed, but got %A." actual)
-
-                let clock = clockAt processedAtUtc
-                let streamNodeState = StreamNodeHeartbeatState()
-                let dispatcher = createDispatcher dataSource generator clock streamNodeState
-                let services = ServiceCollection()
-                services.AddSingleton<NpgsqlDataSource>(dataSource) |> ignore
-                services.AddSingleton<IClock>(clock) |> ignore
-                services.AddSingleton<IIdGenerator>(generator) |> ignore
-                services.AddSingleton<StreamNodeHeartbeatState>(streamNodeState) |> ignore
-                services.AddSingleton<IDomainEventDispatcher>(dispatcher) |> ignore
-                use provider = services.BuildServiceProvider()
-                let relay =
-                    new OutboxRelayHostedService(
-                        provider.GetRequiredService<IServiceScopeFactory>(),
-                        NullLogger<OutboxRelayHostedService>.Instance
-                    )
-
-                let! relayResult = relay.ProcessDueEventsOnceAsync(CancellationToken.None)
-                match relayResult with
-                | Error(UnknownEventType "UnexpectedB2Event") -> ()
-                | actual -> Assert.Fail(sprintf "Expected unknown event type error after processing full batch, but got %A." actual)
-
-                use connection = new NpgsqlConnection(connectionString)
-                do! connection.OpenAsync()
-                use command =
-                    new NpgsqlCommand(
-                        """SELECT
-    (SELECT "Status" FROM "OutboxEvents" WHERE "Id" = @UnknownEventId AND "IsDeleted" = false),
-    (SELECT "Status" FROM "OutboxEvents" WHERE "Id" = @HeartbeatEventId AND "IsDeleted" = false),
-    (SELECT count(*) FROM "OutboxEvents" WHERE "Status" = 'Processing' AND "IsDeleted" = false),
-    (SELECT count(*) FROM "StreamNodeHeartbeats" WHERE "Status" = 'Live' AND "IsDeleted" = false);""",
-                        connection
-                    )
-
-                addParameter "UnknownEventId" unknownEventId command
-                addParameter "HeartbeatEventId" heartbeatEventId command
-                let! reader = command.ExecuteReaderAsync()
-                use reader = reader
-                let! hasRow = reader.ReadAsync()
-                Assert.That(hasRow, Is.True)
-                Assert.That(reader.GetString(0), Is.EqualTo("Failed"))
-                Assert.That(reader.GetString(1), Is.EqualTo("Processed"))
-                Assert.That(reader.GetInt64(2), Is.EqualTo(0L))
-                Assert.That(reader.GetInt64(3), Is.EqualTo(1L))
-            })
-
-    [<Test>]
-    let ``PublishDurableAsync persists outbox row before dispatcher failure and marks it retryable`` () =
-        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
-            task {
-                use dataSource = NpgsqlDataSource.Create(connectionString)
-                let generator = idGenerator ()
-                let nowUtc = DateTimeOffset(2026, 7, 8, 23, 0, 0, TimeSpan.Zero)
-                let clock = clockAt nowUtc
-                let dispatcher = ObservingFailingDispatcher(dataSource)
-                let publisher =
-                    DomainEventPublisher(
-                        dataSource,
-                        dispatcher :> IDomainEventDispatcher,
-                        clock,
-                        NullLogger<DomainEventPublisher>.Instance
-                    )
-                    :> IDomainEventPublisher
-
-                let envelopeResult =
-                    DomainEventEnvelope.create generator clock DomainEventType.TrackRequested "web10.radio.tests" None None "{\"query\":\"Artist - Title\"}"
-
-                let envelope =
-                    match envelopeResult with
-                    | Ok envelope -> envelope
-                    | Error error -> Assert.Fail(sprintf "Expected valid envelope, but got %A." error); Unchecked.defaultof<_>
-
-                let! publishResult = publisher.PublishDurableAsync envelope CancellationToken.None
-                match publishResult with
-                | Error(InvalidPayload("TrackRequested", "forced dispatcher failure")) -> ()
-                | actual -> Assert.Fail(sprintf "Expected fake dispatcher failure, but got %A." actual)
-
-                Assert.That(dispatcher.ObservedPersistedRow, Is.True)
-
-                use connection = new NpgsqlConnection(connectionString)
-                do! connection.OpenAsync()
-                use command =
-                    new NpgsqlCommand(
-                        """SELECT "Status", "Attempts", "NextAttemptAtUtc", "UpdatedAtUtc"
-FROM "OutboxEvents"
-WHERE "Id" = @EventId
-  AND "IsDeleted" = false;""",
-                        connection
-                    )
-
-                addParameter "EventId" envelope.EventId command
-                let! reader = command.ExecuteReaderAsync()
-                use reader = reader
-                let! hasRow = reader.ReadAsync()
-                Assert.That(hasRow, Is.True)
-                Assert.That(reader.GetString(0), Is.EqualTo("Failed"))
-                Assert.That(reader.GetInt32(1), Is.EqualTo(0))
-                Assert.That(reader.GetFieldValue<DateTimeOffset>(2), Is.EqualTo(nowUtc.AddSeconds(2.0)))
-                Assert.That(reader.GetFieldValue<DateTimeOffset>(3), Is.EqualTo(nowUtc))
-            })
-
-    [<Test>]
-    let ``playback cached track starts queue item and persists claimed and started outbox events`` () =
-        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
-            task {
-                let trackId = newId ()
-                let trackFileId = newId ()
-                let queueItemId = newId ()
-                let requestedAtUtc = DateTimeOffset(2026, 7, 9, 0, 0, 0, TimeSpan.Zero)
-                let processedAtUtc = requestedAtUtc.AddSeconds(30.0)
-                let cachePath = "/cache/artist-title.mp3"
-
-                use connection = new NpgsqlConnection(connectionString)
-                do! connection.OpenAsync()
-                use insertCommand =
-                    new NpgsqlCommand(
-                        """INSERT INTO "Tracks" ("Id", "Title", "Artist", "CreatedAtUtc", "UpdatedAtUtc", "IsDeleted")
-VALUES (@TrackId, 'Cached title', 'Cached artist', @RequestedAtUtc, @RequestedAtUtc, false);
-
-INSERT INTO "TrackFiles" (
-    "Id", "TrackId", "StorageBackendId", "StoragePath", "CachePath", "ContentType", "SizeBytes", "IsCached",
-    "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc"
-)
-VALUES (@TrackFileId, @TrackId, NULL, '/library/artist-title.mp3', @CachePath, 'audio/mpeg', 1234, true, false, @RequestedAtUtc, @RequestedAtUtc);
-
-INSERT INTO "PlaybackQueue" (
-    "Id", "TrackId", "Source", "Status", "Priority", "RequestedAtUtc", "CreatedAtUtc", "UpdatedAtUtc", "IsDeleted"
-)
-VALUES (@QueueItemId, @TrackId, 'playlist', 'Queued', 0, @RequestedAtUtc, @RequestedAtUtc, @RequestedAtUtc, false);""",
-                        connection
-                    )
-
-                addParameter "TrackId" trackId insertCommand
-                addParameter "TrackFileId" trackFileId insertCommand
-                addParameter "QueueItemId" queueItemId insertCommand
-                addParameter "RequestedAtUtc" requestedAtUtc insertCommand
-                addParameter "CachePath" cachePath insertCommand
-                let! _ = insertCommand.ExecuteNonQueryAsync()
-
-                use dataSource = NpgsqlDataSource.Create(connectionString)
-                let generator = idGenerator ()
-                let clock = clockAt processedAtUtc
-                let streamNodeState = StreamNodeHeartbeatState()
-                let dispatcher = createDispatcher dataSource generator clock streamNodeState
-                let publisher = createPublisher dataSource dispatcher clock
-                let service =
-                    new PlaybackProgramHostedService(
-                        dataSource,
-                        publisher,
-                        generator,
-                        clock,
-                        NullLogger<PlaybackProgramHostedService>.Instance
-                    )
-
-                let! processResult = service.ProcessOneQueueItemAsync(CancellationToken.None)
-                assertOkTrue "cached playback processing" processResult
-
-                use assertCommand =
-                    new NpgsqlCommand(
-                        """SELECT
-    (SELECT "Status" FROM "PlaybackQueue" WHERE "Id" = @QueueItemId AND "IsDeleted" = false),
-    (SELECT "StartedAtUtc" FROM "PlaybackQueue" WHERE "Id" = @QueueItemId AND "IsDeleted" = false),
-    (SELECT count(*) FROM "OutboxEvents" WHERE "EventType" = 'PlaybackQueueItemClaimed' AND "Payload"->>'queueItemId' = @QueueItemIdText AND "IsDeleted" = false),
-    (SELECT count(*) FROM "OutboxEvents" WHERE "EventType" = 'PlaybackStarted' AND "Payload"->>'queueItemId' = @QueueItemIdText AND "Payload"->>'trackId' = @TrackIdText AND "Payload"->>'cachePath' = @CachePath AND "IsDeleted" = false);""",
-                        connection
-                    )
-
-                addParameter "QueueItemId" queueItemId assertCommand
-                addParameter "QueueItemIdText" (string queueItemId) assertCommand
-                addParameter "TrackIdText" (string trackId) assertCommand
-                addParameter "CachePath" cachePath assertCommand
-                let! reader = assertCommand.ExecuteReaderAsync()
-                use reader = reader
-                let! hasRow = reader.ReadAsync()
-                Assert.That(hasRow, Is.True)
-                Assert.That(reader.GetString(0), Is.EqualTo("Playing"))
-                Assert.That(reader.GetFieldValue<DateTimeOffset>(1), Is.EqualTo(processedAtUtc))
-                Assert.That(reader.GetInt64(2), Is.EqualTo(1L))
-                Assert.That(reader.GetInt64(3), Is.EqualTo(1L))
-            })
-
-    [<Test>]
-    let ``playback service refuses a second cached queue item while first item is playing`` () =
-        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
-            task {
+                let nowUtc = DateTimeOffset(2026, 7, 10, 17, 0, 0, TimeSpan.Zero)
                 let firstTrackId = newId ()
                 let secondTrackId = newId ()
-                let firstTrackFileId = newId ()
-                let secondTrackFileId = newId ()
+                let firstFileId = newId ()
+                let secondFileId = newId ()
                 let firstQueueItemId = newId ()
                 let secondQueueItemId = newId ()
-                let requestedAtUtc = DateTimeOffset(2026, 7, 9, 1, 0, 0, TimeSpan.Zero)
-                let processedAtUtc = requestedAtUtc.AddSeconds(30.0)
 
                 use connection = new NpgsqlConnection(connectionString)
                 do! connection.OpenAsync()
-                use insertCommand =
+                use setup =
                     new NpgsqlCommand(
-                        """INSERT INTO "Tracks" ("Id", "Title", "Artist", "CreatedAtUtc", "UpdatedAtUtc", "IsDeleted")
-VALUES
-    (@FirstTrackId, 'First cached title', 'Cached artist', @RequestedAtUtc, @RequestedAtUtc, false),
-    (@SecondTrackId, 'Second cached title', 'Cached artist', @RequestedAtUtc, @RequestedAtUtc, false);
-
-INSERT INTO "TrackFiles" (
-    "Id", "TrackId", "StorageBackendId", "StoragePath", "CachePath", "ContentType", "SizeBytes", "IsCached",
-    "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc"
-)
-VALUES
-    (@FirstTrackFileId, @FirstTrackId, NULL, '/library/first.mp3', '/cache/first.mp3', 'audio/mpeg', 1234, true, false, @RequestedAtUtc, @RequestedAtUtc),
-    (@SecondTrackFileId, @SecondTrackId, NULL, '/library/second.mp3', '/cache/second.mp3', 'audio/mpeg', 1234, true, false, @RequestedAtUtc, @RequestedAtUtc);
-
-INSERT INTO "PlaybackQueue" (
-    "Id", "TrackId", "Source", "Status", "Priority", "RequestedAtUtc", "CreatedAtUtc", "UpdatedAtUtc", "IsDeleted"
-)
-VALUES
-    (@FirstQueueItemId, @FirstTrackId, 'playlist', 'Queued', 0, @RequestedAtUtc, @RequestedAtUtc, @RequestedAtUtc, false),
-    (@SecondQueueItemId, @SecondTrackId, 'playlist', 'Queued', 0, @SecondRequestedAtUtc, @SecondRequestedAtUtc, @SecondRequestedAtUtc, false);""",
+                        """INSERT INTO "Tracks" ("Id", "Title", "Artist", "IsDeleted")
+VALUES (@FirstTrackId, 'First', 'Artist', false),
+       (@SecondTrackId, 'Second', 'Artist', false);
+INSERT INTO "TrackFiles" ("Id", "TrackId", "StoragePath", "CachePath", "IsCached", "IsDeleted")
+VALUES (@FirstFileId, @FirstTrackId, '/library/first.mp3', '/cache/first.mp3', true, false),
+       (@SecondFileId, @SecondTrackId, '/library/second.mp3', '/cache/second.mp3', true, false);
+INSERT INTO "PlaybackQueue" ("Id", "TrackId", "Source", "Status", "Priority", "RequestedAtUtc")
+VALUES (@FirstQueueItemId, @FirstTrackId, 'playlist', 'Queued', 0, @NowUtc),
+       (@SecondQueueItemId, @SecondTrackId, 'playlist', 'Queued', 0, @SecondRequestedAtUtc);""",
                         connection
                     )
 
-                addParameter "FirstTrackId" firstTrackId insertCommand
-                addParameter "SecondTrackId" secondTrackId insertCommand
-                addParameter "FirstTrackFileId" firstTrackFileId insertCommand
-                addParameter "SecondTrackFileId" secondTrackFileId insertCommand
-                addParameter "FirstQueueItemId" firstQueueItemId insertCommand
-                addParameter "SecondQueueItemId" secondQueueItemId insertCommand
-                addParameter "RequestedAtUtc" requestedAtUtc insertCommand
-                addParameter "SecondRequestedAtUtc" (requestedAtUtc.AddSeconds(1.0)) insertCommand
-                let! _ = insertCommand.ExecuteNonQueryAsync()
+                for name, value in
+                    [ "FirstTrackId", box firstTrackId
+                      "SecondTrackId", box secondTrackId
+                      "FirstFileId", box firstFileId
+                      "SecondFileId", box secondFileId
+                      "FirstQueueItemId", box firstQueueItemId
+                      "SecondQueueItemId", box secondQueueItemId
+                      "NowUtc", box nowUtc
+                      "SecondRequestedAtUtc", box (nowUtc.AddSeconds(1.0)) ] do
+                    setup.Parameters.AddWithValue(name, value) |> ignore
 
+                let! _ = setup.ExecuteNonQueryAsync()
                 use dataSource = NpgsqlDataSource.Create(connectionString)
                 let generator = idGenerator ()
-                let clock = clockAt processedAtUtc
-                let streamNodeState = StreamNodeHeartbeatState()
-                let dispatcher = createDispatcher dataSource generator clock streamNodeState
-                let publisher = createPublisher dataSource dispatcher clock
-                let service =
-                    new PlaybackProgramHostedService(
+                let clock = clockAt nowUtc
+                let playback = new PlaybackProgramHostedService(dataSource, generator, clock, NullLogger<PlaybackProgramHostedService>.Instance)
+                let lifetime = TestApplicationLifetime()
+                let dispatcher =
+                    DomainEventDispatcher(
                         dataSource,
-                        publisher,
                         generator,
                         clock,
-                        NullLogger<PlaybackProgramHostedService>.Instance
+                        StreamNodeHeartbeatState(),
+                        playback :> IPlaybackQueueWorkflow,
+                        NoopLibraryWorkflow() :> ILibraryScanWorkflow,
+                        lifetime :> IHostApplicationLifetime,
+                        NullLogger<DomainEventDispatcher>.Instance
                     )
+                    :> IDomainEventDispatcher
 
-                let! firstResult = service.ProcessOneQueueItemAsync(CancellationToken.None)
-                let! secondResult = service.ProcessOneQueueItemAsync(CancellationToken.None)
-                assertOkTrue "first cached playback processing" firstResult
-                assertOkFalse "second cached playback processing while first is active" secondResult
+                let relay = new OutboxRelayHostedService(dataSource, dispatcher, clock, generator, NullLogger<OutboxRelayHostedService>.Instance)
 
-                use assertCommand =
+                let! firstClaimed = playback.ProcessOneQueueItemAsync(CancellationToken.None)
+                assertOkTrue "the first queue claim" firstClaimed
+
+                for transition in [ "claim dispatch"; "start notification dispatch" ] do
+                    let! result = relay.ProcessDueEventsOnceAsync(CancellationToken.None)
+                    match result with
+                    | Ok 1 -> ()
+                    | actual -> Assert.Fail(sprintf "Expected %s to dispatch one durable event, but got %A." transition actual)
+
+                use playingCommand =
                     new NpgsqlCommand(
-                        """SELECT
-    (SELECT count(*) FROM "PlaybackQueue" WHERE "Status" = 'Playing' AND "IsDeleted" = false),
-    (SELECT "Status" FROM "PlaybackQueue" WHERE "Id" = @FirstQueueItemId AND "IsDeleted" = false),
-    (SELECT "Status" FROM "PlaybackQueue" WHERE "Id" = @SecondQueueItemId AND "IsDeleted" = false);""",
+                        """SELECT "Status", "ClaimOwner", "ClaimAttempt"
+FROM "PlaybackQueue"
+WHERE "Id" = @QueueItemId;""",
                         connection
                     )
 
-                addParameter "FirstQueueItemId" firstQueueItemId assertCommand
-                addParameter "SecondQueueItemId" secondQueueItemId assertCommand
-                let! reader = assertCommand.ExecuteReaderAsync()
+                playingCommand.Parameters.AddWithValue("QueueItemId", firstQueueItemId) |> ignore
+                let! playingReader = playingCommand.ExecuteReaderAsync()
+                use playingReader = playingReader
+                let! hasPlayingRow = playingReader.ReadAsync()
+                Assert.That(hasPlayingRow, Is.True)
+                Assert.That(playingReader.GetString(0), Is.EqualTo("Playing"), "PlaybackStarted must not auto-complete audio before stream-node reports an outcome.")
+                let firstOwner = playingReader.GetGuid(1)
+                let firstAttempt = playingReader.GetInt32(2)
+                do! playingReader.CloseAsync()
+
+                let reporter = PlaybackCompletionReporter(dataSource, generator, clock) :> IPlaybackCompletionReporter
+                let! renewed = reporter.RenewLeaseAsync firstQueueItemId firstOwner firstAttempt CancellationToken.None
+                assertOkTrue "the active stream-node lease renewal" renewed
+                let! staleRenewal = reporter.RenewLeaseAsync firstQueueItemId (newId ()) firstAttempt CancellationToken.None
+                match staleRenewal with
+                | Ok false -> ()
+                | actual -> Assert.Fail(sprintf "Expected stale stream-node lease renewal to be fenced, but got %A." actual)
+
+                let! completed = reporter.ReportAsync firstQueueItemId firstOwner firstAttempt Succeeded CancellationToken.None
+                assertOkTrue "the authoritative successful completion callback" completed
+                let! endedRelayResult = relay.ProcessDueEventsOnceAsync(CancellationToken.None)
+                match endedRelayResult with
+                | Ok 1 -> ()
+                | actual -> Assert.Fail(sprintf "Expected the successful PlaybackEnded event to relay once, but got %A." actual)
+
+                let! secondClaimed = playback.ProcessOneQueueItemAsync(CancellationToken.None)
+                assertOkTrue "the next queue claim after authoritative Played completion" secondClaimed
+
+                use assertion =
+                    new NpgsqlCommand(
+                        """SELECT
+    (SELECT "Status" FROM "PlaybackQueue" WHERE "Id" = @FirstQueueItemId),
+    (SELECT "Status" FROM "PlaybackQueue" WHERE "Id" = @SecondQueueItemId),
+    (SELECT count(*) FROM "OutboxEvents" WHERE "EventType" = 'PlaybackEnded' AND "Payload"->>'status' = 'played' AND "IsDeleted" = false),
+    (SELECT count(*) FROM "OutboxEvents" WHERE "EventType" = 'PlaybackStarted' AND "Status" = 'Processed' AND "IsDeleted" = false);""",
+                        connection
+                    )
+
+                assertion.Parameters.AddWithValue("FirstQueueItemId", firstQueueItemId) |> ignore
+                assertion.Parameters.AddWithValue("SecondQueueItemId", secondQueueItemId) |> ignore
+                let! reader = assertion.ExecuteReaderAsync()
                 use reader = reader
                 let! hasRow = reader.ReadAsync()
                 Assert.That(hasRow, Is.True)
-                Assert.That(reader.GetInt64(0), Is.EqualTo(1L))
-                Assert.That(reader.GetString(1), Is.EqualTo("Playing"))
-                Assert.That(reader.GetString(2), Is.EqualTo("Queued"))
+                Assert.That(reader.GetString(0), Is.EqualTo("Played"))
+                Assert.That(reader.GetString(1), Is.EqualTo("Claimed"), "The next ordered item must advance only after authoritative completion.")
+                Assert.That(reader.GetInt64(2), Is.EqualTo(1L))
+                Assert.That(reader.GetInt64(3), Is.EqualTo(1L))
             })
 
     [<Test>]
-    let ``DonationPaid dispatcher rejects mismatched amount without marking payment paid`` () =
+    let ``durable publication stays Pending until one overlapping relay owns its sole dispatch attempt`` () =
         DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
             task {
+                let nowUtc = DateTimeOffset(2026, 7, 10, 18, 0, 0, TimeSpan.Zero)
                 use dataSource = NpgsqlDataSource.Create(connectionString)
-                let paymentId = newId ()
-                let createdAtUtc = DateTimeOffset(2026, 7, 9, 2, 0, 0, TimeSpan.Zero)
-                let paidAtUtc = createdAtUtc.AddMinutes(1.0)
-                let chargeId = "telegram-charge-mismatch"
+                let generator = idGenerator ()
+                let clock = clockAt nowUtc
+                let published = envelope generator clock TrackRequested "{\"query\":\"one side effect\"}"
+                let publisher = DomainEventPublisher(dataSource) :> IDomainEventPublisher
+                let! publication = publisher.PublishDurableAsync published CancellationToken.None
+
+                match publication with
+                | Ok () -> ()
+                | actual -> Assert.Fail(sprintf "Expected durable publication to append the event, but got %A." actual)
+
+                let blockingDispatcher = BlockingRelayDispatcher()
+                Assert.That(blockingDispatcher.Calls, Is.EqualTo(0), "Publishing durably must not invoke a handler before a relay claims the event.")
 
                 use connection = new NpgsqlConnection(connectionString)
                 do! connection.OpenAsync()
-                use insertCommand =
-                    new NpgsqlCommand(
-                        """INSERT INTO "Payments" (
-    "Id", "Purpose", "AmountStars", "Currency", "TelegramInvoicePayload", "Status", "CreatedAtUtc", "UpdatedAtUtc", "IsDeleted"
-)
-VALUES (@PaymentId, 'Donation', 42, 'XTR', 'invoice-payload', 'InvoiceCreated', @CreatedAtUtc, @CreatedAtUtc, false);""",
-                        connection
-                    )
+                use pendingCommand = new NpgsqlCommand("SELECT \"Status\", \"Attempts\" FROM \"OutboxEvents\" WHERE \"Id\" = @EventId;", connection)
+                pendingCommand.Parameters.AddWithValue("EventId", published.EventId) |> ignore
+                let! pendingReader = pendingCommand.ExecuteReaderAsync()
+                use pendingReader = pendingReader
+                let! hasPendingRow = pendingReader.ReadAsync()
+                Assert.That(hasPendingRow, Is.True)
+                Assert.That(pendingReader.GetString(0), Is.EqualTo("Pending"))
+                Assert.That(pendingReader.GetInt32(1), Is.EqualTo(0))
+                do! pendingReader.CloseAsync()
 
-                addParameter "PaymentId" paymentId insertCommand
-                addParameter "CreatedAtUtc" createdAtUtc insertCommand
-                let! _ = insertCommand.ExecuteNonQueryAsync()
+                let firstRelay = new OutboxRelayHostedService(dataSource, blockingDispatcher :> IDomainEventDispatcher, clock, generator, NullLogger<OutboxRelayHostedService>.Instance)
+                let secondRelay = new OutboxRelayHostedService(dataSource, blockingDispatcher :> IDomainEventDispatcher, clock, generator, NullLogger<OutboxRelayHostedService>.Instance)
+                let firstAttempt = firstRelay.ProcessDueEventsOnceAsync(CancellationToken.None)
+                do! blockingDispatcher.Entered
 
-                let generator = idGenerator ()
-                let clock = clockAt paidAtUtc
-                let streamNodeState = StreamNodeHeartbeatState()
-                let dispatcher = createDispatcher dataSource generator clock streamNodeState
-                let payloadJson =
-                    sprintf
-                        "{\"paymentId\":\"%O\",\"telegramPaymentChargeId\":\"%s\",\"amountStars\":41,\"currency\":\"XTR\"}"
-                        paymentId
-                        chargeId
+                let! overlappingAttempt = secondRelay.ProcessDueEventsOnceAsync(CancellationToken.None)
+                match overlappingAttempt with
+                | Ok 0 -> ()
+                | actual -> Assert.Fail(sprintf "The second relay must observe the held dispatch lease instead of invoking the handler, but got %A." actual)
+                Assert.That(blockingDispatcher.Calls, Is.EqualTo(1))
 
-                let envelopeResult =
-                    DomainEventEnvelope.create generator clock DomainEventType.DonationPaid "web10.radio.tests" None None payloadJson
+                blockingDispatcher.Release()
+                let! firstResult = firstAttempt
+                match firstResult with
+                | Ok 1 -> ()
+                | actual -> Assert.Fail(sprintf "Expected the first relay to complete one dispatch, but got %A." actual)
+                Assert.That(blockingDispatcher.Calls, Is.EqualTo(1), "A durable handler side effect must be invoked once despite relay overlap.")
 
-                let envelope =
-                    match envelopeResult with
-                    | Ok envelope -> envelope
-                    | Error error -> Assert.Fail(sprintf "Expected valid envelope, but got %A." error); Unchecked.defaultof<_>
-
-                let! dispatchResult = dispatcher.DispatchAsync envelope CancellationToken.None
-                match dispatchResult with
-                | Error(PaymentStateRejected rejectedPaymentId) -> Assert.That(rejectedPaymentId, Is.EqualTo(paymentId))
-                | actual -> Assert.Fail(sprintf "Expected payment state rejection for mismatched amount, but got %A." actual)
-
-                use assertCommand =
-                    new NpgsqlCommand(
-                        """SELECT "Status", "TelegramPaymentChargeId", "PaidAtUtc"
-FROM "Payments"
-WHERE "Id" = @PaymentId
-  AND "IsDeleted" = false;""",
-                        connection
-                    )
-
-                addParameter "PaymentId" paymentId assertCommand
-                let! reader = assertCommand.ExecuteReaderAsync()
-                use reader = reader
-                let! hasRow = reader.ReadAsync()
-                Assert.That(hasRow, Is.True)
-                Assert.That(reader.GetString(0), Is.EqualTo("InvoiceCreated"))
-                Assert.That(reader.IsDBNull(1), Is.True)
-                Assert.That(reader.IsDBNull(2), Is.True)
+                use terminalCommand = new NpgsqlCommand("SELECT \"Status\", \"Attempts\" FROM \"OutboxEvents\" WHERE \"Id\" = @EventId;", connection)
+                terminalCommand.Parameters.AddWithValue("EventId", published.EventId) |> ignore
+                let! terminalReader = terminalCommand.ExecuteReaderAsync()
+                use terminalReader = terminalReader
+                let! hasTerminalRow = terminalReader.ReadAsync()
+                Assert.That(hasTerminalRow, Is.True)
+                Assert.That(terminalReader.GetString(0), Is.EqualTo("Processed"))
+                Assert.That(terminalReader.GetInt32(1), Is.EqualTo(1))
             })
 
     [<Test>]
-    let ``production background worker composition resolves dispatch publisher ingestor and hosted workers`` () =
+    let ``row S3 backend overrides Local configuration with exact uncached discoveries and per-page lease renewal`` () =
         DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
             task {
-                let tempRoot = Directory.CreateTempSubdirectory("web10-radio-di-")
+                let nowUtc = DateTimeOffset(2026, 7, 10, 19, 0, 0, TimeSpan.Zero)
+                let jobId = newId ()
+                let storageBackendId = newId ()
+                use dataSource = NpgsqlDataSource.Create(connectionString)
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+                use insertJob =
+                    new NpgsqlCommand(
+                        """INSERT INTO "StorageBackends" ("Id", "Name", "Type", "S3Bucket", "IsEnabled", "IsDeleted")
+VALUES (@StorageBackendId, 'row-s3', 'S3', 'row-radio-bucket', true, false);
+INSERT INTO "LibraryScanJobs" ("Id", "StorageBackendId", "Status", "RequestedAtUtc", "CreatedAtUtc", "UpdatedAtUtc", "IsDeleted")
+VALUES (@JobId, @StorageBackendId, 'Queued', @NowUtc, @NowUtc, @NowUtc, false);""",
+                        connection
+                    )
 
-                try
-                    let services = ServiceCollection()
-                    services.AddLogging() |> ignore
-                    services.AddSingleton<StreamNodeHeartbeatState>() |> ignore
+                insertJob.Parameters.AddWithValue("JobId", jobId) |> ignore
+                insertJob.Parameters.AddWithValue("StorageBackendId", storageBackendId) |> ignore
+                insertJob.Parameters.AddWithValue("NowUtc", nowUtc) |> ignore
+                let! _ = insertJob.ExecuteNonQueryAsync()
 
-                    services
-                    |> DatabaseComposition.addDatabase { ConnectionString = connectionString }
-                    |> ApplicationComposition.addApplicationServices
-                    |> BackgroundWorkerComposition.addBackgroundWorkers (testOptions connectionString tempRoot.FullName)
-                    |> ignore
+                let generator = idGenerator ()
+                let clock = SteppingClock(nowUtc) :> IClock
+                let enumerator =
+                    LeaseObservingS3Enumerator(
+                        dataSource,
+                        jobId,
+                        [ [ { Key = "first/Artist - First.mp3"; SizeBytes = 101L } ]
+                          [ { Key = "second/Artist - Second.flac"; SizeBytes = 202L }
+                            { Key = "second/ignored.txt"; SizeBytes = 1L } ] ]
+                    )
 
-                    use provider = services.BuildServiceProvider()
-                    Assert.That(provider.GetRequiredService<IDomainEventDispatcher>(), Is.Not.Null)
-                    Assert.That(provider.GetRequiredService<IDomainEventPublisher>(), Is.Not.Null)
-                    Assert.That(provider.GetRequiredService<ITelegramUpdateEventIngestor>(), Is.Not.Null)
+                let scanner =
+                    new LibraryScanHostedService(
+                        dataSource,
+                        generator,
+                        clock,
+                        testOptions connectionString Local "/unused-local-default" "",
+                        enumerator :> IS3ObjectEnumerator,
+                        NullLogger<LibraryScanHostedService>.Instance
+                    )
 
-                    let hostedServices = provider.GetServices<IHostedService>() |> Seq.toArray
-                    Assert.That(hostedServices |> Array.exists (fun service -> service :? OutboxRelayHostedService), Is.True)
-                    Assert.That(hostedServices |> Array.exists (fun service -> service :? LibraryScanHostedService), Is.True)
-                    Assert.That(hostedServices |> Array.exists (fun service -> service :? PlaybackProgramHostedService), Is.True)
-                finally
-                    tempRoot.Delete(true)
+                let lifetime = TestApplicationLifetime()
+                let dispatcher =
+                    DomainEventDispatcher(
+                        dataSource,
+                        generator,
+                        clock,
+                        StreamNodeHeartbeatState(),
+                        NoopPlaybackWorkflow() :> IPlaybackQueueWorkflow,
+                        scanner :> ILibraryScanWorkflow,
+                        lifetime :> IHostApplicationLifetime,
+                        NullLogger<DomainEventDispatcher>.Instance
+                    )
+                    :> IDomainEventDispatcher
+
+                let requested = envelope generator clock LibraryScanRequested (sprintf "{\"libraryScanJobId\":\"%O\"}" jobId)
+                let! dispatched = dispatcher.DispatchAsync requested CancellationToken.None
+                match dispatched with
+                | Ok () -> ()
+                | actual -> Assert.Fail(sprintf "Expected LibraryScanRequested to invoke the S3 row backend, but got %A." actual)
+
+                Assert.That(enumerator.Calls, Is.EqualTo(2), "The scanner must visit each S3 page.")
+                Assert.That(enumerator.ObservedLeaseExpirations, Is.EqualTo(box [ nowUtc.AddMinutes(7.0); nowUtc.AddMinutes(10.0) ]), "The claimed scan lease must be renewed after each page callback before enumeration advances.")
+
+                use jobCommand = new NpgsqlCommand("SELECT \"Status\" FROM \"LibraryScanJobs\" WHERE \"Id\" = @JobId;", connection)
+                jobCommand.Parameters.AddWithValue("JobId", jobId) |> ignore
+                let! jobReader = jobCommand.ExecuteReaderAsync()
+                use jobReader = jobReader
+                let! hasJob = jobReader.ReadAsync()
+                Assert.That(hasJob, Is.True)
+                Assert.That(jobReader.GetString(0), Is.EqualTo("Completed"))
+                do! jobReader.CloseAsync()
+
+                use filesCommand =
+                    new NpgsqlCommand(
+                        """SELECT tf."StoragePath", tf."SizeBytes", tf."CachePath", tf."IsCached", tf."StorageBackendId", tf."TrackId", tf."Id"
+FROM "TrackFiles" tf
+WHERE tf."IsDeleted" = false
+ORDER BY tf."StoragePath";""",
+                        connection
+                    )
+                let! filesReader = filesCommand.ExecuteReaderAsync()
+                use filesReader = filesReader
+                let files = ResizeArray<string * int64 * string option * bool * Guid * Guid * Guid>()
+
+                while filesReader.Read() do
+                    files.Add(
+                        ( filesReader.GetString(0),
+                          filesReader.GetInt64(1),
+                          (if filesReader.IsDBNull(2) then None else Some(filesReader.GetString(2))),
+                          filesReader.GetBoolean(3),
+                          filesReader.GetGuid(4),
+                          filesReader.GetGuid(5),
+                          filesReader.GetGuid(6) )
+                    )
+
+                let expectedFiles : (string * int64 * string option * bool * Guid) list = [ ("first/Artist - First.mp3", 101L, None, false, storageBackendId); ("second/Artist - Second.flac", 202L, None, false, storageBackendId) ]
+                Assert.That(files |> Seq.map (fun (path, size, cachePath, isCached, backendId, _, _) -> path, size, cachePath, isCached, backendId) |> Seq.toList, Is.EqualTo(box expectedFiles))
+                do! filesReader.CloseAsync()
+
+                use eventsCommand =
+                    new NpgsqlCommand(
+                        """SELECT "Payload"::text
+FROM "OutboxEvents"
+WHERE "EventType" = 'TrackDiscovered' AND "Status" = 'Pending' AND "IsDeleted" = false
+ORDER BY "Payload"->>'storagePath';""",
+                        connection
+                    )
+                let! eventsReader = eventsCommand.ExecuteReaderAsync()
+                use eventsReader = eventsReader
+                let payloads = ResizeArray<string>()
+
+                while eventsReader.Read() do
+                    payloads.Add(eventsReader.GetString(0))
+
+                let expectedPayloads =
+                    files
+                    |> Seq.map (fun (storagePath, _, _, _, _, trackId, trackFileId) -> storagePath, trackId, trackFileId)
+                    |> Seq.toList
+
+                Assert.That(payloads.Count, Is.EqualTo(expectedPayloads.Length))
+
+                for payload, (storagePath, trackId, trackFileId) in Seq.zip payloads expectedPayloads do
+                    use document = System.Text.Json.JsonDocument.Parse(payload)
+                    let root = document.RootElement
+                    Assert.That(root.EnumerateObject() |> Seq.map (fun property -> property.Name) |> Set.ofSeq, Is.EqualTo(box (Set.ofList [ "storagePath"; "trackFileId"; "trackId" ])))
+                    Assert.That(root.GetProperty("storagePath").GetString(), Is.EqualTo(storagePath))
+                    Assert.That(root.GetProperty("trackId").GetGuid(), Is.EqualTo(trackId))
+                    Assert.That(root.GetProperty("trackFileId").GetGuid(), Is.EqualTo(trackFileId))
             })
+
+    [<Test>]
+    let ``scanner cancellation after claim records retryable failure without late track discovery`` () =
+        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
+            task {
+                let nowUtc = DateTimeOffset(2026, 7, 10, 20, 0, 0, TimeSpan.Zero)
+                let jobId = newId ()
+                use dataSource = NpgsqlDataSource.Create(connectionString)
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+                use insertJob =
+                    new NpgsqlCommand(
+                        """INSERT INTO "LibraryScanJobs" ("Id", "Status", "RequestedAtUtc", "CreatedAtUtc", "UpdatedAtUtc", "IsDeleted")
+VALUES (@JobId, 'Queued', @NowUtc, @NowUtc, @NowUtc, false);""",
+                        connection
+                    )
+
+                insertJob.Parameters.AddWithValue("JobId", jobId) |> ignore
+                insertJob.Parameters.AddWithValue("NowUtc", nowUtc) |> ignore
+                let! _ = insertJob.ExecuteNonQueryAsync()
+
+                let enumerator = BlockingS3Enumerator()
+                let scanner =
+                    new LibraryScanHostedService(
+                        dataSource,
+                        idGenerator (),
+                        clockAt nowUtc,
+                        testOptions connectionString S3 "" "radio-test-bucket",
+                        enumerator :> IS3ObjectEnumerator,
+                        NullLogger<LibraryScanHostedService>.Instance
+                    )
+
+                use cancellation = new CancellationTokenSource()
+                let processing = scanner.ProcessOneJobAsync(cancellation.Token)
+                do! enumerator.Entered
+                cancellation.Cancel()
+                let! processingResult = processing
+                match processingResult with
+                | Error(UnexpectedException("LibraryScanHostedService", _)) -> ()
+                | actual -> Assert.Fail(sprintf "Expected cancellation to surface as scan processing failure, but got %A." actual)
+
+                use assertion =
+                    new NpgsqlCommand(
+                        """SELECT
+    (SELECT "Status" FROM "LibraryScanJobs" WHERE "Id" = @JobId),
+    (SELECT count(*) FROM "Tracks" WHERE "IsDeleted" = false),
+    (SELECT count(*) FROM "OutboxEvents" WHERE "EventType" = 'StreamNodeFailureDetected' AND "IsDeleted" = false),
+    (SELECT count(*) FROM "StreamNodeHeartbeats" WHERE "Status" = 'Degraded' AND "IsDeleted" = false);""",
+                        connection
+                    )
+
+                assertion.Parameters.AddWithValue("JobId", jobId) |> ignore
+                let! reader = assertion.ExecuteReaderAsync()
+                use reader = reader
+                let! hasRow = reader.ReadAsync()
+                Assert.That(hasRow, Is.True)
+                Assert.That(reader.GetString(0), Is.EqualTo("Failed"))
+                Assert.That(reader.GetInt64(1), Is.EqualTo(0L), "Cancellation must not permit a late discovery write after the claimed workflow terminates.")
+                Assert.That(reader.GetInt64(2), Is.EqualTo(0L), "A library scan failure must not emit a stream-node failure event.")
+                Assert.That(reader.GetInt64(3), Is.EqualTo(0L), "A library scan failure must not degrade stream-node health.")
+            })
+
+    [<Test>]
+    let ``ApplicationStopping cancels queued mailbox work and post-stop dispatch cannot execute`` () =
+        task {
+            let generator = idGenerator ()
+            let nowUtc = DateTimeOffset(2026, 7, 10, 21, 0, 0, TimeSpan.Zero)
+            let queueWorkflow = BlockingQueueWorkflow()
+            let lifetime = TestApplicationLifetime()
+            use dataSource = NpgsqlDataSource.Create("Host=localhost;Database=unused;Username=unused;Password=unused")
+            let dispatcher =
+                DomainEventDispatcher(
+                    dataSource,
+                    generator,
+                    clockAt nowUtc,
+                    StreamNodeHeartbeatState(),
+                    queueWorkflow :> IPlaybackQueueWorkflow,
+                    NoopLibraryWorkflow() :> ILibraryScanWorkflow,
+                    lifetime :> IHostApplicationLifetime,
+                    NullLogger<DomainEventDispatcher>.Instance
+                )
+                :> IDomainEventDispatcher
+
+            let first = envelope generator (clockAt nowUtc) PlaybackEnded "{}"
+            let second = envelope generator (clockAt nowUtc) PlaybackEnded "{}"
+            let third = envelope generator (clockAt nowUtc) PlaybackEnded "{}"
+            let _ = dispatcher.DispatchAsync first CancellationToken.None
+            do! queueWorkflow.Entered.WaitAsync(TimeSpan.FromSeconds(10.0))
+            let queuedDispatch = dispatcher.DispatchAsync second CancellationToken.None
+            (lifetime :> IHostApplicationLifetime).StopApplication()
+
+            try
+                let! _ = queuedDispatch.WaitAsync(TimeSpan.FromSeconds(10.0))
+                Assert.Fail("Expected ApplicationStopping to cancel queued dispatch before workflow execution.")
+            with :? TaskCanceledException -> ()
+
+            Assert.That(queueWorkflow.Calls, Is.EqualTo(1), "Stopping must cancel queued mailbox work before a second workflow call can begin.")
+            queueWorkflow.Release()
+
+
+            let postStopDispatch = dispatcher.DispatchAsync third CancellationToken.None
+
+            try
+                let! _ = postStopDispatch.WaitAsync(TimeSpan.FromSeconds(10.0))
+                Assert.Fail("Expected dispatch after ApplicationStopping to be canceled without entering the workflow.")
+            with :? TaskCanceledException -> ()
+
+            Assert.That(queueWorkflow.Calls, Is.EqualTo(1), "Stopping must reject post-stop dispatch without late workflow calls.")
+
+        }
+
+    [<Test>]
+    let ``S3 object enumerator visits every ListObjectsV2 page and propagates cancellation`` () =
+        task {
+            use client = new PagedAmazonS3Client()
+            let enumerator = new S3ObjectEnumerator(client) :> IS3ObjectEnumerator
+            let visited = ResizeArray<S3ObjectDescriptor list>()
+
+            do!
+                enumerator.VisitPagesAsync(
+                    "test-bucket",
+                    (fun page _ ->
+                        visited.Add(List.ofSeq page)
+                        Task.CompletedTask),
+                    CancellationToken.None
+                )
+
+            Assert.That(client.ContinuationTokens |> List.length, Is.EqualTo(2))
+            Assert.That(client.ContinuationTokens |> List.head, Is.EqualTo(None))
+            Assert.That(client.ContinuationTokens |> List.last, Is.EqualTo(Some "page-2"))
+            let descriptors = visited |> Seq.collect id |> Seq.toArray
+            Assert.That(descriptors.Length, Is.EqualTo(2))
+            Assert.That(descriptors[0].Key, Is.EqualTo("first.mp3"))
+            Assert.That(descriptors[1].Key, Is.EqualTo("second.flac"))
+            Assert.That(descriptors[0].SizeBytes, Is.EqualTo(101L))
+            Assert.That(descriptors[1].SizeBytes, Is.EqualTo(202L))
+
+            use cancellation = new CancellationTokenSource()
+            cancellation.Cancel()
+
+            try
+                do! enumerator.VisitPagesAsync("test-bucket", (fun _ _ -> Task.CompletedTask), cancellation.Token)
+                Assert.Fail("Expected a canceled VisitPagesAsync call to propagate cancellation.")
+            with :? OperationCanceledException -> ()
+        }

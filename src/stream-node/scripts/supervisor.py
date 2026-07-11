@@ -851,7 +851,8 @@ class Supervisor:
             self._mark_degraded(failure_reason, now)
         self._completion_pending = (assignment, status, failure_reason)
         self._next_completion_retry_at = now
-        self._stop_media()
+        if status == "failed":
+            self._stop_media()
         with self._lock:
             self._callback_identity = None
         self._service_pending_completion(now)
@@ -1301,7 +1302,7 @@ def _annotated_file_uri(assignment: Assignment, media_path: Path) -> str:
         f'title="{_annotation_value(assignment.title)}",'
         f'artist="{_annotation_value(assignment.artist)}"'
     )
-    return f"annotate:{''.join(metadata)}:{media_path.as_uri()}"
+    return f"annotate:{''.join(metadata)}:{media_path}"
 
 
 def _process_alive(process: subprocess.Popen[bytes] | None) -> bool:

@@ -193,8 +193,11 @@ type private PlayerEventsEnumerator(dataSource: NpgsqlDataSource, clock: IClock,
                     | 3 ->
                         current <- SseItem<JsonElement>(ApiJson.toElement snapshot.DonationGoal, "player.donation")
                         eventIndex <- 4
-                    | _ ->
+                    | 4 ->
                         current <- SseItem<JsonElement>(ApiJson.toElement snapshot.Stream, "player.health")
+                        eventIndex <- 5
+                    | _ ->
+                        current <- SseItem<JsonElement>(ApiJson.toElement snapshot, "player.state")
                         eventIndex <- 1
 
                     return true

@@ -1641,6 +1641,13 @@ WHERE "EventType" = 'SayMessageModerated' AND "Payload" ->> 'sayMessageId' = @Id
                 use healthDocument = JsonDocument.Parse(health.Data)
                 Assert.That(healthDocument.RootElement |> stringProperty "status", Is.EqualTo("live"))
                 Assert.That(healthDocument.RootElement |> intProperty "bitrateKbps", Is.EqualTo(192))
+
+                let! refreshed = readSseEvent reader cancellation.Token
+                Assert.That(refreshed.Name, Is.EqualTo("player.state"))
+                use refreshedDocument = JsonDocument.Parse(refreshed.Data)
+                Assert.That((refreshedDocument.RootElement |> jsonProperty "nowPlaying").ValueKind, Is.EqualTo(JsonValueKind.Object))
+                let refreshedItems = refreshedDocument.RootElement |> jsonProperty "queue" |> jsonProperty "items"
+                Assert.That(refreshedItems.[0] |> stringProperty "title", Is.EqualTo("SSE queue track"))
             })
 
     [<Test>]

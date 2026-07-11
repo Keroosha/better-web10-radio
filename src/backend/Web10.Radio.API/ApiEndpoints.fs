@@ -791,39 +791,62 @@ module ApiEndpoints =
     /// handling never forks. Records adapter-state progress/errors as a side effect.
     let processTelegramUpdate (services: IServiceProvider) (update: Update) (cancellationToken: CancellationToken) : Task<TelegramUpdateProcessingOutcome> =
         task {
-            let state = services.GetRequiredService<ITelegramAdapterState>()
+            use attempt = FlowTelemetry.start FlowTelemetry.TelegramUpdate
+            FlowTelemetry.addTag "telegram.update_id" (box update.UpdateId) attempt
 
-            match mapTelegramUpdate update with
-            | Error message ->
-                state.RecordError("request.invalid")
-                return TelegramUpdateRejected message
-            | Ok Ignored ->
-                state.RecordUpdate(update.UpdateId)
-                return TelegramUpdateAccepted
-            | Ok(PreCheckout preCheckout) ->
-                let workflow = services.GetRequiredService<ITelegramPreCheckoutWorkflow>()
-                let! result = workflow.HandleAsync preCheckout cancellationToken
+            let finish outcome =
+                FlowTelemetry.finish outcome [] attempt |> ignore
 
-                match result with
-                | Ok() ->
+            try
+                let state = services.GetRequiredService<ITelegramAdapterState>()
+
+                match mapTelegramUpdate update with
+                | Error message ->
+                    state.RecordError("request.invalid")
+                    finish "rejected"
+                    return TelegramUpdateRejected message
+                | Ok Ignored ->
+                    FlowTelemetry.addTag "event.type" (box "ignored") attempt
                     state.RecordUpdate(update.UpdateId)
+                    finish "ignored"
                     return TelegramUpdateAccepted
-                | Error error ->
-                    state.RecordError("telegram.pre_checkout_unavailable")
-                    return TelegramPreCheckoutUnavailable error
-            | Ok(DurableEvent event) ->
-                let ingestor = services.GetRequiredService<ITelegramUpdateEventIngestor>()
+                | Ok(PreCheckout preCheckout) ->
+                    FlowTelemetry.addTag "event.type" (box "pre_checkout") attempt
+                    let workflow = services.GetRequiredService<ITelegramPreCheckoutWorkflow>()
+                    let! result = workflow.HandleAsync preCheckout cancellationToken
 
-                let! ingestResult =
-                    ingestor.TryIngestAsync update.UpdateId event.EventType "Web10.Radio.Telegram" event.PayloadJson cancellationToken
+                    match result with
+                    | Ok() ->
+                        state.RecordUpdate(update.UpdateId)
+                        finish "accepted"
+                        return TelegramUpdateAccepted
+                    | Error error ->
+                        state.RecordError("telegram.pre_checkout_unavailable")
+                        finish "error"
+                        return TelegramPreCheckoutUnavailable error
+                | Ok(DurableEvent event) ->
+                    FlowTelemetry.addTag "event.type" (box (DomainEventType.toString event.EventType)) attempt
+                    let ingestor = services.GetRequiredService<ITelegramUpdateEventIngestor>()
 
-                match ingestResult with
-                | Ok _ ->
-                    state.RecordUpdate(update.UpdateId)
-                    return TelegramUpdateAccepted
-                | Error error ->
-                    state.RecordError("telegram.webhook.ingest_failed")
-                    return TelegramIngestFailed error
+                    let! ingestResult =
+                        ingestor.TryIngestAsync update.UpdateId event.EventType "Web10.Radio.Telegram" event.PayloadJson cancellationToken
+
+                    match ingestResult with
+                    | Ok true ->
+                        state.RecordUpdate(update.UpdateId)
+                        finish "accepted"
+                        return TelegramUpdateAccepted
+                    | Ok false ->
+                        state.RecordUpdate(update.UpdateId)
+                        finish "duplicate"
+                        return TelegramUpdateAccepted
+                    | Error error ->
+                        state.RecordError("telegram.webhook.ingest_failed")
+                        finish "error"
+                        return TelegramIngestFailed error
+            with error ->
+                FlowTelemetry.finishError "error" [] error attempt |> ignore
+                return raise error
         }
 
     let private telegramWebhook (context: HttpContext) =
@@ -1014,37 +1037,22 @@ module ApiEndpoints =
 
     let private playbackCallback requireOutcome (context: HttpContext) =
         task {
-            if context.Request.ContentLength.HasValue
-               && context.Request.ContentLength.Value > int64 PlaybackCallbackMaxBodyBytes then
-                do!
-                    ApiProblems.write
-                        context
-                        StatusCodes.Status413PayloadTooLarge
-                        "request.too_large"
-                        "Request body too large"
-                        "Playback callback body exceeds the maximum allowed size."
+            let instrument, kindValue =
+                if requireOutcome then
+                    FlowTelemetry.StreamNodePlaybackCompletion, "completion"
+                else
+                    FlowTelemetry.StreamNodePlaybackLease, "lease"
 
-                return StatusCodes.Status413PayloadTooLarge
-            else
-                let buffer = ArrayPool<byte>.Shared.Rent(PlaybackCallbackMaxBodyBytes + 1)
-                use _bufferLease =
-                    { new IDisposable with
-                        member _.Dispose() = ArrayPool<byte>.Shared.Return(buffer, clearArray = true) }
+            use attempt = FlowTelemetry.start instrument
+            let metricTags = [ FlowTelemetry.kind kindValue ]
+            FlowTelemetry.addTag "kind" (box kindValue) attempt
 
-                let! bodyLength = readBoundedBody PlaybackCallbackMaxBodyBytes context buffer
+            let finish outcome =
+                FlowTelemetry.finish outcome metricTags attempt |> ignore
 
-                match parseQueueItemId context, bodyLength with
-                | Error message, _ ->
-                    do!
-                        ApiProblems.write
-                            context
-                            StatusCodes.Status400BadRequest
-                            "request.invalid"
-                            "Invalid request"
-                            message
-
-                    return StatusCodes.Status400BadRequest
-                | _, None ->
+            try
+                if context.Request.ContentLength.HasValue
+                   && context.Request.ContentLength.Value > int64 PlaybackCallbackMaxBodyBytes then
                     do!
                         ApiProblems.write
                             context
@@ -1053,45 +1061,88 @@ module ApiEndpoints =
                             "Request body too large"
                             "Playback callback body exceeds the maximum allowed size."
 
+                    finish "invalid"
                     return StatusCodes.Status413PayloadTooLarge
-                | Ok queueItemId, Some length ->
-                    match parsePlaybackCallback requireOutcome buffer length with
-                    | Error message ->
-                        do! ApiProblems.write context StatusCodes.Status400BadRequest "request.invalid" "Invalid request" message
+                else
+                    let buffer = ArrayPool<byte>.Shared.Rent(PlaybackCallbackMaxBodyBytes + 1)
+                    use _bufferLease =
+                        { new IDisposable with
+                            member _.Dispose() = ArrayPool<byte>.Shared.Return(buffer, clearArray = true) }
+
+                    let! bodyLength = readBoundedBody PlaybackCallbackMaxBodyBytes context buffer
+
+                    match parseQueueItemId context, bodyLength with
+                    | Error message, _ ->
+                        do!
+                            ApiProblems.write
+                                context
+                                StatusCodes.Status400BadRequest
+                                "request.invalid"
+                                "Invalid request"
+                                message
+
+                        finish "invalid"
                         return StatusCodes.Status400BadRequest
-                    | Ok(claimOwner, claimAttempt, outcome) ->
-                        let reporter = context.RequestServices.GetRequiredService<IPlaybackCompletionReporter>()
+                    | _, None ->
+                        do!
+                            ApiProblems.write
+                                context
+                                StatusCodes.Status413PayloadTooLarge
+                                "request.too_large"
+                                "Request body too large"
+                                "Playback callback body exceeds the maximum allowed size."
 
-                        let! result =
-                            match outcome with
-                            | None -> reporter.RenewLeaseAsync queueItemId claimOwner claimAttempt context.RequestAborted
-                            | Some completion ->
-                                reporter.ReportAsync queueItemId claimOwner claimAttempt completion context.RequestAborted
+                        finish "invalid"
+                        return StatusCodes.Status413PayloadTooLarge
+                    | Ok queueItemId, Some length ->
+                        match parsePlaybackCallback requireOutcome buffer length with
+                        | Error message ->
+                            do! ApiProblems.write context StatusCodes.Status400BadRequest "request.invalid" "Invalid request" message
+                            finish "invalid"
+                            return StatusCodes.Status400BadRequest
+                        | Ok(claimOwner, claimAttempt, outcome) ->
+                            FlowTelemetry.addTag "queue.item_id" (box (queueItemId.ToString("D"))) attempt
+                            FlowTelemetry.addTag "claim.owner" (box (claimOwner.ToString("D"))) attempt
+                            FlowTelemetry.addTag "claim.attempt" (box claimAttempt) attempt
 
-                        match result with
-                        | Ok true ->
-                            context.Response.StatusCode <- StatusCodes.Status204NoContent
-                            return StatusCodes.Status204NoContent
-                        | Ok false ->
-                            do!
-                                ApiProblems.write
-                                    context
-                                    StatusCodes.Status409Conflict
-                                    "playback.claim_stale"
-                                    "Playback claim is stale"
-                                    "The playback claim owner or attempt is no longer active."
+                            let reporter = context.RequestServices.GetRequiredService<IPlaybackCompletionReporter>()
 
-                            return StatusCodes.Status409Conflict
-                        | Error error ->
-                            do!
-                                ApiProblems.write
-                                    context
-                                    StatusCodes.Status500InternalServerError
-                                    "playback.callback_failed"
-                                    "Playback callback failed"
-                                    (BackgroundWorkerError.toMessage error)
+                            let! result =
+                                match outcome with
+                                | None -> reporter.RenewLeaseAsync queueItemId claimOwner claimAttempt context.RequestAborted
+                                | Some completion ->
+                                    reporter.ReportAsync queueItemId claimOwner claimAttempt completion context.RequestAborted
 
-                            return StatusCodes.Status500InternalServerError
+                            match result with
+                            | Ok true ->
+                                context.Response.StatusCode <- StatusCodes.Status204NoContent
+                                finish "accepted"
+                                return StatusCodes.Status204NoContent
+                            | Ok false ->
+                                do!
+                                    ApiProblems.write
+                                        context
+                                        StatusCodes.Status409Conflict
+                                        "playback.claim_stale"
+                                        "Playback claim is stale"
+                                        "The playback claim owner or attempt is no longer active."
+
+                                finish "stale"
+                                return StatusCodes.Status409Conflict
+                            | Error error ->
+                                do!
+                                    ApiProblems.write
+                                        context
+                                        StatusCodes.Status500InternalServerError
+                                        "playback.callback_failed"
+                                        "Playback callback failed"
+                                        (BackgroundWorkerError.toMessage error)
+
+                                finish "error"
+                                return StatusCodes.Status500InternalServerError
+            with error ->
+                FlowTelemetry.finishError "error" metricTags error attempt |> ignore
+                return raise error
         }
 
     let private playbackLease context = playbackCallback false context
@@ -1647,39 +1698,71 @@ module ApiEndpoints =
         }
     let private streamHeartbeat (context: HttpContext) =
         task {
-            match! readJsonBody PlaybackCallbackMaxBodyBytes context with
-            | BodyTooLarge ->
-                do! writeRequestTooLarge context
-                return StatusCodes.Status413PayloadTooLarge
-            | BodyParsed root when hasExactProperties (Set.ofList [ "status"; "failureReason"; "metadata" ]) root ->
-                let status = tryString "status" root |> Option.bind (function | "starting" -> Some "Starting" | "live" -> Some "Live" | "degraded" -> Some "Degraded" | "restarting" -> Some "Restarting" | "failed" -> Some "Failed" | "offline" -> Some "Offline" | _ -> None)
-                let reason = tryNullableString "failureReason" root
-                let validNullableNonNegativeInteger name metadata =
-                    match tryProperty name metadata with
-                    | Some value when value.ValueKind = JsonValueKind.Null -> true
-                    | Some value when value.ValueKind = JsonValueKind.Number -> let mutable parsed = 0 in value.TryGetInt32(&parsed) && parsed >= 0
-                    | _ -> false
-                let validNullableGuid metadata =
-                    match tryProperty "activeQueueItemId" metadata with
-                    | Some value when value.ValueKind = JsonValueKind.Null -> true
-                    | Some value when value.ValueKind = JsonValueKind.String -> value.GetString() |> tryPositiveGuid |> Option.isSome
-                    | _ -> false
-                match status, reason, tryProperty "metadata" root with
-                | Some persistedStatus, Some failureReason, Some metadata when hasExactProperties (Set.ofList [ "bitrateKbps"; "restartAttempt"; "activeQueueItemId" ]) metadata && validNullableNonNegativeInteger "bitrateKbps" metadata && validNullableNonNegativeInteger "restartAttempt" metadata && validNullableGuid metadata ->
-                    let payload = JsonSerializer.Serialize({| status = persistedStatus; failureReason = failureReason |> Option.defaultValue null; metadata = metadata |}, ApiJson.options)
-                    let! published = publishEvent context DomainEventType.StreamNodeHeartbeatReceived "Web10.Radio.StreamNode" payload
-                    if published then
-                        context.Response.StatusCode <- StatusCodes.Status204NoContent
-                        return StatusCodes.Status204NoContent
-                    else
-                        do! writeRepositoryFailure context
-                        return StatusCodes.Status500InternalServerError
+            use attempt = FlowTelemetry.start FlowTelemetry.StreamNodeHeartbeat
+
+            let finish outcome metricTags =
+                FlowTelemetry.finish outcome metricTags attempt |> ignore
+
+            try
+                match! readJsonBody PlaybackCallbackMaxBodyBytes context with
+                | BodyTooLarge ->
+                    do! writeRequestTooLarge context
+                    finish "invalid" []
+                    return StatusCodes.Status413PayloadTooLarge
+                | BodyParsed root when hasExactProperties (Set.ofList [ "status"; "failureReason"; "metadata" ]) root ->
+                    let status =
+                        tryString "status" root
+                        |> Option.bind (function
+                            | "starting" -> Some("Starting", "starting")
+                            | "live" -> Some("Live", "live")
+                            | "degraded" -> Some("Degraded", "degraded")
+                            | "restarting" -> Some("Restarting", "restarting")
+                            | "failed" -> Some("Failed", "failed")
+                            | "offline" -> Some("Offline", "offline")
+                            | _ -> None)
+
+                    let reason = tryNullableString "failureReason" root
+
+                    let validNullableNonNegativeInteger name metadata =
+                        match tryProperty name metadata with
+                        | Some value when value.ValueKind = JsonValueKind.Null -> true
+                        | Some value when value.ValueKind = JsonValueKind.Number ->
+                            let mutable parsed = 0
+                            value.TryGetInt32(&parsed) && parsed >= 0
+                        | _ -> false
+
+                    let validNullableGuid metadata =
+                        match tryProperty "activeQueueItemId" metadata with
+                        | Some value when value.ValueKind = JsonValueKind.Null -> true
+                        | Some value when value.ValueKind = JsonValueKind.String -> value.GetString() |> tryPositiveGuid |> Option.isSome
+                        | _ -> false
+
+                    match status, reason, tryProperty "metadata" root with
+                    | Some(persistedStatus, telemetryStatus), Some failureReason, Some metadata when hasExactProperties (Set.ofList [ "bitrateKbps"; "restartAttempt"; "activeQueueItemId" ]) metadata && validNullableNonNegativeInteger "bitrateKbps" metadata && validNullableNonNegativeInteger "restartAttempt" metadata && validNullableGuid metadata ->
+                        FlowTelemetry.addTag "status" (box telemetryStatus) attempt
+                        let metricTags = [ FlowTelemetry.status telemetryStatus ]
+                        let payload = JsonSerializer.Serialize({| status = persistedStatus; failureReason = failureReason |> Option.defaultValue null; metadata = metadata |}, ApiJson.options)
+                        let! published = publishEvent context DomainEventType.StreamNodeHeartbeatReceived "Web10.Radio.StreamNode" payload
+
+                        if published then
+                            context.Response.StatusCode <- StatusCodes.Status204NoContent
+                            finish "accepted" metricTags
+                            return StatusCodes.Status204NoContent
+                        else
+                            do! writeRepositoryFailure context
+                            finish "error" metricTags
+                            return StatusCodes.Status500InternalServerError
+                    | _ ->
+                        do! writeDomainProblem context StatusCodes.Status400BadRequest "stream-node.heartbeat.invalid" "Invalid stream-node heartbeat" "The heartbeat payload is invalid."
+                        finish "invalid" []
+                        return StatusCodes.Status400BadRequest
                 | _ ->
                     do! writeDomainProblem context StatusCodes.Status400BadRequest "stream-node.heartbeat.invalid" "Invalid stream-node heartbeat" "The heartbeat payload is invalid."
+                    finish "invalid" []
                     return StatusCodes.Status400BadRequest
-            | _ ->
-                do! writeDomainProblem context StatusCodes.Status400BadRequest "stream-node.heartbeat.invalid" "Invalid stream-node heartbeat" "The heartbeat payload is invalid."
-                return StatusCodes.Status400BadRequest
+            with error ->
+                FlowTelemetry.finishError "error" [] error attempt |> ignore
+                return raise error
         }
 
     let private currentPlaybackAssignment (context: HttpContext) =

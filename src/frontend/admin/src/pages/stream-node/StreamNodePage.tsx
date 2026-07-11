@@ -140,8 +140,8 @@ export function StreamNodePage(): ReactElement {
   if (isLoading) {
     return (
       <section>
-        <h2 style={{ fontSize: '16px' }}>Stream-node</h2>
-        <p style={{ opacity: 0.7 }}>Loading stream-node status…</p>
+        <h2>Stream-node</h2>
+        <p className="admin-muted">Loading stream-node status…</p>
       </section>
     );
   }
@@ -149,8 +149,8 @@ export function StreamNodePage(): ReactElement {
   if (loadError !== null || status === null) {
     return (
       <section>
-        <h2 style={{ fontSize: '16px' }}>Stream-node</h2>
-        <p role="alert" style={{ color: '#b00020' }}>
+        <h2>Stream-node</h2>
+        <p role="alert" className="admin-error">
           Failed to load stream-node status: {loadError ?? 'Status data was unavailable.'}
         </p>
       </section>
@@ -163,7 +163,7 @@ export function StreamNodePage(): ReactElement {
   return (
     <section>
       <h2 style={{ fontSize: '16px' }}>Stream-node</h2>
-      <p style={{ fontSize: '12px', opacity: 0.7 }}>Status refreshes every second.</p>
+      <p className="admin-muted">Status refreshes every second.</p>
 
       <dl>
         <dt>Status</dt>
@@ -180,9 +180,10 @@ export function StreamNodePage(): ReactElement {
         <dd>Generation {restartGeneration}</dd>
       </dl>
 
-      <div>
+      <div style={{ display: 'flex', gap: '8px', marginTop: '10px' }}>
         <button
           type="button"
+          className="default"
           disabled={pendingAction !== null}
           onClick={() => void runControl('start')}
         >
@@ -205,7 +206,7 @@ export function StreamNodePage(): ReactElement {
       </div>
 
       {actionError !== null ? (
-        <p role="alert" style={{ color: '#b00020' }}>
+        <p role="alert" className="admin-error">
           {actionError}
         </p>
       ) : null}

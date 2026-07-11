@@ -183,8 +183,8 @@ export function StoragePage(): ReactElement {
   if (isLoading) {
     return (
       <section>
-        <h2 style={{ fontSize: '16px' }}>Storage</h2>
-        <p style={{ opacity: 0.7 }}>Loading storage…</p>
+        <h2>Storage</h2>
+        <p className="admin-muted">Loading storage…</p>
       </section>
     );
   }
@@ -192,8 +192,8 @@ export function StoragePage(): ReactElement {
   if (loadError !== null || storage === null) {
     return (
       <section>
-        <h2 style={{ fontSize: '16px' }}>Storage</h2>
-        <p role="alert" style={{ color: '#b00020' }}>
+        <h2>Storage</h2>
+        <p role="alert" className="admin-error">
           Failed to load storage: {loadError ?? 'Storage data was unavailable.'}
         </p>
       </section>
@@ -204,15 +204,13 @@ export function StoragePage(): ReactElement {
 
   return (
     <section>
-      <h2 style={{ fontSize: '16px' }}>Storage</h2>
-      <p style={{ fontSize: '12px', opacity: 0.7 }}>
+      <h2>Storage</h2>
+      <p className="admin-muted">
         The configured default backend is supplied by the environment and cannot be changed here.
       </p>
 
       <section aria-labelledby="default-storage-heading">
-        <h3 id="default-storage-heading" style={{ fontSize: '14px' }}>
-          Configured default backend (read-only)
-        </h3>
+        <h3 id="default-storage-heading">Configured default backend (read-only)</h3>
         <dl>
           <dt>Type</dt>
           <dd>{defaultBackend.type}</dd>
@@ -230,10 +228,8 @@ export function StoragePage(): ReactElement {
       </section>
 
       <section aria-labelledby="additional-storage-heading">
-        <h3 id="additional-storage-heading" style={{ fontSize: '14px' }}>
-          Additional backends
-        </h3>
-        {backends.length === 0 ? <p style={{ opacity: 0.7 }}>No additional backends configured.</p> : null}
+        <h3 id="additional-storage-heading">Additional backends</h3>
+        {backends.length === 0 ? <p className="admin-muted">No additional backends configured.</p> : null}
 
         {backends.map((backend, index) => {
           const isNewestDraft = backend.id === null && index === backends.length - 1;
@@ -298,16 +294,18 @@ export function StoragePage(): ReactElement {
                 </>
               )}
 
-              <label htmlFor={`enabled-${backend.key}`}>Enabled for {enabledLabel}</label>
-              <input
-                id={`enabled-${backend.key}`}
-                type="checkbox"
-                checked={backend.isEnabled}
-                disabled={saveState === 'pending'}
-                onChange={(event) => updateBackend(backend.key, { isEnabled: event.target.checked })}
-              />
-
               <div>
+                <input
+                  id={`enabled-${backend.key}`}
+                  type="checkbox"
+                  checked={backend.isEnabled}
+                  disabled={saveState === 'pending'}
+                  onChange={(event) => updateBackend(backend.key, { isEnabled: event.target.checked })}
+                />
+                <label htmlFor={`enabled-${backend.key}`}>Enabled for {enabledLabel}</label>
+              </div>
+
+              <div style={{ display: 'flex', gap: '6px' }}>
                 <button
                   type="button"
                   disabled={saveState === 'pending' || index === 0}
@@ -334,15 +332,17 @@ export function StoragePage(): ReactElement {
           );
         })}
 
-        <button type="button" disabled={saveState === 'pending' || backends.length >= 20} onClick={addBackend}>
-          Add backend
-        </button>
-        <button type="button" disabled={saveState === 'pending'} onClick={() => void save()}>
-          {saveState === 'pending' ? 'Saving storage backends…' : 'Save storage backends'}
-        </button>
+        <div style={{ display: 'flex', gap: '8px', marginTop: '4px' }}>
+          <button type="button" disabled={saveState === 'pending' || backends.length >= 20} onClick={addBackend}>
+            Add backend
+          </button>
+          <button type="button" className="default" disabled={saveState === 'pending'} onClick={() => void save()}>
+            {saveState === 'pending' ? 'Saving storage backends…' : 'Save storage backends'}
+          </button>
+        </div>
 
         {saveError !== null ? (
-          <p role="alert" style={{ color: '#b00020' }}>
+          <p role="alert" className="admin-error">
             {saveError}
           </p>
         ) : null}

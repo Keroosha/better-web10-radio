@@ -55,18 +55,31 @@ function AdminShell(): ReactElement {
   };
 
   return (
-    <div style={{ display: 'flex', minHeight: '100vh', fontFamily: 'system-ui, sans-serif', color: '#123' }}>
-      <AdminNav
-        items={ADMIN_NAV_ITEMS}
-        current={page}
-        onNavigate={setPage}
-        onLogout={() => void onLogout()}
-        isLoggingOut={isLoggingOut}
-      />
-      <main style={{ flex: 1, padding: '18px 22px', borderLeft: '1px solid #e5e5e5' }}>
-        {logoutError !== null && <p role="alert">{logoutError}</p>}
-        {renderPage(page)}
-      </main>
+    <div className="admin-desktop">
+      <div className="window glass active admin-window">
+        <div className="title-bar">
+          <div className="title-bar-text">Web10.Radio — Admin</div>
+          <div className="title-bar-controls">
+            <button type="button" aria-label="Minimize" tabIndex={-1} />
+            <button type="button" aria-label="Maximize" tabIndex={-1} />
+            {/* The window's Close control signs the operator out of the cabinet. */}
+            <button type="button" aria-label="Close" onClick={() => void onLogout()} disabled={isLoggingOut} />
+          </div>
+        </div>
+        <div className="window-body admin-window__body">
+          <section className="tabs admin-tabs">
+            <AdminNav items={ADMIN_NAV_ITEMS} current={page} onNavigate={setPage} />
+            <article role="tabpanel" id="admin-panel" className="admin-tabpanel">
+              {logoutError !== null && (
+                <p role="alert" className="admin-error">
+                  {logoutError}
+                </p>
+              )}
+              {renderPage(page)}
+            </article>
+          </section>
+        </div>
+      </div>
     </div>
   );
 }

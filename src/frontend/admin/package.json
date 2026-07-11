@@ -11,6 +11,7 @@
     "lint": "eslint ."
   },
   "dependencies": {
+    "7.css": "^0.21.1",
     "@web10/shared": "workspace:*"
   }
 }

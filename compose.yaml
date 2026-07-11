@@ -38,10 +38,17 @@ services:
   # before the API boots (SPEC §9 compose order: … → storage-init → API). It does NOT chown, so
   # your audio files keep their host ownership.
   storage-init:
-    image: debian:bookworm-slim
+    image: web10-radio-stream-node:local
+    build:
+      context: ./src/stream-node
+      dockerfile: Dockerfile
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
     volumes:
       - ./.storage:/var/lib/web10/storage
-    command: ["sh", "-c", "chmod -R a+rX /var/lib/web10/storage && chmod a+rwx /var/lib/web10/storage"]
+    # Keep this as a one-shot initializer: create the absent smoke track, then apply existing permissions.
+    command: ["sh", "-ec", "track=/var/lib/web10/storage/web10-compose-smoke.wav; if [ ! -e \"$$track\" ] && [ ! -L \"$$track\" ]; then python3 ./scripts/create-smoke-track.py --path \"$$track\" --duration-seconds 120 --sample-rate 48000; fi; chmod -R a+rX /var/lib/web10/storage && chmod a+rwx /var/lib/web10/storage"]
     restart: "no"
 
   api:
@@ -76,6 +83,21 @@ services:
       start_period: 5s
     restart: unless-stopped
 
+  rtmp-sink:
+    image: web10-radio-rtmp-sink:local
+    build:
+      context: ./src/stream-node/smoke/rtmp-sink
+      dockerfile: Dockerfile
+    ports:
+      - "127.0.0.1:8091:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8080/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+    restart: unless-stopped
+
   frontend:
     image: web10-radio-frontend:local
     build:
@@ -87,6 +109,39 @@ services:
     ports:
       # Public stage at http://localhost:8090/ ; admin cabinet at http://localhost:8090/admin/
       - "8090:80"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1/"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+    restart: unless-stopped
+
+  stream-node:
+    image: web10-radio-stream-node:local
+    build:
+      context: ./src/stream-node
+      dockerfile: Dockerfile
+    depends_on:
+      api:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+      rtmp-sink:
+        condition: service_healthy
+    env_file:
+      - path: .defaults.env
+        required: true
+      - path: .env
+        required: false
+    volumes:
+      - ./.storage:/var/lib/web10/storage:ro
+    healthcheck:
+      test: ["CMD", "python3", "./scripts/supervisor.py", "health-check"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
     restart: unless-stopped
 
 volumes:

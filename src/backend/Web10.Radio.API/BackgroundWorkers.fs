@@ -15,6 +15,76 @@ open Web10.Radio.Database
 open Web10.Radio.Database.Repositories
 open Web10.Radio.Telegram
 
+[<RequireQualifiedAccess>]
+module private BackgroundWorkerLog =
+    let private currentTraceId () =
+        let current = System.Diagnostics.Activity.Current
+
+        if isNull current then
+            String.Empty
+        else
+            let traceId = current.TraceId.ToString()
+            if String.IsNullOrWhiteSpace traceId then String.Empty else traceId
+
+    let private terminalPaymentRejectedMessage =
+        LoggerMessage.Define<Guid, Guid, string, int64, Guid, string>(
+            LogLevel.Warning,
+            EventId(3100, "TerminalPaymentRejected"),
+            "Terminal payment rejected for event {eventId} correlation {correlationId} traceId {traceId} Telegram update {telegramUpdateId} payment {paymentId}: {error}"
+        )
+
+    let private backgroundAgentFailedMessage =
+        LoggerMessage.Define<string, Guid, string, string>(
+            LogLevel.Error,
+            EventId(3101, "BackgroundAgentFailed"),
+            "Background agent {operation} failed for event {eventId} type {eventType} traceId {traceId}"
+        )
+
+    let private outboxFailureFenceRejectedMessage =
+        LoggerMessage.Define<Guid, Guid, int, string>(
+            LogLevel.Warning,
+            EventId(3102, "OutboxFailureFenceRejected"),
+            "Outbox failure fence rejected for event {eventId} claimOwner {claimOwner} claimAttempt {claimAttempt} traceId {traceId}"
+        )
+
+    let private outboxMarkFailedMessage =
+        LoggerMessage.Define<Guid, Guid, int, string, string>(
+            LogLevel.Error,
+            EventId(3103, "OutboxMarkFailed"),
+            "Outbox failure marking failed for event {eventId} claimOwner {claimOwner} claimAttempt {claimAttempt} traceId {traceId}: {error}"
+        )
+
+    let private operationFailedMessage =
+        LoggerMessage.Define<string, string, string>(
+            LogLevel.Error,
+            EventId(3104, "BackgroundOperationFailed"),
+            "{operation} failed traceId {traceId}: {error}"
+        )
+
+    let errorKind = function
+        | DomainEventError _ -> "domain_event"
+        | RepositoryError _ -> "repository"
+        | UnknownEventType _ -> "unknown_event_type"
+        | InvalidPayload _ -> "invalid_payload"
+        | StateTransitionRejected _ -> "state_transition_rejected"
+        | TelegramTransportError _ -> "telegram_transport"
+        | UnexpectedException _ -> "unexpected_exception"
+
+    let terminalPaymentRejected (logger: ILogger) eventId correlationId telegramUpdateId paymentId error =
+        terminalPaymentRejectedMessage.Invoke(logger, eventId, correlationId, currentTraceId (), telegramUpdateId, paymentId, error, null)
+
+    let backgroundAgentFailed (logger: ILogger) (error: exn) operation eventId eventType =
+        backgroundAgentFailedMessage.Invoke(logger, operation, eventId, eventType, currentTraceId (), error)
+
+    let outboxFailureFenceRejected (logger: ILogger) eventId claimOwner claimAttempt =
+        outboxFailureFenceRejectedMessage.Invoke(logger, eventId, claimOwner, claimAttempt, currentTraceId (), null)
+
+    let outboxMarkFailed (logger: ILogger) eventId claimOwner claimAttempt =
+        outboxMarkFailedMessage.Invoke(logger, eventId, claimOwner, claimAttempt, currentTraceId (), "repository_error", null)
+
+    let operationFailed (logger: ILogger) operation error =
+        operationFailedMessage.Invoke(logger, operation, currentTraceId (), errorKind error, null)
+
 
 module private JsonPayload =
     let objectWithStrings (fields: (string * string) list) =
@@ -160,34 +230,55 @@ module private PaymentAgent =
         (envelope: DomainEventEnvelope)
         (cancellationToken: CancellationToken)
         : Task<Result<unit, BackgroundWorkerError>> =
-        taskResult {
-            let! payload = parseDonationPaid envelope.PayloadJson
-            let! outcome =
-                PaymentRepository.completePayment
-                    dataSource
-                    payload.PaymentId
-                    payload.TelegramUserId
-                    payload.TelegramPaymentChargeId
-                    payload.AmountStars
-                    payload.Currency
-                    clock.UtcNow
-                    cancellationToken
-                |> TaskResult.mapError RepositoryError
+        task {
+            use attempt = FlowTelemetry.startRoot FlowTelemetry.PaymentComplete
+            let metricTags = [ FlowTelemetry.stage "complete" ]
+            FlowTelemetry.addTag "event.id" (string envelope.EventId) attempt
+            FlowTelemetry.addTag "correlation.id" (string envelope.CorrelationId) attempt
 
-            match outcome with
-            | Completed _ -> return ()
-            | Rejected reason ->
-                logger.LogWarning(
-                    "Terminal payment rejection for event {eventId}, correlation {correlationId}, Telegram update {telegramUpdateId}, payment {paymentId}, user {telegramUserId}: {reason}.",
-                    envelope.EventId,
-                    envelope.CorrelationId,
-                    payload.TelegramUpdateId,
-                    payload.PaymentId,
-                    payload.TelegramUserId,
-                    reason
-                )
+            try
+                let! result =
+                    taskResult {
+                        let! payload = parseDonationPaid envelope.PayloadJson
+                        FlowTelemetry.addTag "payment.id" (string payload.PaymentId) attempt
+                        FlowTelemetry.addTag "telegram.update_id" (string payload.TelegramUpdateId) attempt
 
-                return ()
+                        let! outcome =
+                            PaymentRepository.completePayment
+                                dataSource
+                                payload.PaymentId
+                                payload.TelegramUserId
+                                payload.TelegramPaymentChargeId
+                                payload.AmountStars
+                                payload.Currency
+                                clock.UtcNow
+                                cancellationToken
+                            |> TaskResult.mapError RepositoryError
+
+                        match outcome with
+                        | Completed _ -> return "completed"
+                        | Rejected reason ->
+                            BackgroundWorkerLog.terminalPaymentRejected
+                                logger
+                                envelope.EventId
+                                envelope.CorrelationId
+                                payload.TelegramUpdateId
+                                payload.PaymentId
+                                reason
+
+                            return "rejected"
+                    }
+
+                match result with
+                | Ok outcome ->
+                    FlowTelemetry.finish outcome metricTags attempt |> ignore
+                    return Ok ()
+                | Error error ->
+                    FlowTelemetry.finish "error" metricTags attempt |> ignore
+                    return Error error
+            with ex ->
+                FlowTelemetry.finishError "error" metricTags ex attempt |> ignore
+                return raise ex
         }
 
 module private StreamNodeAgent =
@@ -348,13 +439,12 @@ type DomainEventDispatcher
                                 | :? OperationCanceledException when work.CancellationToken.IsCancellationRequested ->
                                     work.CompleteCanceled()
                                 | ex ->
-                                    logger.LogError(
-                                        ex,
-                                        "Background agent {operation} failed for event {eventId} of type {eventType}.",
-                                        operation,
-                                        work.Envelope.EventId,
-                                        DomainEventType.toString work.Envelope.EventType
-                                    )
+                                    BackgroundWorkerLog.backgroundAgentFailed
+                                        logger
+                                        ex
+                                        operation
+                                        work.Envelope.EventId
+                                        (DomainEventType.toString work.Envelope.EventType)
 
                                     work.Complete(Error(UnexpectedException(operation, ex.Message)))
 
@@ -459,18 +549,9 @@ type OutboxRelayHostedService
             match result with
             | Ok true -> ()
             | Ok false ->
-                logger.LogWarning(
-                    "Outbox failure fence rejected event {eventId}, owner {claimOwner}, attempt {claimAttempt}.",
-                    record.Id,
-                    record.ClaimOwner,
-                    record.ClaimAttempt
-                )
-            | Error repositoryError ->
-                logger.LogError(
-                    "Failed to mark relayed outbox event {eventId} as failed: {error}.",
-                    record.Id,
-                    RepositoryError.toMessage repositoryError
-                )
+                BackgroundWorkerLog.outboxFailureFenceRejected logger record.Id record.ClaimOwner record.ClaimAttempt
+            | Error _ ->
+                BackgroundWorkerLog.outboxMarkFailed logger record.Id record.ClaimOwner record.ClaimAttempt
         }
 
     member _.ProcessDueEventsOnceAsync(cancellationToken: CancellationToken) : Task<Result<int, BackgroundWorkerError>> =
@@ -528,7 +609,7 @@ type OutboxRelayHostedService
                     | Ok 0 -> do! Task.Delay(TimeSpan.FromSeconds(1.0), stoppingToken)
                     | Ok _ -> ()
                     | Error error ->
-                        logger.LogError("Outbox relay failed: {error}.", BackgroundWorkerError.toMessage error)
+                        BackgroundWorkerLog.operationFailed logger "Outbox relay" error
                         do! Task.Delay(TimeSpan.FromSeconds(1.0), stoppingToken)
             with
             | :? OperationCanceledException when stoppingToken.IsCancellationRequested -> ()
@@ -794,7 +875,7 @@ type LibraryScanHostedService
             cancellationToken
         |> TaskResult.mapError RepositoryError
 
-    let processClaimedJob (job: LibraryScanJobRecord) cancellationToken =
+    let processClaimedJob (job: LibraryScanJobRecord) onStorageResolved cancellationToken =
         taskResult {
             let! backend = resolveStorageBackend job cancellationToken
             let! backend =
@@ -803,6 +884,7 @@ type LibraryScanHostedService
 
             match backend.Type with
             | "Local" ->
+                onStorageResolved "local"
                 let! localRoot =
                     backend.LocalRoot
                     |> Option.filter (String.IsNullOrWhiteSpace >> not)
@@ -810,6 +892,7 @@ type LibraryScanHostedService
 
                 do! processLocalBackend job backend localRoot cancellationToken
             | "S3" ->
+                onStorageResolved "s3"
                 let! bucketName =
                     backend.S3Bucket
                     |> Option.filter (String.IsNullOrWhiteSpace >> not)
@@ -825,25 +908,45 @@ type LibraryScanHostedService
 
     let runClaimedJob (job: LibraryScanJobRecord) cancellationToken =
         task {
-            let! processingResult =
-                task {
-                    try
-                        return! processClaimedJob job cancellationToken
-                    with
-                    | :? OperationCanceledException as ex ->
-                        return Error(UnexpectedException("LibraryScanHostedService", ex.Message))
-                    | ex -> return Error(UnexpectedException("LibraryScanHostedService", ex.Message))
-                }
+            use attempt = FlowTelemetry.startRoot FlowTelemetry.LibraryScan
+            let mutable metricTags = []
 
-            match processingResult with
-            | Ok () -> return Ok true
-            | Error processingError ->
-                let reason = BackgroundWorkerError.toMessage processingError
-                let! failureResult = failClaim job reason CancellationToken.None
+            let recordStorage storage =
+                FlowTelemetry.addTag "storage" storage attempt
+                metricTags <- [ FlowTelemetry.storage storage ]
 
-                match failureResult with
-                | Ok _ -> return Error processingError
-                | Error failureError -> return Error failureError
+            FlowTelemetry.addTag "library_scan.job_id" (string job.Id) attempt
+            FlowTelemetry.addTag "claim.attempt" (string job.ClaimAttempt) attempt
+
+            try
+                let! processingResult =
+                    task {
+                        try
+                            return! processClaimedJob job recordStorage cancellationToken
+                        with
+                        | :? OperationCanceledException as ex ->
+                            return Error(UnexpectedException("LibraryScanHostedService", ex.Message))
+                        | ex -> return Error(UnexpectedException("LibraryScanHostedService", ex.Message))
+                    }
+
+                match processingResult with
+                | Ok () ->
+                    FlowTelemetry.finish "completed" metricTags attempt |> ignore
+                    return Ok true
+                | Error processingError ->
+                    let reason = BackgroundWorkerError.toMessage processingError
+                    let! failureResult = failClaim job reason CancellationToken.None
+
+                    match failureResult with
+                    | Ok _ ->
+                        FlowTelemetry.finish "failed" metricTags attempt |> ignore
+                        return Error processingError
+                    | Error failureError ->
+                        FlowTelemetry.finish "failed" metricTags attempt |> ignore
+                        return Error failureError
+            with ex ->
+                FlowTelemetry.finishError "failed" metricTags ex attempt |> ignore
+                return raise ex
         }
 
     let claimAndProcess jobId cancellationToken =
@@ -908,7 +1011,7 @@ type LibraryScanHostedService
                     | Ok true -> ()
                     | Ok false -> do! Task.Delay(TimeSpan.FromSeconds(5.0), stoppingToken)
                     | Error error ->
-                        logger.LogError("Library scan worker failed: {error}.", BackgroundWorkerError.toMessage error)
+                        BackgroundWorkerLog.operationFailed logger "Library scan worker" error
                         do! Task.Delay(TimeSpan.FromSeconds(5.0), stoppingToken)
             with
             | :? OperationCanceledException when stoppingToken.IsCancellationRequested -> ()
@@ -1082,30 +1185,52 @@ type PlaybackProgramHostedService
         claimIdentityPayload claimed.QueueItemId claimed.ClaimOwner claimed.ClaimAttempt []
 
     let claimNextQueueItem cancellationToken =
-        let nowUtc = clock.UtcNow
+        task {
+            use attempt = FlowTelemetry.startRoot FlowTelemetry.QueueClaim
 
-        DatabaseSession.withTransactionResult
-            dataSource
-            (fun connection transaction cancellationToken ->
-                taskResult {
-                    let! claimed =
-                        PlaybackQueueRepository.claimNextDetailedInTransaction
-                            connection
-                            transaction
-                            claimOwner
-                            nowUtc
-                            (nowUtc + claimLease)
-                            cancellationToken
-                        |> TaskResult.mapError RepositoryError
+            try
+                let nowUtc = clock.UtcNow
 
-                    match claimed with
-                    | None -> return false
-                    | Some claimed ->
-                        let! envelope = claimed |> claimedPayload |> createPlaybackEnvelope PlaybackQueueItemClaimed
-                        do! appendEnvelope connection transaction envelope cancellationToken
-                        return true
-                })
-            cancellationToken
+                let! result =
+                    DatabaseSession.withTransactionResult
+                        dataSource
+                        (fun connection transaction cancellationToken ->
+                            taskResult {
+                                let! claimed =
+                                    PlaybackQueueRepository.claimNextDetailedInTransaction
+                                        connection
+                                        transaction
+                                        claimOwner
+                                        nowUtc
+                                        (nowUtc + claimLease)
+                                        cancellationToken
+                                    |> TaskResult.mapError RepositoryError
+
+                                match claimed with
+                                | None -> return None
+                                | Some claimed ->
+                                    let! envelope = claimed |> claimedPayload |> createPlaybackEnvelope PlaybackQueueItemClaimed
+                                    do! appendEnvelope connection transaction envelope cancellationToken
+                                    return Some claimed
+                            })
+                        cancellationToken
+
+                match result with
+                | Ok None ->
+                    FlowTelemetry.finish "empty" [] attempt |> ignore
+                    return Ok false
+                | Ok(Some claimed) ->
+                    FlowTelemetry.addTag "queue.item_id" (string claimed.QueueItemId) attempt
+                    FlowTelemetry.addTag "claim.attempt" (string claimed.ClaimAttempt) attempt
+                    FlowTelemetry.finish "claimed" [] attempt |> ignore
+                    return Ok true
+                | Error error ->
+                    FlowTelemetry.finish "error" [] attempt |> ignore
+                    return Error error
+            with ex ->
+                FlowTelemetry.finishError "error" [] ex attempt |> ignore
+                return raise ex
+        }
 
     let playbackStartedPayload queueItemId owner attempt trackId cachePath =
         claimIdentityPayload
@@ -1344,7 +1469,7 @@ type PlaybackProgramHostedService
                     | Ok true -> ()
                     | Ok false -> do! Task.Delay(TimeSpan.FromSeconds(2.0), stoppingToken)
                     | Error error ->
-                        logger.LogError("Playback program worker failed: {error}.", BackgroundWorkerError.toMessage error)
+                        BackgroundWorkerLog.operationFailed logger "Playback program worker" error
                         do! Task.Delay(TimeSpan.FromSeconds(2.0), stoppingToken)
             with
             | :? OperationCanceledException when stoppingToken.IsCancellationRequested -> ()

@@ -17,7 +17,7 @@ Backend scaffold уже есть в `src/backend/`:
 Текущий B4 backend/API state:
 
 - Public player routes `/api/v0/player/state`, `/events`, `/stream`, `/song`, `/health` реализованы.
-- Telegram `/api/v0/telegram/webhook` — webhook-only v0 ingress: strict secret/body validation, typed Funogram mapping, durable command/callback/payment relay и synchronous pre-checkout acknowledgement с 8-second internal deadline.
+- Telegram `/api/v0/telegram/webhook` и optional in-process Long Polling worker используют один typed ingress: strict webhook secret/body validation, durable command/callback/payment relay и synchronous pre-checkout acknowledgement с 8-second internal deadline. `WEB10_TELEGRAM__UPDATE_MODE` выбирает один transport.
 - Localized RU/EN `/start`, `/help`, `/request`, `/say`, `/song`, `/terms`, `/paysupport` реализованы. `/request` использует PostgreSQL `pg_trgm`; request invoice стоит configured 100 Stars, `/say` invoice — configured 50 Stars в compose deployment values.
 - Stars invoices используют `XTR`, empty provider token и один price item. Request queue и say moderation state изменяются только после `successful_payment`; charge id сохраняется для future refund operations.
 - Internal stream-node callbacks `/api/v0/stream-node/playback/{queueItemId}/lease|completion` защищены policy `Web10StreamNode`; lease renewal и authoritative completion fenced по owner/attempt.
@@ -38,7 +38,7 @@ Backend scaffold уже есть в `src/backend/`:
 
 ## Backend configuration contract
 
-Admin routes используют session auth (не bearer): `WEB10_ADMIN__USERNAME` и `WEB10_ADMIN__PASSWORD` задают bootstrap admin, который создается/обновляется при старте. `POST /api/v0/admin/auth/login` устанавливает `HttpOnly` cookie `web10_admin_session`, а каждый mutating admin request требует заголовок `X-CSRF-Token` из ответа login. Отдельный `WEB10_STREAM__CALLBACK_TOKEN` защищает stream-node lease/completion callbacks (bearer secret 24+ символов из [A-Za-z0-9_-], не переиспользует RTMP key). `WEB10_TELEGRAM__UPDATE_MODE=Webhook|LongPolling` выбирает способ приема Telegram updates; MVP использует `LongPolling`, чтобы бот принимал `/say` и Stars без публичного webhook. Compose содержит только тестовые non-production values. Для Local default storage задаются `WEB10_STORAGE__TYPE=Local` и `WEB10_STORAGE__LOCAL_ROOT`; S3 bucket/region/service URL и true force-path-style не задаются, а explicit `S3_FORCE_PATH_STYLE=false` допустим.
+Admin routes используют session auth (не bearer): `WEB10_ADMIN__USERNAME` и `WEB10_ADMIN__PASSWORD` задают bootstrap admin, который создается/обновляется при старте. `POST /api/v0/admin/auth/login` устанавливает `HttpOnly` cookie `web10_admin_session`, а каждый mutating admin request требует заголовок `X-CSRF-Token` из ответа login. Отдельный `WEB10_STREAM__CALLBACK_TOKEN` защищает stream-node lease/completion callbacks (bearer secret 24+ символов из [A-Za-z0-9_-], не переиспользует RTMP key). `WEB10_TELEGRAM__UPDATE_MODE` принимает exact `Webhook|LongPolling` и defaults to `Webhook`. В `LongPolling` API hosted service сначала вызывает Telegram `deleteWebhook(dropPendingUpdates=false)`, затем получает `getUpdates` с monotonic offset; оба транспорта проходят тот же typed, durable ingress. Для local polling задайте `LongPolling` и реальный bot token; committed Compose defaults остаются offline `Webhook`. Для Local default storage задаются `WEB10_STORAGE__TYPE=Local` и `WEB10_STORAGE__LOCAL_ROOT`; S3 bucket/region/service URL и true force-path-style не задаются, а explicit `S3_FORCE_PATH_STYLE=false` допустим.
 
 Telegram request/say prices обязательны и не имеют runtime defaults: `WEB10_TELEGRAM__REQUEST_PRICE_STARS` и `WEB10_TELEGRAM__SAY_PRICE_STARS` должны быть positive invariant `Int32`. `compose.yaml` задает smoke/deployment values `100` и `50`; те же значения управляют localized copy, persisted order/message amount, pre-checkout validation и Telegram `LabeledPrice`.
 
@@ -50,7 +50,7 @@ S3 scanner обходит `ListObjectsV2` page-by-page, renews the fenced scan l
 
 ## Backend Compose smoke
 
-`compose.yaml` разворачивает PostgreSQL + migrator + API + `frontend` (nginx со stage на `/` и admin на `/admin/`, проксирует `/api`). Это Development vertical-slice env (`WEB10_DEV__FIXTURES_ENABLED=true`). Все еще отсутствует реальный `stream-node` (phase B5) и optional observability collector (OTLP export best-effort; без коллектора API остается healthy). Пока B5 не готов, поток можно сымитировать локально скриптом `scripts/fake-stream-node.py`, который шлет `live` heartbeats и продвигает очередь через lease/completion — стадия покажет LIVE.
+`compose.yaml` разворачивает PostgreSQL + migrator + API + `frontend` (nginx со stage на `/` и admin на `/admin/`, проксирует `/api`) + реальный `stream-node` + внутренний `rtmp-sink`. Это Development vertical-slice env (`WEB10_DEV__FIXTURES_ENABLED=true`): stream-node владеет Xvfb, kiosk Chromium, Liquidsoap, loopback callbacks и Unix command socket; Liquidsoap кодирует H.264/AAC FLV и публикует в Compose RTMP sink. OTLP collector остается optional: export best-effort, поэтому его отсутствие не делает API unhealthy. `scripts/fake-stream-node.py` остается только локальным simulator для целевых backend сценариев, но не участвует в Compose.
 
 Вся конфигурация живет в `.defaults.env` (committed рабочие defaults) и грузится через `env_file`, поэтому стек работает «из коробки» без всякой подготовки. Чтобы что-то переопределить (реальный bot token, admin password, RTMP key), создайте локальный `.env` (gitignored) только с нужными ключами — он перекрывает defaults; секреты вынесены в отдельный SECRETS-блок в `.defaults.env`. Admin password обязан быть 12–256 символов (короткие значения вроде `admin` валят startup).
 
@@ -63,7 +63,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-docker compose up --build --wait --wait-timeout 120 api
+docker compose up --build --wait --wait-timeout 120
 
 curl -fsS http://localhost:8080/health/live
 curl -sS -w '\nHTTP %{http_code}\n' http://localhost:8080/health/ready
@@ -79,6 +79,13 @@ docker compose exec -T postgres \
   psql -v ON_ERROR_STOP=1 -U web10 -d web10 -tAc "SELECT 1 / ((count(*) = 1)::int) FROM pg_extension WHERE extname = 'pg_trgm';"
 docker compose exec -T postgres \
   psql -v ON_ERROR_STOP=1 -U web10 -d web10 -tAc "SELECT 1 / ((count(*) = 5)::int) FROM pg_indexes WHERE schemaname='public' AND indexname IN ('IX_Tracks_Active_Title_Trgm','IX_Tracks_Active_ArtistTitle_Trgm','UX_Payments_Active_InvoicePayload','UX_Payments_Active_PurposeEntity','UX_PlaybackQueue_Active_TrackRequest');"
+
+# Assert a real X11 → Liquidsoap → RTMP pipeline without printing RTMP keys.
+python3 scripts/smoke-backend.py --mode restart-live --base-url http://localhost:8080 --rtmp-stat-url http://localhost:8091/stat --username admin --password admin-password --timeout-seconds 90
+docker compose stop rtmp-sink
+python3 scripts/smoke-backend.py --mode expect-output-failure --base-url http://localhost:8080 --rtmp-stat-url http://localhost:8091/stat --username admin --password admin-password --timeout-seconds 60
+docker compose start rtmp-sink
+python3 scripts/smoke-backend.py --mode recover --base-url http://localhost:8080 --rtmp-stat-url http://localhost:8091/stat --username admin --password admin-password --timeout-seconds 90
 ```
 
 `docker compose up --wait` ожидает Compose health state, а `--wait-timeout 120` ограничивает ожидание. В `mcr.microsoft.com/dotnet/aspnet:10.0-noble-chiseled` healthcheck запускает доступный runtime command `dotnet Web10.Radio.API.dll --health-check http://127.0.0.1:8080/health/live`; managed self-probe выходит с code `0` только для successful HTTP response и не требует Alpine/libmusl, shell, `curl` или `wget` внутри container.
@@ -88,8 +95,9 @@ docker compose exec -T postgres \
 - `postgres` — `healthy`.
 - `migrator` — exited with code `0`.
 - `api` — `healthy` на `http://localhost:8080`.
+- `frontend` и `rtmp-sink` — `healthy`; `stream-node` — running under `dumb-init`.
 
-`/health/live` возвращает HTTP 200. Compose использует intentionally invalid Telegram token, поэтому operational `getMe` probe в `/health/ready` возвращает HTTP 503 с overall `Unhealthy`; это ожидаемо для smoke-config и доказывает, что configured-only token больше не считается рабочей зависимостью. При валидном production token checks `api`, `postgresql`, `storage`, `telegram-adapter` должны быть `Healthy`, а отсутствующий stream-node heartbeat остается `Degraded`. Authenticated admin request (после login) возвращает HTTP 200 и JSON array. Migration query выводит пять примененных migration, а следующие assertions возвращают `1` только при установленном `pg_trgm` и всех пяти B4 indexes:
+`/health/live` возвращает HTTP 200. Compose использует intentionally invalid Telegram token, поэтому operational `getMe` probe в `/health/ready` возвращает HTTP 503 с overall `Unhealthy`; это ожидаемо для smoke-config и доказывает, что configured-only token больше не считается рабочей зависимостью. При валидном production token checks `api`, `postgresql`, `storage`, `telegram-adapter` и свежий stream-node heartbeat должны быть `Healthy`. Smoke проверяет real X11/Chromium/Liquidsoap RTMP ingress, durable `RTMP output failed` при остановленном sink и explicit admin restart recovery; runner не печатает cookies, CSRF values, response payloads или RTMP key. Authenticated admin request (после login) возвращает HTTP 200 и JSON array. Migration query выводит пять примененных migration, а следующие assertions возвращают `1` только при установленном `pg_trgm` и всех пяти B4 indexes:
 
 ```text
 202607080001
@@ -120,3 +128,4 @@ Observed 2026-07-10 after B4 Telegram/Stars implementation:
 - Focused modified fixtures passed `75/75`: Telegram bot `6`, payment repository `7`, migrations/metadata `12`, configuration/domain/API `41`, background workers `9`.
 - `ApiContractTests` passed `27/27`, including authenticated say moderation, webhook actor mapping, group private-only behavior, and synchronous pre-checkout `204|503` mapping.
 - `docker compose up --build --wait --wait-timeout 120 api` reached healthy API liveness without `sleep`; SQL assertions confirmed migration `202607100003`, `pg_trgm`, and all five B4 indexes; cleanup removed containers, network, and volumes.
+- 2026-07-11 B5/B6 closure: `docker compose config --quiet`, stream-node image build, `liquidsoap --check`, bounded `restart-live` → RTMP ingress, RTMP failure classification, and explicit recovery all passed. `dotnet test src/backend/Web10.Radio.sln --no-restore` passed `132/132`; `python3 -m unittest discover -s src/stream-node/tests -p '*_test.py'` passed `5/5`.

@@ -18,6 +18,27 @@ open Npgsql
 open Web10.Radio.Database
 open Web10.Radio.Database.Repositories
 
+
+[<RequireQualifiedAccess>]
+module private AdminIdentityLog =
+    let private currentTraceId () =
+        let current = System.Diagnostics.Activity.Current
+
+        if isNull current then
+            String.Empty
+        else
+            let traceId = current.TraceId.ToString()
+            if String.IsNullOrWhiteSpace traceId then String.Empty else traceId
+
+    let private bootstrapFailedMessage =
+        LoggerMessage.Define<string>(
+            LogLevel.Critical,
+            EventId(3050, "AdminIdentityBootstrapFailed"),
+            "Admin identity bootstrap failed traceId {traceId}."
+        )
+
+    let bootstrapFailed (logger: ILogger) =
+        bootstrapFailedMessage.Invoke(logger, currentTraceId (), null)
 [<RequireQualifiedAccess>]
 module AdminSessionAuthentication =
     [<Literal>]
@@ -273,7 +294,7 @@ type AdminBootstrapHostedService(identityService: AdminIdentityService, logger: 
                 match result with
                 | Ok () -> return ()
                 | Error _ ->
-                    logger.LogCritical("Admin identity bootstrap failed.")
+                    AdminIdentityLog.bootstrapFailed logger
                     return raise (InvalidOperationException("Admin identity bootstrap failed."))
             }
             :> Task

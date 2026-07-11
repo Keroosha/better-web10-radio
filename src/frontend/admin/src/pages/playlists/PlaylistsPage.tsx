@@ -307,8 +307,8 @@ export function PlaylistsPage(): ReactElement {
 
   return (
     <section>
-      <h2 style={{ fontSize: '16px' }}>Playlists</h2>
-      <p style={{ fontSize: '12px', opacity: 0.7 }}>
+      <h2>Playlists</h2>
+      <p className="admin-muted">
         Build the active rotation from scanned tracks, or queue a track immediately.
       </p>
       {playlistsState.status === 'ready' && activePlaylist !== null && itemsState.status === 'ready' ? (
@@ -325,22 +325,22 @@ export function PlaylistsPage(): ReactElement {
       {validationError !== null ? <p role="alert">{validationError}</p> : null}
       {actionMessage !== null ? <p aria-live="polite">{actionMessage}</p> : null}
 
-      <form onSubmit={(event) => void searchTracks(event)} style={{ display: 'flex', gap: '8px', alignItems: 'end' }}>
-        <label htmlFor="track-search" style={{ display: 'grid', gap: '4px' }}>
-          Track search
+      <form onSubmit={(event) => void searchTracks(event)} style={{ display: 'flex', gap: '8px', alignItems: 'flex-end' }}>
+        <div className="group">
+          <label htmlFor="track-search">Track search</label>
           <input
             id="track-search"
             value={searchQuery}
             onChange={(event) => setSearchQuery(event.target.value)}
             maxLength={201}
           />
-        </label>
-        <button type="submit" disabled={tracksState.status === 'loading'}>
+        </div>
+        <button type="submit" className="default" disabled={tracksState.status === 'loading'}>
           {tracksState.status === 'loading' ? 'Searching…' : 'Search tracks'}
         </button>
       </form>
 
-      {tracksState.status === 'idle' ? <p style={{ opacity: 0.7 }}>Search the scanned library to add or queue a track.</p> : null}
+      {tracksState.status === 'idle' ? <p className="admin-muted">Search the scanned library to add or queue a track.</p> : null}
       {tracksState.status === 'error' ? <p role="alert">Failed to load tracks: {tracksState.message}</p> : null}
       {tracksState.status === 'ready' && tracksState.data.length === 0 ? <p>No tracks matched this search.</p> : null}
       {tracksState.status === 'ready' && tracksState.data.length > 0 ? (
@@ -368,18 +368,18 @@ export function PlaylistsPage(): ReactElement {
       ) : null}
 
       <hr />
-      {playlistsState.status === 'loading' ? <p style={{ opacity: 0.7 }}>Loading playlists…</p> : null}
+      {playlistsState.status === 'loading' ? <p className="admin-muted">Loading playlists…</p> : null}
       {playlistsState.status === 'error' ? <p role="alert">Failed to load playlists: {playlistsState.message}</p> : null}
       {playlistsState.status === 'ready' && playlistsState.data.length === 0 ? <p>No active playlist exists yet.</p> : null}
       {playlistsState.status === 'ready' && playlistsState.data.length > 1 ? (
-        <p style={{ opacity: 0.7 }}>{playlistsState.data.length} playlists loaded; edit the active playlist below.</p>
+        <p className="admin-muted">{playlistsState.data.length} playlists loaded; edit the active playlist below.</p>
       ) : null}
 
       {playlistsState.status === 'ready' ? (
         <div style={{ display: 'grid', gap: '10px', maxWidth: '560px' }}>
           {activePlaylist !== null && itemsState.status === 'ready' ? <h3>{activePlaylist.name}</h3> : null}
-          <label htmlFor="playlist-name">
-            Playlist name
+          <div className="group">
+            <label htmlFor="playlist-name">Playlist name</label>
             <input
               id="playlist-name"
               value={playlistName}
@@ -387,9 +387,9 @@ export function PlaylistsPage(): ReactElement {
               maxLength={121}
               disabled={isSavingPlaylist}
             />
-          </label>
-          <label htmlFor="playlist-description">
-            Playlist description
+          </div>
+          <div className="group">
+            <label htmlFor="playlist-description">Playlist description</label>
             <textarea
               id="playlist-description"
               value={playlistDescription}
@@ -397,18 +397,19 @@ export function PlaylistsPage(): ReactElement {
               maxLength={1001}
               disabled={isSavingPlaylist}
             />
-          </label>
-          <label>
+          </div>
+          <div>
             <input
+              id="playlist-active"
               type="checkbox"
               checked={playlistIsActive}
               onChange={(event) => setPlaylistIsActive(event.target.checked)}
               disabled={isSavingPlaylist}
-            />{' '}
-            Active playlist
-          </label>
+            />
+            <label htmlFor="playlist-active">Active playlist</label>
+          </div>
           <div>
-            <button type="button" onClick={() => void savePlaylist()} disabled={isSavingPlaylist}>
+            <button type="button" className="default" onClick={() => void savePlaylist()} disabled={isSavingPlaylist}>
               {isSavingPlaylist ? 'Saving…' : activePlaylist === null ? 'Create playlist' : 'Save playlist'}
             </button>
           </div>
@@ -418,7 +419,7 @@ export function PlaylistsPage(): ReactElement {
       {activePlaylist !== null ? (
         <div style={{ marginTop: '18px' }}>
           <h3>Playlist order</h3>
-          {itemsState.status === 'loading' ? <p style={{ opacity: 0.7 }}>Loading playlist items…</p> : null}
+          {itemsState.status === 'loading' ? <p className="admin-muted">Loading playlist items…</p> : null}
           {itemsState.status === 'error' ? <p role="alert">Failed to load playlist items: {itemsState.message}</p> : null}
           {itemsState.status === 'ready' && itemsState.data.length === 0 ? <p>No tracks in this playlist yet.</p> : null}
           {itemsState.status === 'ready' && itemsState.data.length > 0 ? (
@@ -451,6 +452,7 @@ export function PlaylistsPage(): ReactElement {
           ) : null}
           <button
             type="button"
+            className="default"
             onClick={() => void saveItems()}
             disabled={itemsState.status !== 'ready' || !itemsDirty || isSavingItems}
           >

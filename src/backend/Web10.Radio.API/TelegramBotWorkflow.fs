@@ -44,6 +44,102 @@ type private DonationInvoice =
       ProviderToken: string }
 
 [<RequireQualifiedAccess>]
+module private TelegramWorkflowLog =
+    let private currentTraceId () =
+        let current = System.Diagnostics.Activity.Current
+
+        if isNull current then
+            String.Empty
+        else
+            let traceId = current.TraceId.ToString()
+            if String.IsNullOrWhiteSpace traceId then String.Empty else traceId
+
+    let private terminalOutboundFailureMessage =
+        LoggerMessage.Define<Guid, Guid, string, int64, Nullable<Guid>, Nullable<int>>(
+            LogLevel.Warning,
+            EventId(3200, "TelegramOutboundTerminalFailure"),
+            "Telegram terminal outbound failure for event {eventId} correlation {correlationId} traceId {traceId} update {telegramUpdateId} payment {paymentId}: {error}"
+        )
+
+    let private interactionAcceptedMessage =
+        LoggerMessage.Define<Guid, Guid, string, int64, string, string>(
+            LogLevel.Information,
+            EventId(3201, "TelegramInteractionAccepted"),
+            "Telegram interaction for event {eventId} correlation {correlationId} traceId {traceId} update {telegramUpdateId} operation {operation} outcome {outcome}"
+        )
+
+    let private invoiceSendAttemptedMessage =
+        LoggerMessage.Define<Guid, Guid, string, Guid, string>(
+            LogLevel.Information,
+            EventId(3202, "TelegramInvoiceSendAttempted"),
+            "Telegram invoice send for event {eventId} correlation {correlationId} traceId {traceId} payment {paymentId} outcome {outcome}"
+        )
+
+    let private preCheckoutReceivedMessage =
+        LoggerMessage.Define<string, int64>(
+            LogLevel.Information,
+            EventId(3203, "TelegramPreCheckoutReceived"),
+            "Telegram pre-checkout received traceId {traceId} update {telegramUpdateId}"
+        )
+
+    let private preCheckoutRejectedMessage =
+        LoggerMessage.Define<string, int64, string>(
+            LogLevel.Warning,
+            EventId(3204, "TelegramPreCheckoutRejected"),
+            "Telegram pre-checkout rejected traceId {traceId} update {telegramUpdateId}: {error}"
+        )
+
+    let private preCheckoutAnswerFailedMessage =
+        LoggerMessage.Define<string, string, int64, Nullable<int>>(
+            LogLevel.Warning,
+            EventId(3205, "TelegramPreCheckoutAnswerFailed"),
+            "Telegram pre-checkout {operation} failed traceId {traceId} update {telegramUpdateId}: {error}"
+        )
+
+    let private preCheckoutTimedOutMessage =
+        LoggerMessage.Define<string, int64>(
+            LogLevel.Warning,
+            EventId(3206, "TelegramPreCheckoutTimedOut"),
+            "Telegram pre-checkout timed out traceId {traceId} update {telegramUpdateId}"
+        )
+
+    let terminalOutboundFailure (logger: ILogger) eventId correlationId telegramUpdateId (paymentId: Guid option) (errorCode: int option) =
+        let payment =
+            match paymentId with
+            | Some value -> Nullable<Guid>(value)
+            | None -> Nullable<Guid>()
+
+        let error =
+            match errorCode with
+            | Some value -> Nullable<int>(value)
+            | None -> Nullable<int>()
+
+        terminalOutboundFailureMessage.Invoke(logger, eventId, correlationId, currentTraceId (), telegramUpdateId, payment, error, null)
+
+    let interactionAccepted (logger: ILogger) eventId correlationId telegramUpdateId operation =
+        interactionAcceptedMessage.Invoke(logger, eventId, correlationId, currentTraceId (), telegramUpdateId, operation, "accepted", null)
+
+    let invoiceSendAttempted (logger: ILogger) eventId correlationId paymentId =
+        invoiceSendAttemptedMessage.Invoke(logger, eventId, correlationId, currentTraceId (), paymentId, "attempted", null)
+
+    let preCheckoutReceived (logger: ILogger) telegramUpdateId =
+        preCheckoutReceivedMessage.Invoke(logger, currentTraceId (), telegramUpdateId, null)
+
+    let preCheckoutRejected (logger: ILogger) telegramUpdateId =
+        preCheckoutRejectedMessage.Invoke(logger, currentTraceId (), telegramUpdateId, "payment_validation_rejected", null)
+
+    let preCheckoutAnswerFailed (logger: ILogger) telegramUpdateId (errorCode: int option) =
+        let error =
+            match errorCode with
+            | Some value -> Nullable<int>(value)
+            | None -> Nullable<int>()
+
+        preCheckoutAnswerFailedMessage.Invoke(logger, "answer_pre_checkout", currentTraceId (), telegramUpdateId, error, null)
+
+    let preCheckoutTimedOut (logger: ILogger) telegramUpdateId =
+        preCheckoutTimedOutMessage.Invoke(logger, currentTraceId (), telegramUpdateId, null)
+
+[<RequireQualifiedAccess>]
 module private TelegramWorkflowJson =
     let parseObject eventType payloadJson =
         if String.IsNullOrWhiteSpace payloadJson then
@@ -293,17 +389,13 @@ type TelegramBotWorkflow
                 return Error(TelegramTransportError(transportError.Method, transportError.Description))
             | Error transportError ->
                 adapterState.RecordError("Telegram outbound terminal failure.")
-                logger.LogWarning(
-                    "Telegram terminal outbound failure for event {eventId}, correlation {correlationId}, update {telegramUpdateId}, user {telegramUserId}, action {action}, payment {paymentId}, method {methodName}, code {errorCode}.",
-                    envelope.EventId,
-                    envelope.CorrelationId,
-                    telegramUpdateId,
-                    telegramUserId,
-                    action,
-                    paymentId,
-                    transportError.Method,
+                TelegramWorkflowLog.terminalOutboundFailure
+                    logger
+                    envelope.EventId
+                    envelope.CorrelationId
+                    telegramUpdateId
+                    paymentId
                     transportError.ErrorCode
-                )
                 return Ok ()
         }
 
@@ -692,7 +784,7 @@ type TelegramBotWorkflow
                     match TelegramWorkflowJson.parseObject eventType envelope.PayloadJson |> Result.bind (TelegramWorkflowJson.requiredString eventType "query") with
                     | Error error -> return Error error
                     | Ok query ->
-                        logger.LogInformation("Telegram interaction event {eventId}, correlation {correlationId}, update {telegramUpdateId}, user {telegramUserId}, command {command}.", envelope.EventId, envelope.CorrelationId, interaction.TelegramUpdateId, interaction.TelegramUserId, "request")
+                        TelegramWorkflowLog.interactionAccepted logger envelope.EventId envelope.CorrelationId interaction.TelegramUpdateId "track-request"
                         return! handleTrackRequested envelope interaction query cancellationToken
             | SayMessageSubmitted ->
                 match TelegramWorkflowJson.interaction eventType envelope.PayloadJson with
@@ -701,62 +793,110 @@ type TelegramBotWorkflow
                     match TelegramWorkflowJson.parseObject eventType envelope.PayloadJson |> Result.bind (TelegramWorkflowJson.requiredString eventType "text") with
                     | Error error -> return Error error
                     | Ok text ->
-                        logger.LogInformation("Telegram interaction event {eventId}, correlation {correlationId}, update {telegramUpdateId}, user {telegramUserId}, command {command}.", envelope.EventId, envelope.CorrelationId, interaction.TelegramUpdateId, interaction.TelegramUserId, "say")
+                        TelegramWorkflowLog.interactionAccepted logger envelope.EventId envelope.CorrelationId interaction.TelegramUpdateId "say-message"
                         return! handleSay envelope interaction text cancellationToken
             | TelegramCommandReceived ->
                 match TelegramWorkflowJson.interaction eventType envelope.PayloadJson with
                 | Error error -> return Error error
                 | Ok interaction ->
-                    logger.LogInformation("Telegram interaction event {eventId}, correlation {correlationId}, update {telegramUpdateId}, user {telegramUserId}, command {command}.", envelope.EventId, envelope.CorrelationId, interaction.TelegramUpdateId, interaction.TelegramUserId, interaction.Command)
+                    TelegramWorkflowLog.interactionAccepted logger envelope.EventId envelope.CorrelationId interaction.TelegramUpdateId "command"
                     return! handleCommand envelope interaction cancellationToken
             | TelegramCallbackReceived ->
                 match TelegramWorkflowJson.callback eventType envelope.PayloadJson with
                 | Error error -> return Error error
                 | Ok callback ->
-                    logger.LogInformation("Telegram callback event {eventId}, correlation {correlationId}, update {telegramUpdateId}, user {telegramUserId}, action {action}.", envelope.EventId, envelope.CorrelationId, callback.TelegramUpdateId, callback.TelegramUserId, "callback")
+                    TelegramWorkflowLog.interactionAccepted logger envelope.EventId envelope.CorrelationId callback.TelegramUpdateId "callback"
                     return! handleCallback envelope callback cancellationToken
             | _ -> return Error(InvalidPayload(eventType, "event is not handled by TelegramBotWorkflow."))
         }
 
     member _.SendInvoiceAsync(envelope: DomainEventEnvelope, cancellationToken: CancellationToken) =
         task {
-            let eventType = DomainEventType.toString envelope.EventType
-            if envelope.EventType <> DonationInvoiceCreated then
-                return Error(InvalidPayload(eventType, "event is not a DonationInvoiceCreated event."))
-            else
-                match TelegramWorkflowJson.invoice eventType envelope.PayloadJson with
-                | Error error -> return Error error
-                | Ok invoice ->
-                    let expectedTitle, expectedDescription, expectedPriceLabel =
-                        match invoice.Purpose with
-                        | Request -> TelegramText.requestInvoiceTitle TelegramLocale.English, TelegramText.requestInvoiceDescription TelegramLocale.English, TelegramText.requestInvoicePriceLabel TelegramLocale.English
-                        | Say -> TelegramText.sayInvoiceTitle TelegramLocale.English, TelegramText.sayInvoiceDescription TelegramLocale.English, TelegramText.sayInvoicePriceLabel TelegramLocale.English
-                        | Donation -> String.Empty, String.Empty, String.Empty
-                    let validFixedCopy =
-                        let russian =
+            use attempt = FlowTelemetry.start FlowTelemetry.PaymentInvoice
+            FlowTelemetry.addTag "event.id" (box envelope.EventId) attempt
+            FlowTelemetry.addTag "correlation.id" (box envelope.CorrelationId) attempt
+
+            try
+                let eventType = DomainEventType.toString envelope.EventType
+
+                if envelope.EventType <> DonationInvoiceCreated then
+                    FlowTelemetry.finish "error" [ FlowTelemetry.stage "invoice" ] attempt |> ignore
+                    return Error(InvalidPayload(eventType, "event is not a DonationInvoiceCreated event."))
+                else
+                    match TelegramWorkflowJson.invoice eventType envelope.PayloadJson with
+                    | Error error ->
+                        FlowTelemetry.finish "error" [ FlowTelemetry.stage "invoice" ] attempt |> ignore
+                        return Error error
+                    | Ok invoice ->
+                        FlowTelemetry.addTag "payment.id" (box invoice.PaymentId) attempt
+
+                        let expectedTitle, expectedDescription, expectedPriceLabel =
                             match invoice.Purpose with
-                            | Request -> invoice.Title = TelegramText.requestInvoiceTitle TelegramLocale.Russian && invoice.Description = TelegramText.requestInvoiceDescription TelegramLocale.Russian && invoice.PriceLabel = TelegramText.requestInvoicePriceLabel TelegramLocale.Russian
-                            | Say -> invoice.Title = TelegramText.sayInvoiceTitle TelegramLocale.Russian && invoice.Description = TelegramText.sayInvoiceDescription TelegramLocale.Russian && invoice.PriceLabel = TelegramText.sayInvoicePriceLabel TelegramLocale.Russian
-                            | Donation -> false
-                        russian || (invoice.Title = expectedTitle && invoice.Description = expectedDescription && invoice.PriceLabel = expectedPriceLabel)
-                    if invoice.PurposeEntityId = Guid.Empty || invoice.PaymentId.ToString("D") = String.Empty || not validFixedCopy then
-                        return Error(InvalidPayload(eventType, "invoice payload has invalid fixed fields."))
-                    else
-                        logger.LogInformation("Telegram invoice event {eventId}, correlation {correlationId}, payment {paymentId}.", envelope.EventId, envelope.CorrelationId, invoice.PaymentId)
-                        let telegramInvoice =
-                            { ChatId = invoice.ChatId
-                              Title = invoice.Title
-                              Description = invoice.Description
-                              Payload = invoice.PaymentId.ToString("D")
-                              Currency = invoice.Currency
-                              ProviderToken = invoice.ProviderToken
-                              PriceLabel = invoice.PriceLabel
-                              AmountStars = invoice.AmountStars }
-                        return! terminalTransport envelope 0L 0L "invoice" (Some invoice.PaymentId) (telegramClient.SendInvoiceAsync(telegramInvoice, cancellationToken))
+                            | Request -> TelegramText.requestInvoiceTitle TelegramLocale.English, TelegramText.requestInvoiceDescription TelegramLocale.English, TelegramText.requestInvoicePriceLabel TelegramLocale.English
+                            | Say -> TelegramText.sayInvoiceTitle TelegramLocale.English, TelegramText.sayInvoiceDescription TelegramLocale.English, TelegramText.sayInvoicePriceLabel TelegramLocale.English
+                            | Donation -> String.Empty, String.Empty, String.Empty
+
+                        let validFixedCopy =
+                            let russian =
+                                match invoice.Purpose with
+                                | Request -> invoice.Title = TelegramText.requestInvoiceTitle TelegramLocale.Russian && invoice.Description = TelegramText.requestInvoiceDescription TelegramLocale.Russian && invoice.PriceLabel = TelegramText.requestInvoicePriceLabel TelegramLocale.Russian
+                                | Say -> invoice.Title = TelegramText.sayInvoiceTitle TelegramLocale.Russian && invoice.Description = TelegramText.sayInvoiceDescription TelegramLocale.Russian && invoice.PriceLabel = TelegramText.sayInvoicePriceLabel TelegramLocale.Russian
+                                | Donation -> false
+
+                            russian || (invoice.Title = expectedTitle && invoice.Description = expectedDescription && invoice.PriceLabel = expectedPriceLabel)
+
+                        if invoice.PurposeEntityId = Guid.Empty || invoice.PaymentId.ToString("D") = String.Empty || not validFixedCopy then
+                            FlowTelemetry.finish "error" [ FlowTelemetry.stage "invoice" ] attempt |> ignore
+                            return Error(InvalidPayload(eventType, "invoice payload has invalid fixed fields."))
+                        else
+                            TelegramWorkflowLog.invoiceSendAttempted logger envelope.EventId envelope.CorrelationId invoice.PaymentId
+
+                            let telegramInvoice =
+                                { ChatId = invoice.ChatId
+                                  Title = invoice.Title
+                                  Description = invoice.Description
+                                  Payload = invoice.PaymentId.ToString("D")
+                                  Currency = invoice.Currency
+                                  ProviderToken = invoice.ProviderToken
+                                  PriceLabel = invoice.PriceLabel
+                                  AmountStars = invoice.AmountStars }
+
+                            let! result = telegramClient.SendInvoiceAsync(telegramInvoice, cancellationToken)
+
+                            match result with
+                            | Ok () ->
+                                FlowTelemetry.finish "sent" [ FlowTelemetry.stage "invoice" ] attempt |> ignore
+                                return Ok ()
+                            | Error transportError when transportError.IsRetryable ->
+                                FlowTelemetry.finish "retryable_error" [ FlowTelemetry.stage "invoice" ] attempt |> ignore
+                                return Error(TelegramTransportError(transportError.Method, transportError.Description))
+                            | Error transportError ->
+                                adapterState.RecordError("Telegram outbound terminal failure.")
+
+                                TelegramWorkflowLog.terminalOutboundFailure
+                                    logger
+                                    envelope.EventId
+                                    envelope.CorrelationId
+                                    0L
+                                    (Some invoice.PaymentId)
+                                    transportError.ErrorCode
+
+                                FlowTelemetry.finish "terminal_failure" [ FlowTelemetry.stage "invoice" ] attempt |> ignore
+                                return Ok ()
+            with ex ->
+                FlowTelemetry.finishError "error" [ FlowTelemetry.stage "invoice" ] ex attempt |> ignore
+                return raise ex
         }
 
     member _.HandleAsync(input: TelegramPreCheckoutInput, cancellationToken: CancellationToken) =
         task {
+            use attempt = FlowTelemetry.start FlowTelemetry.PaymentPreCheckout
+            FlowTelemetry.addTag "telegram.update_id" (box input.TelegramUpdateId) attempt
+
+            match Guid.TryParse input.InvoicePayload with
+            | true, paymentId -> FlowTelemetry.addTag "payment.id" (box paymentId) attempt
+            | false, _ -> ()
+
             use deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
             deadline.CancelAfter(TimeSpan.FromSeconds 8.0)
 
@@ -764,11 +904,7 @@ type TelegramBotWorkflow
                 let currentLocale = locale input.LanguageCode
                 let receivedAtUtc = clock.UtcNow
 
-                logger.LogInformation(
-                    "Telegram pre-checkout received for update {telegramUpdateId}, user {telegramUserId}.",
-                    input.TelegramUpdateId,
-                    input.TelegramUserId
-                )
+                TelegramWorkflowLog.preCheckoutReceived logger input.TelegramUpdateId
 
                 let inboxPayload =
                     JsonSerializer.Serialize(
@@ -816,48 +952,44 @@ type TelegramBotWorkflow
                         deadline.Token
 
                 match validation with
-                | Error error -> return Error error
+                | Error error ->
+                    FlowTelemetry.finish "error" [ FlowTelemetry.stage "pre_checkout" ] attempt |> ignore
+                    return Error error
                 | Ok decision ->
-                    let answer, rejectionReason =
+                    let answer, rejectionReason, outcome =
                         match decision with
-                        | PreCheckoutDecision.Approved -> None, None
+                        | PreCheckoutDecision.Approved -> None, None, "approved"
                         | PreCheckoutDecision.Rejected reason ->
-                            Some(TelegramText.paymentDoesNotMatchExpectedOrder currentLocale), Some reason
+                            Some(TelegramText.paymentDoesNotMatchExpectedOrder currentLocale), Some reason, "rejected"
 
                     match rejectionReason with
-                    | Some reason ->
-                        logger.LogWarning(
-                            "Telegram pre-checkout rejected for update {telegramUpdateId}, user {telegramUserId}, reason {reason}.",
-                            input.TelegramUpdateId,
-                            input.TelegramUserId,
-                            reason
-                        )
+                    | Some _ ->
+                        TelegramWorkflowLog.preCheckoutRejected logger input.TelegramUpdateId
                     | None -> ()
 
                     let! answered = telegramClient.AnswerPreCheckoutAsync(input.QueryId, answer, deadline.Token)
 
                     match answered with
-                    | Ok () -> return Ok ()
+                    | Ok () ->
+                        FlowTelemetry.finish outcome [ FlowTelemetry.stage "pre_checkout" ] attempt |> ignore
+                        return Ok ()
                     | Error transportError ->
-                        logger.LogWarning(
-                            "Telegram pre-checkout answer failed for update {telegramUpdateId}, user {telegramUserId}, method {methodName}, code {errorCode}.",
-                            input.TelegramUpdateId,
-                            input.TelegramUserId,
-                            transportError.Method,
-                            transportError.ErrorCode
-                        )
-
-                        return Error(preCheckoutUnavailable transportError.Method transportError.Description)
+                        TelegramWorkflowLog.preCheckoutAnswerFailed logger input.TelegramUpdateId transportError.ErrorCode
+                        let unavailable = preCheckoutUnavailable transportError.Method transportError.Description
+                        FlowTelemetry.finish "transport_error" [ FlowTelemetry.stage "pre_checkout" ] attempt |> ignore
+                        return Error unavailable
             with
-            | :? OperationCanceledException as ex when cancellationToken.IsCancellationRequested -> return raise ex
-            | :? OperationCanceledException ->
-                logger.LogWarning(
-                    "Telegram pre-checkout timed out for update {telegramUpdateId}, user {telegramUserId}.",
-                    input.TelegramUpdateId,
-                    input.TelegramUserId
-                )
-
-                return Error(preCheckoutUnavailable "answerPreCheckoutQuery" "Telegram pre-checkout processing timed out.")
+            | :? OperationCanceledException as ex when cancellationToken.IsCancellationRequested ->
+                FlowTelemetry.finishError "error" [ FlowTelemetry.stage "pre_checkout" ] ex attempt |> ignore
+                return raise ex
+            | :? OperationCanceledException as ex ->
+                TelegramWorkflowLog.preCheckoutTimedOut logger input.TelegramUpdateId
+                let unavailable = preCheckoutUnavailable "answerPreCheckoutQuery" "Telegram pre-checkout processing timed out."
+                FlowTelemetry.finishError "timeout" [ FlowTelemetry.stage "pre_checkout" ] ex attempt |> ignore
+                return Error unavailable
+            | ex ->
+                FlowTelemetry.finishError "error" [ FlowTelemetry.stage "pre_checkout" ] ex attempt |> ignore
+                return raise ex
         }
  
 

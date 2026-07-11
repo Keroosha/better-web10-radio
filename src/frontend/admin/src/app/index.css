@@ -1,0 +1,110 @@
+/*
+ * Admin cabinet desktop chrome.
+ *
+ * Owns what 7.css / inline styles cannot: the html/body reset, the teal Windows 7
+ * "Aero" wallpaper, the 1-2rem desktop gutter, the single full-bleed glass window,
+ * the nav-pane split, and the utility classes that replace the old repeated literals.
+ *
+ * Imported in main.tsx AFTER `import '7.css'` so these rules win over the framework.
+ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  /* Teal Windows 7 desktop. A gradient means no image asset, so nothing has to
+     resolve under the production `--base=/admin/`. It also gives the `.glass`
+     window frame something behind it to blur. */
+  background: radial-gradient(140% 120% at 50% -15%, #63c1d4 0%, #2f93a9 34%, #14647a 68%, #0a3b4c 100%)
+    fixed;
+}
+
+/* The desktop surface: keeps a 1-2rem transparent gutter around the window so the
+   wallpaper stays visible on every edge. */
+.admin-desktop {
+  display: flex;
+  min-height: 100vh;
+  padding: clamp(1rem, 2vw, 2rem);
+}
+
+/* Centered variant for the auth-gate windows (login + session probe). */
+.admin-desktop--center {
+  align-items: center;
+  justify-content: center;
+}
+
+/* The one big window fills the gutter-bounded area (overrides 7.css's demo width). */
+.admin-window {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  width: auto;
+  min-height: 0;
+  min-width: 0;
+}
+
+/* IMPORTANT: keep 7.css's default window-body `margin: var(--w7-w-space)` (the gap
+   that reveals the glass border + rounded corners). We only turn it into a flex
+   column that fills the frame and gives the tabs a little inner breathing room. */
+.admin-window__body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  padding: 8px;
+}
+
+/* Tabbed navigation fills the body; only the active panel scrolls. */
+.admin-tabs {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.admin-tablist {
+  flex: none;
+}
+
+.admin-tabpanel {
+  flex: 1;
+  min-height: 0;
+  margin-bottom: 0;
+  overflow-y: auto;
+}
+
+/* Utility classes replacing the repeated inline literals. */
+.admin-error {
+  color: #b00020;
+}
+
+.admin-muted {
+  opacity: 0.7;
+}
+
+/* Wide data tables (e.g. social links) can exceed the panel; let them scroll
+   horizontally instead of clipping, and relax 7.css's nowrap so cells with form
+   controls wrap naturally. */
+.admin-table-scroll {
+  overflow-x: auto;
+}
+
+.admin-tabpanel table td,
+.admin-tabpanel table th {
+  white-space: normal;
+}
+
+/* Compact action buttons inside table rows shouldn't inherit the 75px min-width. */
+.admin-tabpanel table button {
+  min-width: 0;
+}

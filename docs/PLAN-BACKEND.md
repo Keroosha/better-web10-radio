@@ -12,8 +12,8 @@
 - [x] Use soft delete with `IsDeleted`; never delete domain data with `DELETE` from application code.
 - [x] Use `SELECT ... FOR UPDATE SKIP LOCKED` for queue/work claiming.
 - [x] Fail application startup when required configuration is missing or a value violates an implemented validator.
-- [ ] Use DI composition and high-performance structured logging.
-- [ ] Add OTEL traces/metrics for API, Telegram, queue, payment, and stream-node flows.
+- [x] Use DI composition and high-performance structured logging.
+- [x] Add OTEL traces/metrics for API, Telegram, queue, payment, and stream-node flows.
 - [x] Ban Alpine/libmusl Docker images; use Debian/Ubuntu images for non-.NET infrastructure.
 - [x] Use Microsoft .NET chiseled images for final/runtime .NET containers.
 
@@ -62,14 +62,14 @@
 - [x] Implement `POST /api/v0/telegram/webhook` with strict secret/body validation, typed Funogram parsing, transactional update/event dedupe, and durable command-state dispatch.
 - [x] Implement `GET /api/v0/telegram/health` with monotonic last update/error state.
 - [x] Implement authenticated stream-node playback lease/completion callbacks with owner/attempt fencing and bounded bodies.
-- [ ] Implement all admin routes listed in `SPEC.md`.
+- [x] Implement all admin routes listed in `SPEC.md`.
 - [x] Add route-level logging fields: route, status, traceId, correlationId, elapsedMs.
 - [x] Add API integration tests for player state/SSE/range streaming, complete admin auth matrix, typed Telegram webhook dedupe and domain effects, stream-node callback fencing/body limits, health routes, and problem-details errors.
 
 ### Phase B4 — Telegram bot and Stars payments
 
 - [x] Configure Funogram bot token from `WEB10_TELEGRAM__BOT_TOKEN` and configured Stars prices from required `WEB10_TELEGRAM__REQUEST_PRICE_STARS` / `WEB10_TELEGRAM__SAY_PRICE_STARS` keys.
-- [x] Support webhook-only v0 mode through `/api/v0/telegram/webhook`; no long-polling runtime path is shipped.
+- [x] Support selectable `Webhook` and `LongPolling` v0 modes: webhook uses `/api/v0/telegram/webhook`; the hosted poller first calls `deleteWebhook(dropPendingUpdates=false)` and then routes typed updates through the same durable ingress.
 - [x] Implement localized `/start` and `/help` with RU for `ru|ru-*` and English fallback.
 - [x] Implement `/request <query>` with `pg_trgm` ranked suggestions, immutable selection/confirmation, and unpaid `NeedsReview` backlog for unmatched requests.
 - [x] Implement `/say <text>` as a paid flow: create the pending message/order, relay the Stars invoice, wait for `successful_payment`, then atomically mark `PaidPendingModeration`.
@@ -84,26 +84,26 @@
 ### Phase B5 — Stream-node
 
 - [x] Create `src/stream-node/` with Dockerfile and runtime scripts.
-- [ ] Start Xvfb and export a stable display such as `:99`.
-- [ ] Start Chromium in kiosk mode pointed at `WEB10_STREAM__STAGE_URL`.
-- [ ] Include Chromium flag `--enable-unsafe-swiftshader` for software WebGL.
-- [ ] Use FFmpeg/x11grab to capture Chromium/X11 video.
-- [ ] Create LiquidSoap script that reads backend metadata/queue state and builds the audio/video stream.
-- [ ] Encode Telegram RTMP output with FFmpeg/LiquidSoap settings documented in `SPEC.md`.
-- [ ] Push stream to `WEB10_STREAM__RTMP_URL` using `WEB10_STREAM__RTMP_KEY`.
-- [ ] Report heartbeat and failure states to backend.
-- [ ] Implement bounded restart policy and admin-visible failure reason.
-- [ ] Add smoke checks for Xvfb, Chromium launch, LiquidSoap syntax, FFmpeg availability, and backend heartbeat.
+- [x] Start Xvfb and export a stable display such as `:99`.
+- [x] Start Chromium in kiosk mode pointed at `WEB10_STREAM__STAGE_URL`.
+- [x] Include Chromium flag `--enable-unsafe-swiftshader` for software WebGL.
+- [x] Use FFmpeg/x11grab to capture Chromium/X11 video.
+- [x] Create LiquidSoap script that reads backend metadata/queue state and builds the audio/video stream.
+- [x] Encode Telegram RTMP output with FFmpeg/LiquidSoap settings documented in `SPEC.md`.
+- [x] Push stream to `WEB10_STREAM__RTMP_URL` using `WEB10_STREAM__RTMP_KEY`.
+- [x] Report heartbeat and failure states to backend.
+- [x] Implement bounded restart policy and admin-visible failure reason.
+- [x] Add smoke checks for Xvfb, Chromium launch, LiquidSoap syntax, FFmpeg availability, and backend heartbeat.
 
 ### Phase B6 — Observability, Docker, verification
 
-- [ ] Add LoggerMessage source-generated/high-performance logging wrappers or equivalent low-allocation logging pattern.
-- [ ] Add OTEL tracing and metrics for API, Telegram updates, payment flow, queue claims, library scans, and stream-node callbacks.
-- [ ] Add Docker Compose for PostgreSQL, API, frontend placeholder/service URL, stream-node, and optional observability collector.
+- [x] Add LoggerMessage source-generated/high-performance logging wrappers or equivalent low-allocation logging pattern.
+- [x] Add OTEL tracing and metrics for API, Telegram updates, payment flow, queue claims, library scans, and stream-node callbacks.
+- [x] Add Docker Compose for PostgreSQL, API, frontend placeholder/service URL, stream-node, and optional observability collector.
 - [x] Add Docker Compose smoke path for PostgreSQL, separate migrator, API startup, and a chiseled-compatible managed API liveness healthcheck.
 - [x] Verify `docker compose up --build --wait --wait-timeout 120 api` applies migrations through `202607100003`, installs `pg_trgm` and all five B4 indexes, reaches healthy API liveness, and permits immediate `/health/*` requests without `sleep`.
 - [x] Document backend Compose smoke commands, migration check, and Docker image policy.
 - [ ] Add NUnit integration tests for database, API, Telegram, and stream-node contracts.
-- [ ] Verify all apps can run in containers with required config.
+- [x] Verify all apps can run in containers with required config.
 - [x] Verify startup fails when required config keys are missing.
 - [x] Verify no application repository executes `DELETE` against domain tables.

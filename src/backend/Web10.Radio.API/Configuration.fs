@@ -118,14 +118,15 @@ module Configuration =
             errors.Add("WEB10_STORAGE__TYPE must be exactly Local or S3.")
             None
 
+
     let private parseTelegramUpdateMode (errors: ResizeArray<string>) (value: string option) =
         match value with
-        | None -> TelegramUpdateMode.Webhook
-        | Some "Webhook" -> TelegramUpdateMode.Webhook
-        | Some "LongPolling" -> TelegramUpdateMode.LongPolling
+        | None -> Webhook
+        | Some "Webhook" -> Webhook
+        | Some "LongPolling" -> LongPolling
         | Some _ ->
             errors.Add("WEB10_TELEGRAM__UPDATE_MODE must be exactly Webhook or LongPolling.")
-            TelegramUpdateMode.Webhook
+            Webhook
 
     let private parseBoolean (errors: ResizeArray<string>) envVar (value: string option) =
         match value with
@@ -334,7 +335,8 @@ module Configuration =
 
         let sayPriceStars =
             parsePositiveInt32 errors "WEB10_TELEGRAM__SAY_PRICE_STARS" (requiredValue "TELEGRAM:SAY_PRICE_STARS")
-        let telegramUpdateMode = parseTelegramUpdateMode errors (optionalValue "TELEGRAM:UPDATE_MODE")
+        let telegramUpdateMode =
+            parseTelegramUpdateMode errors (readOptionalExact configuration "TELEGRAM:UPDATE_MODE")
         let localRoot = optionalValue "STORAGE:LOCAL_ROOT"
         let s3Bucket = optionalValue "STORAGE:S3_BUCKET"
         let s3Region = optionalValue "STORAGE:S3_REGION"
@@ -368,8 +370,8 @@ module Configuration =
                       WebhookSecret = getRequired "TELEGRAM:WEBHOOK_SECRET"
                       ChannelIdOrUsername = getRequired "TELEGRAM:CHANNEL_ID_OR_USERNAME"
                       RequestPriceStars = Option.get requestPriceStars
-                      SayPriceStars = Option.get sayPriceStars
-                      UpdateMode = telegramUpdateMode }
+                      UpdateMode = telegramUpdateMode
+                      SayPriceStars = Option.get sayPriceStars }
                   Stream =
                     { RtmpUrl = Option.get rtmpUrl
                       RtmpKey = getRequired "STREAM:RTMP_KEY"

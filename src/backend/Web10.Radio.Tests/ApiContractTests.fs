@@ -106,9 +106,10 @@ module ApiContractTests =
 
             member _.AnswerPreCheckoutAsync(_preCheckoutQueryId, _errorMessage, _cancellationToken) = ok ()
 
-            member _.GetUpdatesAsync(_offset, _timeoutSeconds, _cancellationToken) = Task.FromResult(Ok [||])
+            member _.GetUpdatesAsync(_offset, _cancellationToken) = Task.FromResult(Ok(Array.empty<Funogram.Telegram.Types.Update>))
 
             member _.DeleteWebhookAsync(_dropPendingUpdates, _cancellationToken) = ok ()
+
 
     type private CapturedLog =
         { Level: LogLevel

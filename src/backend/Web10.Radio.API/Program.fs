@@ -56,9 +56,9 @@ module Program =
             |> DatabaseComposition.addDatabase options.Postgres
             |> ApplicationComposition.addApplicationServices
             |> TelegramComposition.addTelegram options.Telegram
+            |> TelegramLongPollingComposition.addTelegramLongPolling options.Telegram.UpdateMode
             |> BackgroundWorkerComposition.addBackgroundWorkers options
             |> ApiEndpoints.addApiServices options.Admin options.DevelopmentFixturesEnabled options.Stream
-            |> TelegramLongPollingComposition.addTelegramLongPolling options.Telegram
             |> HealthComposition.addHealthChecks options
             |> ObservabilityComposition.addObservability options.Otel builder.Environment
             |> ignore

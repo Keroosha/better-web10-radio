@@ -10,11 +10,11 @@ interface ResourceViewProps<T> {
 /** Renders loading / error / ready states for an {@link ApiResource}. */
 export function ResourceView<T>({ resource, children }: ResourceViewProps<T>): ReactElement {
   if (resource.status === 'loading') {
-    return <p style={{ opacity: 0.7 }}>Loading…</p>;
+    return <p className="admin-muted">Loading…</p>;
   }
   if (resource.status === 'error') {
     return (
-      <p role="alert" style={{ color: '#b00020' }}>
+      <p role="alert" className="admin-error">
         Failed to load: {resource.error.message}
       </p>
     );

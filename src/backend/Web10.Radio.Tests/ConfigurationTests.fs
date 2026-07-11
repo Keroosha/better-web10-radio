@@ -277,6 +277,36 @@ module ConfigurationTests =
             | Error errors -> Assert.Fail(sprintf "Expected configured Telegram Stars prices to be accepted, but got %s." (joinedErrors errors)))
 
     [<Test>]
+    let ``load defaults an omitted Telegram update mode to Webhook`` () =
+        withTemporaryDirectory (fun root ->
+            match Configuration.load (configurationPairs root |> buildConfiguration) with
+            | Ok options -> Assert.That(options.Telegram.UpdateMode, Is.EqualTo(Web10.Radio.Telegram.TelegramUpdateMode.Webhook))
+            | Error errors -> Assert.Fail(sprintf "Expected omitted Telegram update mode to default to Webhook, but got %s." (joinedErrors errors)))
+
+    [<Test>]
+    let ``load accepts only the exact LongPolling Telegram update mode`` () =
+        withTemporaryDirectory (fun root ->
+            let pairs = configurationPairs root |> Map.add "TELEGRAM:UPDATE_MODE" "LongPolling"
+
+            match Configuration.load (buildConfiguration pairs) with
+            | Ok options -> Assert.That(options.Telegram.UpdateMode, Is.EqualTo(Web10.Radio.Telegram.TelegramUpdateMode.LongPolling))
+            | Error errors -> Assert.Fail(sprintf "Expected exact LongPolling Telegram update mode to be accepted, but got %s." (joinedErrors errors)))
+
+    [<Test>]
+    let ``load rejects an invalid Telegram update mode without leaking its value or configured secrets`` () =
+        withTemporaryDirectory (fun root ->
+            let invalidMode = "invalid-update-mode-secret-987654"
+            let pairs = configurationPairs root |> Map.add "TELEGRAM:UPDATE_MODE" invalidMode
+
+            match Configuration.load (buildConfiguration pairs) with
+            | Ok _ -> Assert.Fail("Expected an invalid Telegram update mode to be rejected.")
+            | Error errors ->
+                let message = joinedErrors errors
+                Assert.That(errors, Is.EqualTo(box [ "WEB10_TELEGRAM__UPDATE_MODE must be exactly Webhook or LongPolling." ]))
+                Assert.That(message, Does.Not.Contain(invalidMode), "Configuration diagnostics must not echo the invalid update-mode value.")
+                assertNoSecretsWereLeaked pairs message)
+
+    [<Test>]
     let ``load aggregates exact Telegram Stars price diagnostics`` () =
         withTemporaryDirectory (fun root ->
             let pairs =

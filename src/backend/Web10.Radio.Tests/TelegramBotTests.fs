@@ -13,6 +13,7 @@ open NUnit.Framework
 open Web10.Radio.API
 open Web10.Radio.Database.Repositories
 open Web10.Radio.Telegram
+open Funogram.Telegram.Types
 
 module TelegramBotTests =
     type private FixedClock(nowUtc: DateTimeOffset) =
@@ -91,9 +92,10 @@ module TelegramBotTests =
                 preCheckouts.Add { QueryId = queryId; ErrorMessage = errorMessage }
                 Task.FromResult preCheckoutResult
 
-            member _.GetUpdatesAsync(_offset, _timeoutSeconds, _) = Task.FromResult(Ok [||])
+            member _.GetUpdatesAsync(_offset, _cancellationToken) = Task.FromResult(Ok(Array.empty<Update>))
 
-            member _.DeleteWebhookAsync(_dropPendingUpdates, _) = Task.FromResult(Ok())
+            member _.DeleteWebhookAsync(_dropPendingUpdates, _cancellationToken) = Task.FromResult(Ok())
+
 
     type private CapturingLogger(entries: ConcurrentQueue<string>) =
         interface ILogger with

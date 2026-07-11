@@ -73,130 +73,126 @@ export function SayModerationPage(): ReactElement {
 
   return (
     <section>
-      <h2 style={{ fontSize: '16px' }}>Say moderation</h2>
-      <p style={{ fontSize: '12px', opacity: 0.7 }}>
+      <h2>Say moderation</h2>
+      <p className="admin-muted">
         Approve or reject paid <code>/say</code> messages. Only <code>pending</code> messages are
         actionable; approved ones show on the stage, rejected ones stay hidden.
       </p>
 
-      <div role="tablist" aria-label="Moderation status" style={{ display: 'flex', gap: '6px', margin: '10px 0' }}>
-        {STATUS_TABS.map((tab) => (
-          <button
-            key={tab}
-            type="button"
-            role="tab"
-            aria-selected={tab === status}
-            onClick={() => selectStatus(tab)}
-            style={{
-              padding: '5px 12px',
-              borderRadius: '6px',
-              border: '1px solid #ccc',
-              cursor: 'pointer',
-              background: tab === status ? '#123' : '#fff',
-              color: tab === status ? '#fff' : '#123',
-              textTransform: 'capitalize',
-            }}
-          >
-            {tab}
-          </button>
-        ))}
-      </div>
+      <section className="tabs" style={{ marginTop: '10px', maxWidth: '720px' }}>
+        <menu role="tablist" aria-label="Moderation status">
+          {STATUS_TABS.map((tab) => (
+            <button
+              key={tab}
+              type="button"
+              role="tab"
+              aria-selected={tab === status}
+              aria-controls="say-panel"
+              onClick={() => selectStatus(tab)}
+              style={{ textTransform: 'capitalize' }}
+            >
+              {tab}
+            </button>
+          ))}
+        </menu>
 
-      {mutation.status === 'error' && mutation.error !== null && (
-        <p role="alert" style={{ color: '#b00020', fontSize: '13px' }}>
-          Moderation failed: {mutationErrorText(mutation.error)}
-        </p>
-      )}
+        <article role="tabpanel" id="say-panel">
+          {mutation.status === 'error' && mutation.error !== null && (
+            <p role="alert" className="admin-error">
+              Moderation failed: {mutationErrorText(mutation.error)}
+            </p>
+          )}
 
-      <ResourceView resource={resource}>
-        {(messages) =>
-          messages.length === 0 ? (
-            <p style={{ opacity: 0.7 }}>No {status} messages.</p>
-          ) : (
-            <ul style={{ listStyle: 'none', padding: 0, margin: 0, maxWidth: '680px' }}>
-              {messages.map((message) => (
-                <li
-                  key={message.id}
-                  style={{ border: '1px solid #e5e5e5', borderRadius: '8px', padding: '12px 14px', marginBottom: '10px' }}
-                >
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                    {message.color !== null && (
-                      <span
-                        aria-hidden="true"
-                        style={{
-                          width: '12px',
-                          height: '12px',
-                          borderRadius: '50%',
-                          background: message.color,
-                          display: 'inline-block',
-                        }}
-                      />
-                    )}
-                    <strong>{message.displayName}</strong>
-                    <span style={{ opacity: 0.7 }}>{formatStars(message.amountStars)} ⭐</span>
-                    <span style={{ marginLeft: 'auto', fontSize: '12px', opacity: 0.6 }}>
-                      {message.submittedAtUtc === null ? '—' : formatUtcTime(message.submittedAtUtc)}
-                    </span>
-                  </div>
-                  <p style={{ margin: '8px 0 0' }}>{message.text}</p>
-                  {message.status === 'rejected' && message.moderationReason !== null && (
-                    <p style={{ margin: '6px 0 0', fontSize: '12px', color: '#b00020' }}>
-                      Reason: {message.moderationReason}
-                    </p>
-                  )}
-
-                  {message.status === 'pending' && (
-                    <div style={{ marginTop: '10px' }}>
-                      {draft?.id === message.id ? (
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-                          <textarea
-                            aria-label={`Rejection reason for ${message.displayName}`}
-                            value={draft.reason}
-                            maxLength={REJECT_REASON_MAX}
-                            onChange={(event) => setDraft({ id: message.id, reason: event.target.value })}
-                            rows={2}
-                            style={{ padding: '6px', resize: 'vertical' }}
+          <ResourceView resource={resource}>
+            {(messages) =>
+              messages.length === 0 ? (
+                <p className="admin-muted">No {status} messages.</p>
+              ) : (
+                <ul style={{ listStyle: 'none', padding: 0, margin: 0 }}>
+                  {messages.map((message) => (
+                    <li
+                      key={message.id}
+                      style={{ border: '1px solid #a7b7c9', background: '#fbfdff', padding: '12px 14px', marginBottom: '10px' }}
+                    >
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        {message.color !== null && (
+                          <span
+                            aria-hidden="true"
+                            style={{
+                              width: '12px',
+                              height: '12px',
+                              borderRadius: '50%',
+                              background: message.color,
+                              display: 'inline-block',
+                            }}
                           />
-                          <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                            <button
-                              type="button"
-                              disabled={busy || draft.reason.trim().length < REJECT_REASON_MIN}
-                              onClick={() => submitReject(message.id, draft.reason)}
-                              style={{ padding: '5px 12px' }}
-                            >
-                              Confirm reject
-                            </button>
-                            <button type="button" disabled={busy} onClick={() => setDraft(null)} style={{ padding: '5px 12px' }}>
-                              Cancel
-                            </button>
-                            <span style={{ fontSize: '11px', opacity: 0.6 }}>
-                              {draft.reason.trim().length}/{REJECT_REASON_MAX}
-                            </span>
-                          </div>
-                        </div>
-                      ) : (
-                        <div style={{ display: 'flex', gap: '8px' }}>
-                          <button type="button" disabled={busy} onClick={() => approve(message.id)} style={{ padding: '5px 12px' }}>
-                            Approve
-                          </button>
-                          <button
-                            type="button"
-                            disabled={busy}
-                            onClick={() => setDraft({ id: message.id, reason: '' })}
-                            style={{ padding: '5px 12px' }}
-                          >
-                            Reject
-                          </button>
+                        )}
+                        <strong>{message.displayName}</strong>
+                        <span className="admin-muted">{formatStars(message.amountStars)} ⭐</span>
+                        <span className="admin-muted" style={{ marginLeft: 'auto', fontSize: '12px' }}>
+                          {message.submittedAtUtc === null ? '—' : formatUtcTime(message.submittedAtUtc)}
+                        </span>
+                      </div>
+                      <p style={{ margin: '8px 0 0' }}>{message.text}</p>
+                      {message.status === 'rejected' && message.moderationReason !== null && (
+                        <p className="admin-error" style={{ margin: '6px 0 0', fontSize: '12px' }}>
+                          Reason: {message.moderationReason}
+                        </p>
+                      )}
+
+                      {message.status === 'pending' && (
+                        <div style={{ marginTop: '10px' }}>
+                          {draft?.id === message.id ? (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                              <textarea
+                                aria-label={`Rejection reason for ${message.displayName}`}
+                                value={draft.reason}
+                                maxLength={REJECT_REASON_MAX}
+                                onChange={(event) => setDraft({ id: message.id, reason: event.target.value })}
+                                rows={2}
+                                style={{ resize: 'vertical' }}
+                              />
+                              <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                                <button
+                                  type="button"
+                                  className="default"
+                                  disabled={busy || draft.reason.trim().length < REJECT_REASON_MIN}
+                                  onClick={() => submitReject(message.id, draft.reason)}
+                                >
+                                  Confirm reject
+                                </button>
+                                <button type="button" disabled={busy} onClick={() => setDraft(null)}>
+                                  Cancel
+                                </button>
+                                <span className="admin-muted" style={{ fontSize: '11px' }}>
+                                  {draft.reason.trim().length}/{REJECT_REASON_MAX}
+                                </span>
+                              </div>
+                            </div>
+                          ) : (
+                            <div style={{ display: 'flex', gap: '8px' }}>
+                              <button type="button" className="default" disabled={busy} onClick={() => approve(message.id)}>
+                                Approve
+                              </button>
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => setDraft({ id: message.id, reason: '' })}
+                              >
+                                Reject
+                              </button>
+                            </div>
+                          )}
                         </div>
                       )}
-                    </div>
-                  )}
-                </li>
-              ))}
-            </ul>
-          )
-        }
-      </ResourceView>
+                    </li>
+                  ))}
+                </ul>
+              )
+            }
+          </ResourceView>
+        </article>
+      </section>
     </section>
   );
 }

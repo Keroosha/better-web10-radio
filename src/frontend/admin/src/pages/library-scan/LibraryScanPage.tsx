@@ -113,18 +113,18 @@ export function LibraryScanPage(): ReactElement {
 
   return (
     <section>
-      <h2 style={{ fontSize: '16px' }}>Library scan</h2>
-      <p style={{ fontSize: '12px', opacity: 0.7 }}>
+      <h2>Library scan</h2>
+      <p className="admin-muted">
         Scan the default storage or an enabled additional backend for playable tracks.
       </p>
 
-      {storageState.status === 'loading' ? <p style={{ opacity: 0.7 }}>Loading storage choices…</p> : null}
+      {storageState.status === 'loading' ? <p className="admin-muted">Loading storage choices…</p> : null}
       {storageState.status === 'error' ? <p role="alert">Failed to load storage choices: {storageState.message}</p> : null}
 
       {storageState.status === 'ready' ? (
         <div style={{ display: 'grid', gap: '10px', maxWidth: '520px' }}>
-          <label htmlFor="library-storage-backend">
-            Storage backend
+          <div className="group">
+            <label htmlFor="library-storage-backend">Storage backend</label>
             <select
               id="library-storage-backend"
               value={selectedStorageBackendId}
@@ -138,12 +138,12 @@ export function LibraryScanPage(): ReactElement {
                 </option>
               ))}
             </select>
-          </label>
+          </div>
           {storageState.storage.additionalBackends.length === 0 ? (
-            <p style={{ margin: 0, opacity: 0.7 }}>No additional storage backends are configured.</p>
+            <p className="admin-muted" style={{ margin: 0 }}>No additional storage backends are configured.</p>
           ) : null}
           <div>
-            <button type="button" onClick={() => void startScan()} disabled={isStarting}>
+            <button type="button" className="default" onClick={() => void startScan()} disabled={isStarting}>
               {isStarting ? 'Starting scan…' : 'Start scan'}
             </button>
           </div>
@@ -151,7 +151,7 @@ export function LibraryScanPage(): ReactElement {
       ) : null}
 
       {scan === null && actionError === null && storageState.status === 'ready' ? (
-        <p style={{ marginTop: '14px', opacity: 0.7 }}>No scan has been started yet.</p>
+        <p className="admin-muted" style={{ marginTop: '14px' }}>No scan has been started yet.</p>
       ) : null}
 
       {actionError !== null ? <p role="alert">{actionError}</p> : null}

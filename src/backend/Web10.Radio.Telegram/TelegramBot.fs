@@ -147,12 +147,11 @@ type ITelegramBotClient =
         CancellationToken -> Task<Result<unit, TelegramBotError>>
 
     abstract member GetUpdatesAsync:
-        offset: int64 option *
-        timeoutSeconds: int *
-        CancellationToken -> Task<Result<Update array, TelegramBotError>>
+        offset: int64 option * CancellationToken -> Task<Result<Update array, TelegramBotError>>
 
     abstract member DeleteWebhookAsync:
         dropPendingUpdates: bool * CancellationToken -> Task<Result<unit, TelegramBotError>>
+
 
 [<RequireQualifiedAccess>]
 module TelegramText =
@@ -457,10 +456,11 @@ type FunogramTelegramBotClient(config: Funogram.Types.BotConfig) =
 
             execute "answerPreCheckoutQuery" request cancellationToken |> passThrough
 
-        member _.GetUpdatesAsync(offset, timeoutSeconds, cancellationToken) =
-            let request = Req.GetUpdates.Make(?offset = offset, timeout = int64 timeoutSeconds)
+        member _.GetUpdatesAsync(offset, cancellationToken) =
+            let request = Req.GetUpdates.Make(?offset = offset, timeout = 30L)
             executeResult "getUpdates" request cancellationToken
 
         member _.DeleteWebhookAsync(dropPendingUpdates, cancellationToken) =
             let request = Req.DeleteWebhook.Make(dropPendingUpdates = dropPendingUpdates)
             execute "deleteWebhook" request cancellationToken |> passThrough
+

@@ -83,7 +83,7 @@ module AuditRegressionTests =
 
         Assert.That(apiDockerfile, Does.Contain("mcr.microsoft.com/dotnet/aspnet:10.0-noble-chiseled"))
         Assert.That(migratorDockerfile, Does.Contain("mcr.microsoft.com/dotnet/runtime:10.0-noble-chiseled"))
-        Assert.That(streamNodeDockerfile, Does.Contain("FROM debian:bookworm-slim"))
+        Assert.That(streamNodeDockerfile, Does.Contain("FROM debian:trixie-slim"))
 
         [ "alpine"
           "libmusl"

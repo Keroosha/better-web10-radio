@@ -20,6 +20,9 @@ RUN bun run --filter @web10/web-stage build \
     && (cd admin && bunx vite build --base=/admin/)
 
 FROM nginx:stable-bookworm AS runtime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=build /app/web-stage/dist /usr/share/nginx/html
 COPY --from=build /app/admin/dist /usr/share/nginx/html/admin
 COPY nginx.conf /etc/nginx/conf.d/default.conf

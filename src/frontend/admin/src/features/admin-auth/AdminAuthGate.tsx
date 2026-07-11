@@ -128,9 +128,16 @@ export function AdminAuthGate({ children }: AdminAuthGateProps): ReactElement {
 
   if (isProbing) {
     return (
-      <main style={{ maxWidth: '420px', margin: '10vh auto', fontFamily: 'system-ui, sans-serif' }}>
-        <p role="status">Checking admin session…</p>
-      </main>
+      <div className="admin-desktop admin-desktop--center">
+        <div className="window glass active" style={{ width: 'min(360px, 100%)' }}>
+          <div className="title-bar">
+            <div className="title-bar-text">Web10.Radio — Admin</div>
+          </div>
+          <div className="window-body has-space">
+            <p role="status">Checking admin session…</p>
+          </div>
+        </div>
+      </div>
     );
   }
 
@@ -142,39 +149,55 @@ export function AdminAuthGate({ children }: AdminAuthGateProps): ReactElement {
     );
   }
   return (
-    <main style={{ maxWidth: '420px', margin: '10vh auto', fontFamily: 'system-ui, sans-serif' }}>
-      <h1 style={{ fontSize: '18px' }}>Web10.Radio — Admin</h1>
-      <p style={{ fontSize: '13px', opacity: 0.75 }}>Sign in with your administrator credentials.</p>
-      <form onSubmit={(event) => void onSubmit(event)} style={{ display: 'grid', gap: '10px', marginTop: '12px' }}>
-        <label style={{ display: 'grid', gap: '4px', fontSize: '13px' }}>
-          Username
-          <input
-            type="text"
-            value={username}
-            onChange={(event) => setUsername(event.target.value)}
-            autoComplete="username"
-            disabled={isSubmitting}
-            required
-            style={{ padding: '6px 8px' }}
-          />
-        </label>
-        <label style={{ display: 'grid', gap: '4px', fontSize: '13px' }}>
-          Password
-          <input
-            type="password"
-            value={password}
-            onChange={(event) => setPassword(event.target.value)}
-            autoComplete="current-password"
-            disabled={isSubmitting}
-            required
-            style={{ padding: '6px 8px' }}
-          />
-        </label>
-        {serverError !== null && <p role="alert">{serverError}</p>}
-        <button type="submit" disabled={isSubmitting} style={{ justifySelf: 'start', padding: '6px 12px' }}>
-          {isSubmitting ? 'Signing in…' : 'Sign in'}
-        </button>
-      </form>
-    </main>
+    <div className="admin-desktop admin-desktop--center">
+      <div className="window glass active" style={{ width: 'min(420px, 100%)' }}>
+        <div className="title-bar">
+          <div className="title-bar-text">Web10.Radio — Admin</div>
+          <div className="title-bar-controls">
+            <button type="button" aria-label="Close" tabIndex={-1} />
+          </div>
+        </div>
+        <div className="window-body has-space">
+          <p className="admin-muted">Sign in with your administrator credentials.</p>
+          <form
+            onSubmit={(event) => void onSubmit(event)}
+            style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}
+          >
+            <div className="group">
+              <label htmlFor="admin-username">Username</label>
+              <input
+                id="admin-username"
+                type="text"
+                value={username}
+                onChange={(event) => setUsername(event.target.value)}
+                autoComplete="username"
+                disabled={isSubmitting}
+                required
+              />
+            </div>
+            <div className="group">
+              <label htmlFor="admin-password">Password</label>
+              <input
+                id="admin-password"
+                type="password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                autoComplete="current-password"
+                disabled={isSubmitting}
+                required
+              />
+            </div>
+            {serverError !== null && (
+              <p role="alert" className="admin-error">
+                {serverError}
+              </p>
+            )}
+            <button type="submit" className="default" disabled={isSubmitting} style={{ alignSelf: 'flex-start' }}>
+              {isSubmitting ? 'Signing in…' : 'Sign in'}
+            </button>
+          </form>
+        </div>
+      </div>
+    </div>
   );
 }

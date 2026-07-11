@@ -166,76 +166,96 @@ export function SocialLinksPage(): ReactElement {
 
   return (
     <section>
-      <h2 style={{ fontSize: '16px' }}>Social links</h2>
+      <h2>Social links</h2>
       <ResourceView resource={resource}>
         {(loadedLinks) => (
           <form onSubmit={saveLinks} style={{ maxWidth: '900px' }}>
             {loadedLinks.length === 0 && drafts.length === 0 ? (
-              <p style={{ opacity: 0.7 }}>No social links configured.</p>
+              <p className="admin-muted">No social links configured.</p>
             ) : null}
             {drafts.length > 0 ? (
-              <table style={{ borderCollapse: 'collapse', width: '100%' }}>
-                <thead>
-                  <tr style={{ textAlign: 'left', borderBottom: '2px solid #ddd' }}>
-                    <th style={{ padding: '6px' }}>Kind</th>
-                    <th style={{ padding: '6px' }}>Details</th>
-                    <th style={{ padding: '6px' }}>Order</th>
-                    <th style={{ padding: '6px' }}>Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {drafts.map((draft, index) => (
-                    <tr key={draft.draftKey} style={{ borderBottom: '1px solid #eee', verticalAlign: 'top' }}>
-                      <td style={{ padding: '6px' }}>
-                        <label htmlFor={`kind-${draft.draftKey}`}>Kind for {draft.label}</label>
-                        <select
-                          id={`kind-${draft.draftKey}`}
-                          value={draft.kind}
-                          onChange={(event) => {
-                            const parsedKind = SocialKindSchema.safeParse(event.currentTarget.value);
-                            if (parsedKind.success) {
-                              updateDraft(draft.draftKey, { kind: parsedKind.data });
-                            }
-                          }}
-                          disabled={isSaving}
-                        >
-                          {socialKinds.map((kind) => <option key={kind} value={kind}>{kind}</option>)}
-                        </select>
-                      </td>
-                      <td style={{ padding: '6px' }}>
-                        <p>{draft.name}</p>
-                        <label htmlFor={`name-${draft.draftKey}`}>Name for {draft.label}</label>
-                        <input id={`name-${draft.draftKey}`} value={draft.name} onChange={(event) => updateDraft(draft.draftKey, { name: event.currentTarget.value })} disabled={isSaving} />
-                        <label htmlFor={`handle-${draft.draftKey}`}>Handle for {draft.label}</label>
-                        <input id={`handle-${draft.draftKey}`} value={draft.handle} onChange={(event) => updateDraft(draft.draftKey, { handle: event.currentTarget.value })} disabled={isSaving} />
-                        <label htmlFor={`url-${draft.draftKey}`}>URL for {draft.label}</label>
-                        <input id={`url-${draft.draftKey}`} value={draft.url} onChange={(event) => updateDraft(draft.draftKey, { url: event.currentTarget.value })} disabled={isSaving} />
-                        <label htmlFor={`glyph-${draft.draftKey}`}>Glyph for {draft.label}</label>
-                        <input id={`glyph-${draft.draftKey}`} value={draft.glyph} onChange={(event) => updateDraft(draft.draftKey, { glyph: event.currentTarget.value })} disabled={isSaving} />
-                        <label htmlFor={`color-${draft.draftKey}`}>Color for {draft.label}</label>
-                        <input id={`color-${draft.draftKey}`} value={draft.color} onChange={(event) => updateDraft(draft.draftKey, { color: event.currentTarget.value })} disabled={isSaving} />
-                        <label htmlFor={`qr-${draft.draftKey}`}>QR image URL for {draft.label}</label>
-                        <input id={`qr-${draft.draftKey}`} value={draft.qrImageUrl} onChange={(event) => updateDraft(draft.draftKey, { qrImageUrl: event.currentTarget.value })} disabled={isSaving} />
-                        <label htmlFor={`featured-${draft.draftKey}`}>
-                          <input id={`featured-${draft.draftKey}`} type="checkbox" checked={draft.isFeatured} onChange={(event) => updateDraft(draft.draftKey, { isFeatured: event.currentTarget.checked })} disabled={isSaving} />
-                          Featured
-                        </label>
-                      </td>
-                      <td style={{ padding: '6px' }}>
-                        <button type="button" aria-label={`Move ${draft.label} up`} onClick={() => moveDraft(draft.draftKey, -1)} disabled={isSaving || index === 0}>↑</button>
-                        <button type="button" aria-label={`Move ${draft.label} down`} onClick={() => moveDraft(draft.draftKey, 1)} disabled={isSaving || index === drafts.length - 1}>↓</button>
-                      </td>
-                      <td style={{ padding: '6px' }}>
-                        <button type="button" aria-label={`Remove ${draft.label}`} onClick={() => setDrafts((currentDrafts) => currentDrafts.filter((currentDraft) => currentDraft.draftKey !== draft.draftKey))} disabled={isSaving}>Remove</button>
-                      </td>
+              <div className="admin-table-scroll">
+                <table style={{ width: '100%' }}>
+                  <thead>
+                    <tr>
+                      <th style={{ width: '18%' }}>Kind</th>
+                      <th style={{ width: '54%' }}>Details</th>
+                      <th style={{ width: '14%' }}>Order</th>
+                      <th style={{ width: '14%' }}>Actions</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {drafts.map((draft, index) => (
+                      <tr key={draft.draftKey} style={{ verticalAlign: 'top' }}>
+                        <td>
+                          <div className="group">
+                            <label htmlFor={`kind-${draft.draftKey}`}>Kind for {draft.label}</label>
+                            <select
+                              id={`kind-${draft.draftKey}`}
+                              value={draft.kind}
+                              onChange={(event) => {
+                                const parsedKind = SocialKindSchema.safeParse(event.currentTarget.value);
+                                if (parsedKind.success) {
+                                  updateDraft(draft.draftKey, { kind: parsedKind.data });
+                                }
+                              }}
+                              disabled={isSaving}
+                            >
+                              {socialKinds.map((kind) => <option key={kind} value={kind}>{kind}</option>)}
+                            </select>
+                          </div>
+                        </td>
+                        <td>
+                          <p>{draft.name}</p>
+                          <div className="group">
+                            <label htmlFor={`name-${draft.draftKey}`}>Name for {draft.label}</label>
+                            <input id={`name-${draft.draftKey}`} value={draft.name} onChange={(event) => updateDraft(draft.draftKey, { name: event.currentTarget.value })} disabled={isSaving} />
+                          </div>
+                          <div className="group">
+                            <label htmlFor={`handle-${draft.draftKey}`}>Handle for {draft.label}</label>
+                            <input id={`handle-${draft.draftKey}`} value={draft.handle} onChange={(event) => updateDraft(draft.draftKey, { handle: event.currentTarget.value })} disabled={isSaving} />
+                          </div>
+                          <div className="group">
+                            <label htmlFor={`url-${draft.draftKey}`}>URL for {draft.label}</label>
+                            <input id={`url-${draft.draftKey}`} value={draft.url} onChange={(event) => updateDraft(draft.draftKey, { url: event.currentTarget.value })} disabled={isSaving} />
+                          </div>
+                          <div className="group">
+                            <label htmlFor={`glyph-${draft.draftKey}`}>Glyph for {draft.label}</label>
+                            <input id={`glyph-${draft.draftKey}`} value={draft.glyph} onChange={(event) => updateDraft(draft.draftKey, { glyph: event.currentTarget.value })} disabled={isSaving} />
+                          </div>
+                          <div className="group">
+                            <label htmlFor={`color-${draft.draftKey}`}>Color for {draft.label}</label>
+                            <input id={`color-${draft.draftKey}`} value={draft.color} onChange={(event) => updateDraft(draft.draftKey, { color: event.currentTarget.value })} disabled={isSaving} />
+                          </div>
+                          <div className="group">
+                            <label htmlFor={`qr-${draft.draftKey}`}>QR image URL for {draft.label}</label>
+                            <input id={`qr-${draft.draftKey}`} value={draft.qrImageUrl} onChange={(event) => updateDraft(draft.draftKey, { qrImageUrl: event.currentTarget.value })} disabled={isSaving} />
+                          </div>
+                          <div>
+                            <input id={`featured-${draft.draftKey}`} type="checkbox" checked={draft.isFeatured} onChange={(event) => updateDraft(draft.draftKey, { isFeatured: event.currentTarget.checked })} disabled={isSaving} />
+                            <label htmlFor={`featured-${draft.draftKey}`}>Featured</label>
+                          </div>
+                        </td>
+                        <td>
+                          <div style={{ display: 'flex', gap: '4px' }}>
+                            <button type="button" aria-label={`Move ${draft.label} up`} onClick={() => moveDraft(draft.draftKey, -1)} disabled={isSaving || index === 0}>↑</button>
+                            <button type="button" aria-label={`Move ${draft.label} down`} onClick={() => moveDraft(draft.draftKey, 1)} disabled={isSaving || index === drafts.length - 1}>↓</button>
+                          </div>
+                        </td>
+                        <td>
+                          <button type="button" aria-label={`Remove ${draft.label}`} onClick={() => setDrafts((currentDrafts) => currentDrafts.filter((currentDraft) => currentDraft.draftKey !== draft.draftKey))} disabled={isSaving}>Remove</button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             ) : null}
-            <button type="button" onClick={() => { const draftKey = `new-${nextDraftKey.current}`; nextDraftKey.current += 1; setDrafts((currentDrafts) => [...currentDrafts, newDraft(draftKey)]); }} disabled={isSaving || drafts.length >= 50} style={{ marginTop: '12px' }}>Add social link</button>
-            <button type="submit" disabled={isSaving} style={{ marginLeft: '8px' }}>{isSaving ? 'Saving…' : 'Save social links'}</button>
-            {saveError !== null ? <p role="alert" style={{ color: '#b00020' }}>{saveError instanceof ApiError && saveError.code !== null ? saveError.code : saveError.message}</p> : null}
+            <div style={{ display: 'flex', gap: '8px', marginTop: '12px' }}>
+              <button type="button" onClick={() => { const draftKey = `new-${nextDraftKey.current}`; nextDraftKey.current += 1; setDrafts((currentDrafts) => [...currentDrafts, newDraft(draftKey)]); }} disabled={isSaving || drafts.length >= 50}>Add social link</button>
+              <button type="submit" className="default" disabled={isSaving}>{isSaving ? 'Saving…' : 'Save social links'}</button>
+            </div>
+            {saveError !== null ? <p role="alert" className="admin-error">{saveError instanceof ApiError && saveError.code !== null ? saveError.code : saveError.message}</p> : null}
             {savedLinks !== null ? <p>Saved</p> : null}
           </form>
         )}

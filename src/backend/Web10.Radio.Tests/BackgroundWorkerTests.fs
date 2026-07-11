@@ -15,6 +15,7 @@ open NUnit.Framework
 open Web10.Radio.API
 open Web10.Radio.Database
 open Web10.Radio.Database.Repositories
+open Web10.Radio.Telegram
 
 module BackgroundWorkerTests =
     type private PagedAmazonS3Client() =
@@ -221,7 +222,7 @@ module BackgroundWorkerTests =
               ChannelIdOrUsername = "@web10_test"
               RequestPriceStars = 100
               SayPriceStars = 50
-              UpdateMode = Web10.Radio.Telegram.TelegramUpdateMode.Webhook }
+              UpdateMode = TelegramUpdateMode.Webhook }
           Stream =
             { RtmpUrl = Uri("rtmp://localhost/live")
               RtmpKey = "test-rtmp-key"

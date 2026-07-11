@@ -167,8 +167,8 @@ test('logout revokes the server session and returns the operator to the gate', a
   });
 
   render(<App />);
-  await waitFor(() => expect(screen.getByRole('button', { name: 'Log out' })).toBeTruthy());
-  fireEvent.click(screen.getByRole('button', { name: 'Log out' }));
+  await waitFor(() => expect(screen.getByRole('button', { name: 'Close' })).toBeTruthy());
+  fireEvent.click(screen.getByRole('button', { name: 'Close' }));
 
   await waitFor(() => expect(screen.getByLabelText('Username')).toBeTruthy());
   const logout = calls.find((call) => call.path === '/api/v0/admin/auth/logout');
@@ -199,7 +199,7 @@ test('renders every admin section without a 501 or unpinned badge after session 
     'Stream-node',
     'Library scan',
   ]) {
-    expect(screen.getByRole('button', { name: section })).toBeTruthy();
+    expect(screen.getByRole('tab', { name: section })).toBeTruthy();
   }
 });
 
@@ -250,7 +250,7 @@ test('opens each formerly unpinned section as a real page rather than a placehol
     { navigation: 'Stream-node', signal: 'Status' },
     { navigation: 'Library scan', signal: 'Scan the default storage or an enabled additional backend for playable tracks.' },
   ]) {
-    fireEvent.click(screen.getByRole('button', { name: page.navigation }));
+    fireEvent.click(screen.getByRole('tab', { name: page.navigation }));
     await screen.findByText(page.signal);
     expect(screen.queryByText(/contract unpinned/i)).toBeNull();
   }

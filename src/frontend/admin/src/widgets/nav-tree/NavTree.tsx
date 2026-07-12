@@ -80,11 +80,6 @@ export function NavTree({ nav, onNavigate }: NavTreeProps): ReactElement {
           </ul>
         </details>
       </li>
-      <li style={{ borderTop: '1px solid #cdd', margin: '6px 0 4px', paddingTop: '6px' }}>
-        <span style={itemStyle(nav.view === 'styleguide')} onClick={() => onNavigate('styleguide')}>
-          <span style={glyph}>🎨</span>Дизайн-система
-        </span>
-      </li>
     </ul>
   );
 }

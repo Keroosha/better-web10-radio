@@ -19,7 +19,6 @@ import { NodePage } from '../pages/node/NodePage';
 import { PlayerPage } from '../pages/player/PlayerPage';
 import { PlaylistsPage } from '../pages/playlists/PlaylistsPage';
 import { StoragePage } from '../pages/storage/StoragePage';
-import { StyleguidePage } from '../pages/styleguide/StyleguidePage';
 import { breadcrumb, INITIAL_NAV, type AdminNav, type AdminView, type LibraryGroupBy } from '../shared/lib/view';
 import { ToastProvider, useToast } from '../shared/ui/toast';
 import { NavTree } from '../widgets/nav-tree/NavTree';
@@ -134,7 +133,6 @@ function AdminShell(): ReactElement {
               {nav.view === 'goals' ? <GoalsPage /> : null}
               {nav.view === 'storage' ? <StoragePage /> : null}
               {nav.view === 'node' ? <NodePage /> : null}
-              {nav.view === 'styleguide' ? <StyleguidePage /> : null}
             </div>
           </div>
           <TransportBar

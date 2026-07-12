@@ -8,8 +8,7 @@ export type AdminView =
   | 'banners'
   | 'goals'
   | 'storage'
-  | 'node'
-  | 'styleguide';
+  | 'node';
 
 export type LibraryGroupBy = 'album' | 'artist';
 
@@ -37,7 +36,5 @@ export function breadcrumb(nav: AdminNav): string {
       return 'Настройки › Хранилища';
     case 'node':
       return 'Настройки › Нода трансляции';
-    case 'styleguide':
-      return 'Дизайн-система';
   }
 }

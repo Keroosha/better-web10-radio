@@ -30,8 +30,8 @@ module PlaybackQueueRepositoryTests =
 VALUES (@TrackId, 'Queue title', 'Queue artist', false);
 
 INSERT INTO "PlaybackQueue" ("Id", "TrackId", "Source", "Status", "Priority", "RequestedAtUtc")
-VALUES (@FirstQueueId, @TrackId, 'playlist', 'Queued', 0, @RequestedAtUtc),
-       (@SecondQueueId, @TrackId, 'playlist', 'Queued', 0, @SecondRequestedAtUtc);""",
+VALUES (@FirstQueueId, @TrackId, 'fallback', 'Queued', 0, @RequestedAtUtc),
+       (@SecondQueueId, @TrackId, 'fallback', 'Queued', 0, @SecondRequestedAtUtc);""",
                         connection
                     )
 
@@ -102,8 +102,8 @@ WHERE "IsDeleted" = false;""",
 VALUES (@TrackId, 'Queued but not current', 'Regression', false);
 
 INSERT INTO "PlaybackQueue" ("Id", "TrackId", "Source", "Status", "Priority", "RequestedAtUtc", "ClaimOwner", "ClaimAttempt", "ClaimLeaseExpiresAtUtc")
-VALUES (@QueuedItemId, @TrackId, 'playlist', 'Queued', 0, @NowUtc, NULL, 0, NULL),
-       (@ClaimedItemId, @TrackId, 'playlist', 'Claimed', 0, @NowUtc, @ClaimOwner, 1, @LeaseExpiresAtUtc);""",
+VALUES (@QueuedItemId, @TrackId, 'fallback', 'Queued', 0, @NowUtc, NULL, 0, NULL),
+       (@ClaimedItemId, @TrackId, 'fallback', 'Claimed', 0, @NowUtc, @ClaimOwner, 1, @LeaseExpiresAtUtc);""",
                         connection
                     )
 
@@ -154,7 +154,7 @@ INSERT INTO "TrackFiles" ("Id", "TrackId", "StoragePath", "CachePath", "ContentT
 VALUES (@TrackFileId, @TrackId, '/library/current.ogg', '/cache/current.ogg', NULL, true, false);
 
 INSERT INTO "PlaybackQueue" ("Id", "TrackId", "Source", "Status", "Priority", "RequestedAtUtc", "ClaimOwner", "ClaimAttempt", "ClaimLeaseExpiresAtUtc")
-VALUES (@QueueItemId, @TrackId, 'playlist', 'Playing', 0, @NowUtc, @ClaimOwner, 7, @LeaseExpiresAtUtc);""",
+VALUES (@QueueItemId, @TrackId, 'fallback', 'Playing', 0, @NowUtc, @ClaimOwner, 7, @LeaseExpiresAtUtc);""",
                         connection
                     )
 

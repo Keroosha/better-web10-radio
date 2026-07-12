@@ -104,5 +104,19 @@ test('defaults to parallax on with no track, and maps nowPlaying to a scene trac
   expect(withTrack.lastOptions?.track).toEqual({
     title: NOW_PLAYING.title,
     artist: NOW_PLAYING.artist,
+    coverImageUrl: NOW_PLAYING.coverImageUrl,
   });
+});
+
+test('progress-only snapshots keep the same WebGL scene', () => {
+  const rec = makeRecorder();
+  const { rerender } = render(<StageScene createScene={rec.factory} nowPlaying={NOW_PLAYING} />);
+  rerender(
+    <StageScene
+      createScene={rec.factory}
+      nowPlaying={{ ...NOW_PLAYING, positionMs: NOW_PLAYING.positionMs + 1000 }}
+    />,
+  );
+  expect(rec.builds).toBe(1);
+  expect(rec.disposes).toBe(0);
 });

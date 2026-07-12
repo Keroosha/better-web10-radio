@@ -8,9 +8,19 @@ open Npgsql
 open NpgsqlTypes
 open Web10.Radio.Database
 
+[<RequireQualifiedAccess>]
+type OutboxAudience =
+    | Api
+    | Telegram
+    member this.DbLiteral =
+        match this with
+        | OutboxAudience.Api -> "Api"
+        | OutboxAudience.Telegram -> "Telegram"
+
 type OutboxEventToAppend =
     { Id: Guid
       EventType: string
+      Audience: OutboxAudience
       OccurredAtUtc: DateTimeOffset
       Producer: string
       CorrelationId: Guid option
@@ -20,6 +30,7 @@ type OutboxEventToAppend =
 type OutboxEventRecord =
     { Id: Guid
       EventType: string
+      Audience: OutboxAudience
       OccurredAtUtc: DateTimeOffset
       Producer: string
       CorrelationId: Guid option
@@ -29,7 +40,7 @@ type OutboxEventRecord =
       ClaimAttempt: int
       LeaseExpiresAtUtc: DateTimeOffset }
 
-type OutboxDispatchLease internal (connection: NpgsqlConnection, records: OutboxEventRecord list) =
+type OutboxDispatchLease internal (connection: NpgsqlConnection, lockName: string, records: OutboxEventRecord list) =
     let mutable disposed = 0
 
     member _.Records = records
@@ -37,7 +48,12 @@ type OutboxDispatchLease internal (connection: NpgsqlConnection, records: Outbox
     member private _.Release() =
         if Interlocked.Exchange(&disposed, 1) = 0 then
             try
-                use command = new NpgsqlCommand("SELECT pg_advisory_unlock(hashtext('web10.radio.outbox-global-dispatch'));", connection)
+                use command =
+                    new NpgsqlCommand(
+                        $"SELECT pg_advisory_unlock(hashtext('{lockName}'));",
+                        connection
+                    )
+
                 command.ExecuteScalar() |> ignore
             with _ ->
                 ()
@@ -52,16 +68,27 @@ module OutboxEventRepository =
 
     [<Literal>]
     let private appendSql = """INSERT INTO "OutboxEvents" (
-    "Id", "EventType", "OccurredAtUtc", "Producer", "CorrelationId", "CausationId", "Payload",
+    "Id", "EventType", "Audience", "OccurredAtUtc", "Producer", "CorrelationId", "CausationId", "Payload",
     "Status", "Attempts", "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc"
 )
 VALUES (
-    @Id, @EventType, @OccurredAtUtc, @Producer, @CorrelationId, @CausationId, @Payload::jsonb,
+    @Id, @EventType, @Audience, @OccurredAtUtc, @Producer, @CorrelationId, @CausationId, @Payload::jsonb,
     'Pending', 0, false, @OccurredAtUtc, @OccurredAtUtc
 );"""
 
+    let private dispatchLockName audience =
+        match audience with
+        | OutboxAudience.Api -> "web10.radio.outbox-dispatch-api"
+        | OutboxAudience.Telegram -> "web10.radio.outbox-dispatch-telegram"
+
+    let private tryDispatchLockSql audience =
+        $"SELECT pg_try_advisory_lock(hashtext('{dispatchLockName audience}'));"
+
+    let private releaseDispatchLockSql lockName =
+        $"SELECT pg_advisory_unlock(hashtext('{lockName}'));"
+
     [<Literal>]
-    let private tryGlobalDispatchLockSql = """SELECT pg_try_advisory_lock(hashtext('web10.radio.outbox-global-dispatch'));"""
+    let private deadLetterAttempts = 20
 
     [<Literal>]
     let private claimEarliestDueSql = """WITH first_unfinished AS (
@@ -69,6 +96,8 @@ VALUES (
     FROM "OutboxEvents"
     WHERE "IsDeleted" = false
       AND "Status" <> 'Processed'
+      AND "Audience" = @Audience
+      AND NOT ("Status" = 'Failed' AND "Attempts" >= @MaxAttempts)
     ORDER BY "OccurredAtUtc" ASC, "CreatedAtUtc" ASC, "Id" ASC
     FOR UPDATE
     LIMIT 1
@@ -76,7 +105,8 @@ VALUES (
     SELECT e."Id"
     FROM "OutboxEvents" e
     INNER JOIN first_unfinished first ON first."Id" = e."Id"
-    WHERE (
+    WHERE e."Audience" = @Audience
+      AND (
         (e."Status" IN ('Pending', 'Failed') AND (e."NextAttemptAtUtc" IS NULL OR e."NextAttemptAtUtc" <= @NowUtc))
         OR (e."Status" = 'Processing' AND (e."ClaimLeaseExpiresAtUtc" IS NULL OR e."ClaimLeaseExpiresAtUtc" <= @NowUtc))
     )
@@ -89,7 +119,7 @@ SET "Status" = 'Processing',
     "UpdatedAtUtc" = @NowUtc
 FROM due_event
 WHERE e."Id" = due_event."Id"
-RETURNING e."Id", e."EventType", e."OccurredAtUtc", e."Producer", e."CorrelationId", e."CausationId",
+RETURNING e."Id", e."EventType", e."Audience", e."OccurredAtUtc", e."Producer", e."CorrelationId", e."CausationId",
           e."Payload"::text, e."ClaimOwner", e."Attempts", e."ClaimLeaseExpiresAtUtc";"""
 
     [<Literal>]
@@ -128,17 +158,25 @@ WHERE "Id" = @EventId
     let private readNullableGuid (reader: NpgsqlDataReader) ordinal =
         if reader.IsDBNull(ordinal) then None else Some(reader.GetGuid(ordinal))
 
+    let private readAudience (reader: NpgsqlDataReader) ordinal =
+        match reader.GetString(ordinal) with
+        | "Api" -> OutboxAudience.Api
+        | "Telegram" -> OutboxAudience.Telegram
+        | value -> invalidArg "Audience" $"Unknown outbox audience '{value}'."
+
     let private readRecord (reader: NpgsqlDataReader) =
         { Id = reader.GetGuid(0)
           EventType = reader.GetString(1)
-          OccurredAtUtc = reader.GetFieldValue<DateTimeOffset>(2)
-          Producer = reader.GetString(3)
-          CorrelationId = readNullableGuid reader 4
-          CausationId = readNullableGuid reader 5
-          PayloadJson = reader.GetString(6)
-          ClaimOwner = reader.GetGuid(7)
-          ClaimAttempt = reader.GetInt32(8)
-          LeaseExpiresAtUtc = reader.GetFieldValue<DateTimeOffset>(9) }
+          Audience = readAudience reader 2
+          OccurredAtUtc = reader.GetFieldValue<DateTimeOffset>(3)
+          Producer = reader.GetString(4)
+          CorrelationId = readNullableGuid reader 5
+          CausationId = readNullableGuid reader 6
+          PayloadJson = reader.GetString(7)
+          ClaimOwner = reader.GetGuid(8)
+          ClaimAttempt = reader.GetInt32(9)
+          LeaseExpiresAtUtc = reader.GetFieldValue<DateTimeOffset>(10) }
+
 
     let appendInTransaction
         (connection: NpgsqlConnection)
@@ -151,6 +189,7 @@ WHERE "Id" = @EventId
                 use command = new NpgsqlCommand(appendSql, connection, transaction)
                 command.Parameters.AddWithValue("Id", event.Id) |> ignore
                 command.Parameters.AddWithValue("EventType", event.EventType) |> ignore
+                command.Parameters.AddWithValue("Audience", event.Audience.DbLiteral) |> ignore
                 command.Parameters.AddWithValue("OccurredAtUtc", event.OccurredAtUtc) |> ignore
                 command.Parameters.AddWithValue("Producer", event.Producer) |> ignore
                 addNullableUuid command "CorrelationId" event.CorrelationId
@@ -174,6 +213,7 @@ WHERE "Id" = @EventId
 
     let tryClaimDueOrdered
         (dataSource: NpgsqlDataSource)
+        (audience: OutboxAudience)
         (claimOwner: Guid)
         (nowUtc: DateTimeOffset)
         (batchSize: int)
@@ -182,13 +222,14 @@ WHERE "Id" = @EventId
         taskResult {
             do! (batchSize > 0) |> Result.requireTrue (InvalidBatchSize batchSize)
 
+            let lockName = dispatchLockName audience
             let mutable connection: NpgsqlConnection = null
             let mutable lockHeld = false
 
             try
                 let! openedConnection = dataSource.OpenConnectionAsync(cancellationToken)
                 connection <- openedConnection
-                use lockCommand = new NpgsqlCommand(tryGlobalDispatchLockSql, connection)
+                use lockCommand = new NpgsqlCommand(tryDispatchLockSql audience, connection)
                 let! acquired = lockCommand.ExecuteScalarAsync(cancellationToken)
                 lockHeld <- Convert.ToBoolean(acquired)
 
@@ -199,16 +240,18 @@ WHERE "Id" = @EventId
                 else
                     use! transaction = connection.BeginTransactionAsync(cancellationToken)
                     use command = new NpgsqlCommand(claimEarliestDueSql, connection, transaction)
+                    command.Parameters.AddWithValue("Audience", audience.DbLiteral) |> ignore
                     command.Parameters.AddWithValue("ClaimOwner", claimOwner) |> ignore
                     command.Parameters.AddWithValue("NowUtc", nowUtc) |> ignore
                     command.Parameters.AddWithValue("LeaseExpiresAtUtc", nowUtc + processingLease) |> ignore
+                    command.Parameters.AddWithValue("MaxAttempts", deadLetterAttempts) |> ignore
                     let! reader = command.ExecuteReaderAsync(cancellationToken)
                     use reader = reader
                     let! hasRow = reader.ReadAsync(cancellationToken)
                     let records = if hasRow then [ readRecord reader ] else []
                     do! reader.CloseAsync()
                     do! transaction.CommitAsync(cancellationToken)
-                    let lease = new OutboxDispatchLease(connection, records)
+                    let lease = new OutboxDispatchLease(connection, lockName, records)
                     connection <- null
                     lockHeld <- false
                     return Some lease
@@ -216,9 +259,7 @@ WHERE "Id" = @EventId
                 if not (isNull connection) then
                     if lockHeld then
                         try
-                            use unlockCommand =
-                                new NpgsqlCommand("SELECT pg_advisory_unlock(hashtext('web10.radio.outbox-global-dispatch'));", connection)
-
+                            use unlockCommand = new NpgsqlCommand(releaseDispatchLockSql lockName, connection)
                             unlockCommand.ExecuteScalar() |> ignore
                         with _ ->
                             ()

@@ -16,20 +16,27 @@ import {
   getSocialLinks,
   getStorage,
   getStreamNodeStatus,
-  getTracks,
+  getTracksPage,
   loginAdmin,
   logoutAdmin,
+  playNow,
   queueTrack,
+  removeTrackCover,
+  reorderQueue,
   rejectSayMessage,
   replacePlaylist,
   replacePlaylistItems,
   replaceSocialLinks,
   replaceStorage,
+  replaceTrackCover,
+  restartCurrent,
   restartStreamNode,
   setAdminSession,
+  skipCurrent,
   startStreamNode,
   stopStreamNode,
   updateDonationGoal,
+  updateTrackMetadata,
   type AdminSayMessage,
   type FetchImpl,
   type SocialLinksReplaceRequest,
@@ -88,12 +95,29 @@ const track = {
   album: '',
   durationMs: 0,
   hasCachedFile: true,
+  coverImageUrl: '',
+  metadataSource: 'filename' as const,
+};
+const playlistPolicy = {
+  type: 'general' as const,
+  source: 'manual' as const,
+  order: 'sequential' as const,
+  weight: 3,
+  isJingle: false,
+  interrupt: false,
+  avoidDuplicates: true,
+  playEverySongs: null,
+  playEveryMinutes: null,
+  playAtMinute: null,
+  schedules: [],
 };
 const playlist = {
   id,
   name: 'Night shift',
   description: null,
   isActive: true,
+  ...playlistPolicy,
+  isSystem: false,
   itemCount: 1,
 };
 const playlistItem = {
@@ -227,12 +251,13 @@ describe('library and playback routes', () => {
     expect(request.requestInit()?.method).toBe('GET');
   });
 
-  test('encodes track query and limit and validates active track projection', async () => {
-    const request = capturingFetch([track]);
+  test('encodes track query and limit and validates cursor page projection', async () => {
+    const request = capturingFetch({ items: [track], nextCursor: null });
 
-    const result = await getTracks({ query: 'night drive', limit: 25 }, { fetchImpl: request.fetchImpl });
+    const result = await getTracksPage({ query: 'night drive', limit: 25 }, { fetchImpl: request.fetchImpl });
 
-    expect(result[0]?.hasCachedFile).toBe(true);
+    expect(result.items[0]?.hasCachedFile).toBe(true);
+    expect(result.nextCursor).toBeNull();
     expect(request.requestUrl()).toBe('/api/v0/admin/tracks?query=night+drive&limit=25');
     expect(request.requestInit()?.method).toBe('GET');
   });
@@ -244,6 +269,97 @@ describe('library and playback routes', () => {
 
     expect(result.queueItemId).toBe(otherId);
     expect(request.requestUrl()).toBe('/api/v0/admin/playback/queue');
+    expect(request.requestInit()?.method).toBe('POST');
+    expect(request.requestInit()?.body).toBe(JSON.stringify({ trackId: id }));
+  });
+  test('updates metadata with the exact body and validates the updated projection', async () => {
+    const updatedTrack = { ...track, title: 'Updated title', artist: 'Updated artist', album: 'Album' };
+    const request = capturingFetch(updatedTrack);
+
+    const result = await updateTrackMetadata(
+      id,
+      { title: 'Updated title', artist: 'Updated artist', album: 'Album' },
+      { fetchImpl: request.fetchImpl },
+    );
+
+    expect(result.title).toBe('Updated title');
+    expect(request.requestUrl()).toBe(`/api/v0/admin/tracks/${id}`);
+    expect(request.requestInit()?.method).toBe('PUT');
+    expect(request.requestInit()?.body).toBe(
+      JSON.stringify({ title: 'Updated title', artist: 'Updated artist', album: 'Album' }),
+    );
+  });
+
+  test('uploads a raw cover with its media type, CSRF token, and exact route', async () => {
+    setAdminSession(session);
+    const request = capturingFetch(track);
+    const body = new Blob(['png bytes'], { type: 'image/png' });
+
+    const result = await replaceTrackCover(id, body, { fetchImpl: request.fetchImpl });
+
+    expect(result.id).toBe(id);
+    expect(request.requestUrl()).toBe(`/api/v0/admin/tracks/${id}/cover`);
+    expect(request.requestInit()?.method).toBe('PUT');
+    expect(request.requestInit()?.body).toBe(body);
+    const headers = new Headers(request.requestInit()?.headers);
+    expect(headers.get('content-type')).toBe('image/png');
+    expect(headers.get('x-csrf-token')).toBe('csrf-token');
+  });
+
+  test('removes a cover with DELETE and validates the returned projection', async () => {
+    const request = capturingFetch({ ...track, coverImageUrl: '' });
+
+    const result = await removeTrackCover(id, { fetchImpl: request.fetchImpl });
+
+    expect(result.coverImageUrl).toBe('');
+    expect(request.requestUrl()).toBe(`/api/v0/admin/tracks/${id}/cover`);
+    expect(request.requestInit()?.method).toBe('DELETE');
+  });
+
+  test('reorders the complete queue using the exact ID set and response schema', async () => {
+    const queue = validPlayerState().queue;
+    const request = capturingFetch(queue);
+
+    const result = await reorderQueue(
+      { queueItemIds: queue.items.map((item) => item.queueItemId) },
+      { fetchImpl: request.fetchImpl },
+    );
+
+    expect(result.items).toHaveLength(queue.items.length);
+    expect(request.requestUrl()).toBe('/api/v0/admin/playback/queue/order');
+    expect(request.requestInit()?.method).toBe('PUT');
+    expect(request.requestInit()?.body).toBe(
+      JSON.stringify({ queueItemIds: queue.items.map((item) => item.queueItemId) }),
+    );
+  });
+
+  test('posts skip and restart controls as exact empty JSON commands', async () => {
+    const requests: RequestInit[] = [];
+    const fetchImpl: FetchImpl = vi.fn((_url, init) => {
+      if (init !== undefined) {
+        requests.push(init);
+      }
+      return Promise.resolve(new Response(null, { status: 202 }));
+    });
+
+    await skipCurrent({ fetchImpl });
+    await restartCurrent({ fetchImpl });
+
+    expect(requests.map((request) => request.method)).toEqual(['POST', 'POST']);
+    expect(requests.map((request) => request.body)).toEqual(['{}', '{}']);
+    expect(vi.mocked(fetchImpl).mock.calls.map(([url]) => url)).toEqual([
+      '/api/v0/admin/playback/skip',
+      '/api/v0/admin/playback/restart-current',
+    ]);
+  });
+
+  test('plays a track now with the exact body and accepted queue identifier', async () => {
+    const request = capturingFetch({ queueItemId: otherId }, 202);
+
+    const result = await playNow({ trackId: id }, { fetchImpl: request.fetchImpl });
+
+    expect(result.queueItemId).toBe(otherId);
+    expect(request.requestUrl()).toBe('/api/v0/admin/playback/play-now');
     expect(request.requestInit()?.method).toBe('POST');
     expect(request.requestInit()?.body).toBe(JSON.stringify({ trackId: id }));
   });
@@ -328,7 +444,7 @@ describe('playlist routes', () => {
   });
 
   test('creates a playlist with the exact body and validates the created summary', async () => {
-    const body = { name: 'Night shift', description: null, isActive: true };
+    const body = { ...playlistPolicy, name: 'Night shift', description: null, isActive: true };
     const request = capturingFetch(playlist, 201);
 
     const result = await createPlaylist(body, { fetchImpl: request.fetchImpl });
@@ -340,7 +456,7 @@ describe('playlist routes', () => {
   });
 
   test('replaces one playlist by path id with exact mutable fields', async () => {
-    const body = { name: 'Night shift', description: 'updated', isActive: false };
+    const body = { ...playlistPolicy, name: 'Night shift', description: 'updated', isActive: false };
     const request = capturingFetch({ ...playlist, ...body });
 
     const result = await replacePlaylist(id, body, { fetchImpl: request.fetchImpl });

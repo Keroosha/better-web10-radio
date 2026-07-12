@@ -1,14 +1,12 @@
 namespace Web10.Radio.API
 
 open System
-open System.Globalization
 open System.IO
 open System.Net
 open System.Text.RegularExpressions
 open Microsoft.Extensions.Configuration
 open Npgsql
 open Web10.Radio.Database
-open Web10.Radio.Telegram
 
 type StreamOptions =
     { RtmpUrl: Uri
@@ -23,6 +21,7 @@ type StorageType =
 type StorageOptions =
     { Type: StorageType
       LocalRoot: string
+      CacheRoot: string
       S3Bucket: string
       S3Region: string
       S3ServiceUrl: Uri option
@@ -40,7 +39,6 @@ type DataProtectionOptions =
 
 type Web10Options =
     { Postgres: PostgresOptions
-      Telegram: TelegramOptions
       Stream: StreamOptions
       Storage: StorageOptions
       Admin: AdminOptions
@@ -52,24 +50,16 @@ type Web10Options =
 module Configuration =
     let private requiredKeys =
         [ "POSTGRES:CONNECTION_STRING", "WEB10_POSTGRES__CONNECTION_STRING"
-          "TELEGRAM:BOT_TOKEN", "WEB10_TELEGRAM__BOT_TOKEN"
-          "TELEGRAM:WEBHOOK_SECRET", "WEB10_TELEGRAM__WEBHOOK_SECRET"
-          "TELEGRAM:CHANNEL_ID_OR_USERNAME", "WEB10_TELEGRAM__CHANNEL_ID_OR_USERNAME"
-          "TELEGRAM:REQUEST_PRICE_STARS", "WEB10_TELEGRAM__REQUEST_PRICE_STARS"
-          "TELEGRAM:SAY_PRICE_STARS", "WEB10_TELEGRAM__SAY_PRICE_STARS"
           "STREAM:RTMP_URL", "WEB10_STREAM__RTMP_URL"
           "STREAM:RTMP_KEY", "WEB10_STREAM__RTMP_KEY"
           "STREAM:STAGE_URL", "WEB10_STREAM__STAGE_URL"
           "STREAM:CALLBACK_TOKEN", "WEB10_STREAM__CALLBACK_TOKEN"
           "STORAGE:TYPE", "WEB10_STORAGE__TYPE"
+          "STORAGE:CACHE_ROOT", "WEB10_STORAGE__CACHE_ROOT"
           "ADMIN:USERNAME", "WEB10_ADMIN__USERNAME"
           "ADMIN:PASSWORD", "WEB10_ADMIN__PASSWORD"
           "OTEL:EXPORTER_OTLP_ENDPOINT", "WEB10_OTEL__EXPORTER_OTLP_ENDPOINT"
           "DATA_PROTECTION:KEY_RING_PATH", "WEB10_DATA_PROTECTION__KEY_RING_PATH" ]
-
-    let private requiredPositiveInt32Keys =
-        [ "TELEGRAM:REQUEST_PRICE_STARS", "WEB10_TELEGRAM__REQUEST_PRICE_STARS"
-          "TELEGRAM:SAY_PRICE_STARS", "WEB10_TELEGRAM__SAY_PRICE_STARS" ]
 
     let private readRequired (configuration: IConfiguration) (errors: ResizeArray<string>) (key: string, envVar: string) =
         let value = configuration[key]
@@ -83,6 +73,9 @@ module Configuration =
     let private readOptional (configuration: IConfiguration) key =
         let value = configuration[key]
         if String.IsNullOrWhiteSpace value then None else Some(value.Trim())
+    let private readOptionalExact (configuration: IConfiguration) key =
+        let value = configuration[key]
+        if isNull value then None else Some value
 
     let private readRequiredUntrimmed (configuration: IConfiguration) (errors: ResizeArray<string>) (key: string, envVar: string) =
         let value = configuration[key]
@@ -92,9 +85,6 @@ module Configuration =
             None
         else
             Some value
-    let private readOptionalExact (configuration: IConfiguration) key =
-        let value = configuration[key]
-        if isNull value then None else Some value
 
     let private parseAbsoluteUri (errors: ResizeArray<string>) envVar allowedSchemes (value: string option) =
         match value with
@@ -119,14 +109,6 @@ module Configuration =
             None
 
 
-    let private parseTelegramUpdateMode (errors: ResizeArray<string>) (value: string option) =
-        match value with
-        | None -> Webhook
-        | Some "Webhook" -> Webhook
-        | Some "LongPolling" -> LongPolling
-        | Some _ ->
-            errors.Add("WEB10_TELEGRAM__UPDATE_MODE must be exactly Webhook or LongPolling.")
-            Webhook
 
     let private parseBoolean (errors: ResizeArray<string>) envVar (value: string option) =
         match value with
@@ -137,17 +119,6 @@ module Configuration =
             errors.Add(sprintf "%s must be exactly true or false." envVar)
             false
 
-    let private parsePositiveInt32 (errors: ResizeArray<string>) envVar (value: string option) =
-        match value with
-        | Some raw ->
-            match Int32.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture) with
-            | true, parsed when parsed > 0 -> Some parsed
-            | _ ->
-                errors.Add(sprintf "%s must be a positive 32-bit integer." envVar)
-                None
-        | None ->
-            errors.Add(sprintf "%s must be a positive 32-bit integer." envVar)
-            None
 
     let private validateConnectionString (errors: ResizeArray<string>) (value: string option) =
         match value with
@@ -197,26 +168,6 @@ module Configuration =
         | Some value when value.Length >= 12 && value.Length <= 256 -> ()
         | _ -> errors.Add("WEB10_ADMIN__PASSWORD must be 12 to 256 characters and is not trimmed.")
 
-    let private telegramTokenPattern = Regex("^[1-9][0-9]{5,19}:[A-Za-z0-9_-]{20,}$", RegexOptions.CultureInvariant)
-    let private telegramUsernamePattern = Regex("^@[A-Za-z][A-Za-z0-9_]{4,31}$", RegexOptions.CultureInvariant)
-    let private telegramChannelIdPattern = Regex("^-100[1-9][0-9]{5,15}$", RegexOptions.CultureInvariant)
-    let private webhookSecretPattern = Regex("^[A-Za-z0-9_-]{16,256}$", RegexOptions.CultureInvariant)
-
-    let private validateTelegram (errors: ResizeArray<string>) (botToken: string option) (webhookSecret: string option) (channel: string option) =
-        match botToken with
-        | Some value when not (telegramTokenPattern.IsMatch value) ->
-            errors.Add("WEB10_TELEGRAM__BOT_TOKEN must have Telegram bot token syntax (numeric bot id, colon, and token).")
-        | _ -> ()
-
-        match webhookSecret with
-        | Some value when not (webhookSecretPattern.IsMatch value) || not (hasEnoughVariation value) ->
-            errors.Add("WEB10_TELEGRAM__WEBHOOK_SECRET must be a nontrivial 16-256 character Telegram secret token using letters, digits, underscore, or hyphen.")
-        | _ -> ()
-
-        match channel with
-        | Some value when not (telegramUsernamePattern.IsMatch value || telegramChannelIdPattern.IsMatch value) ->
-            errors.Add("WEB10_TELEGRAM__CHANNEL_ID_OR_USERNAME must be an @channel_username or a -100-prefixed Telegram channel id.")
-        | _ -> ()
 
     let private s3BucketPattern = Regex("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", RegexOptions.CultureInvariant)
     let private s3RegionPattern = Regex("^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$", RegexOptions.CultureInvariant)
@@ -272,11 +223,16 @@ module Configuration =
         (errors: ResizeArray<string>)
         (storageType: StorageType option)
         (localRoot: string option)
+        (cacheRoot: string option)
         (s3Bucket: string option)
         (s3Region: string option)
         (s3ServiceUrl: string option)
         (forcePathStyleValue: string option)
         =
+        match cacheRoot with
+        | None -> ()
+        | Some _ -> validateWritableDirectory errors "WEB10_STORAGE__CACHE_ROOT" cacheRoot
+
         match storageType with
         | None -> ()
         | Some Local ->
@@ -310,9 +266,7 @@ module Configuration =
             requiredKeys
             |> List.map (fun ((key, _) as requiredKey) ->
                 let value =
-                    if List.contains requiredKey requiredPositiveInt32Keys then
-                        readOptional configuration key
-                    elif key = "ADMIN:PASSWORD" then
+                    if key = "ADMIN:PASSWORD" then
                         readRequiredUntrimmed configuration errors requiredKey
                     else
                         readRequired configuration errors requiredKey
@@ -321,23 +275,14 @@ module Configuration =
             |> Map.ofList
 
         let requiredValue key = values[key]
-        let optionalValue key = readOptional configuration key
         let connectionString = requiredValue "POSTGRES:CONNECTION_STRING"
-        let botToken = requiredValue "TELEGRAM:BOT_TOKEN"
-        let webhookSecret = requiredValue "TELEGRAM:WEBHOOK_SECRET"
-        let telegramChannel = requiredValue "TELEGRAM:CHANNEL_ID_OR_USERNAME"
+        let optionalValue key = readOptional configuration key
         let rtmpKey = requiredValue "STREAM:RTMP_KEY"
         let streamCallbackToken = requiredValue "STREAM:CALLBACK_TOKEN"
         let adminUsername = requiredValue "ADMIN:USERNAME"
         let adminPassword = requiredValue "ADMIN:PASSWORD"
-        let requestPriceStars =
-            parsePositiveInt32 errors "WEB10_TELEGRAM__REQUEST_PRICE_STARS" (requiredValue "TELEGRAM:REQUEST_PRICE_STARS")
-
-        let sayPriceStars =
-            parsePositiveInt32 errors "WEB10_TELEGRAM__SAY_PRICE_STARS" (requiredValue "TELEGRAM:SAY_PRICE_STARS")
-        let telegramUpdateMode =
-            parseTelegramUpdateMode errors (readOptionalExact configuration "TELEGRAM:UPDATE_MODE")
         let localRoot = optionalValue "STORAGE:LOCAL_ROOT"
+        let cacheRoot = requiredValue "STORAGE:CACHE_ROOT"
         let s3Bucket = optionalValue "STORAGE:S3_BUCKET"
         let s3Region = optionalValue "STORAGE:S3_REGION"
         let s3ServiceUrlRaw = optionalValue "STORAGE:S3_SERVICE_URL"
@@ -350,12 +295,11 @@ module Configuration =
         let developmentFixturesEnabled = parseBoolean errors "WEB10_DEV__FIXTURES_ENABLED" (readOptionalExact configuration "DEV:FIXTURES_ENABLED")
         let s3ServiceUrl = parseAbsoluteUri errors "WEB10_STORAGE__S3_SERVICE_URL" (Set.ofList [ "http"; "https" ]) s3ServiceUrlRaw
         validateConnectionString errors connectionString
-        validateTelegram errors botToken webhookSecret telegramChannel
         validateSecret errors "WEB10_STREAM__RTMP_KEY" 16 rtmpKey
         validateBearerSecret errors "WEB10_STREAM__CALLBACK_TOKEN" 24 streamCallbackToken
         validateAdminUsername errors adminUsername
         validateAdminPassword errors adminPassword
-        validateStorage errors storageType localRoot s3Bucket s3Region s3ServiceUrlRaw forcePathStyleRaw
+        validateStorage errors storageType localRoot cacheRoot s3Bucket s3Region s3ServiceUrlRaw forcePathStyleRaw
         validateWritableDirectory errors "WEB10_DATA_PROTECTION__KEY_RING_PATH" (requiredValue "DATA_PROTECTION:KEY_RING_PATH")
 
         if errors.Count > 0 then
@@ -365,13 +309,6 @@ module Configuration =
 
             Ok
                 { Postgres = { ConnectionString = getRequired "POSTGRES:CONNECTION_STRING" }
-                  Telegram =
-                    { BotToken = getRequired "TELEGRAM:BOT_TOKEN"
-                      WebhookSecret = getRequired "TELEGRAM:WEBHOOK_SECRET"
-                      ChannelIdOrUsername = getRequired "TELEGRAM:CHANNEL_ID_OR_USERNAME"
-                      RequestPriceStars = Option.get requestPriceStars
-                      UpdateMode = telegramUpdateMode
-                      SayPriceStars = Option.get sayPriceStars }
                   Stream =
                     { RtmpUrl = Option.get rtmpUrl
                       RtmpKey = getRequired "STREAM:RTMP_KEY"
@@ -380,6 +317,7 @@ module Configuration =
                   Storage =
                     { Type = Option.get storageType
                       LocalRoot = Option.defaultValue "" localRoot
+                      CacheRoot = Path.GetFullPath(getRequired "STORAGE:CACHE_ROOT")
                       S3Bucket = Option.defaultValue "" s3Bucket
                       S3Region = Option.defaultValue "" s3Region
                       S3ServiceUrl = s3ServiceUrl
@@ -390,3 +328,4 @@ module Configuration =
                   Otel = { ExporterOtlpEndpoint = Option.get otlpEndpoint }
                   DataProtection = { KeyRingPath = getRequired "DATA_PROTECTION:KEY_RING_PATH" }
                   DevelopmentFixturesEnabled = developmentFixturesEnabled }
+

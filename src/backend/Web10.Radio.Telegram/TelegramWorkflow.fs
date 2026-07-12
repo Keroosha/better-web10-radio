@@ -1,4 +1,4 @@
-namespace Web10.Radio.API
+namespace Web10.Radio.Telegram
 
 open System
 open System.Text.Json
@@ -9,7 +9,8 @@ open FsToolkit.ErrorHandling
 open Npgsql
 open Web10.Radio.Database
 open Web10.Radio.Database.Repositories
-open Web10.Radio.Telegram
+open Web10.Radio.Application
+open Dodo.Primitives
 
 type private TelegramInteraction =
     { TelegramUpdateId: int64
@@ -324,8 +325,7 @@ type ITelegramPreCheckoutWorkflow =
 type TelegramBotWorkflow
     (
         dataSource: NpgsqlDataSource,
-        idGenerator: IIdGenerator,
-        clock: IClock,
+        timeProvider: TimeProvider,
         options: TelegramOptions,
         telegramClient: ITelegramBotClient,
         adapterState: ITelegramAdapterState,
@@ -344,7 +344,7 @@ type TelegramBotWorkflow
         payloadJson
         cancellationToken =
         task {
-            match DomainEventEnvelope.create idGenerator clock eventType "Web10.Radio.API.TelegramBot" (Some source.CorrelationId) (Some source.EventId) payloadJson with
+            match DomainEventEnvelope.create timeProvider eventType "Web10.Radio.Telegram.Bot" (Some source.CorrelationId) (Some source.EventId) payloadJson with
             | Error error -> return Error(DomainEventError error)
             | Ok derived ->
                 let! appended = OutboxEventRepository.appendInTransaction connection transaction (OutboxMapping.toOutboxEvent derived) cancellationToken
@@ -368,11 +368,15 @@ type TelegramBotWorkflow
                priceLabel = priceLabel
                amountStars = order.AmountStars
                currency = "XTR"
-               providerToken = "" |}
+               providerToken = "" |},
+            DomainJson.options
         )
 
     let matchedPayload (requestId: Guid) (trackId: Guid) =
-        JsonSerializer.Serialize({| trackRequestId = requestId.ToString("D"); trackId = trackId.ToString("D") |})
+        JsonSerializer.Serialize(
+            {| trackRequestId = requestId.ToString("D"); trackId = trackId.ToString("D") |},
+            DomainJson.options
+        )
 
     let terminalTransport
         (envelope: DomainEventEnvelope)
@@ -554,7 +558,7 @@ type TelegramBotWorkflow
                                 | Error error -> return Error error
                                 | Ok(Some order) -> return Ok(CommandOutcome.AlreadyApplied order)
                                 | Ok None ->
-                                    let paymentId = idGenerator.NewId()
+                                    let paymentId = Uuid.CreateVersion7().ToGuidBigEndian()
                                     let order =
                                         { Id = paymentId
                                           TelegramUserId = interaction.TelegramUserId
@@ -563,7 +567,7 @@ type TelegramBotWorkflow
                                           AmountStars = options.SayPriceStars
                                           InvoicePayload = paymentId.ToString("D")
                                           PayerDisplayName = Some message.DisplayName
-                                          CreatedAtUtc = clock.UtcNow }
+                                          CreatedAtUtc = timeProvider.GetUtcNow() }
                                     let! created = TelegramCommandRepository.createSayWithPaymentInTransaction connection transaction message options.SayPriceStars order token
                                     match created |> mapRepository with
                                     | Error error -> return Error error
@@ -588,14 +592,13 @@ type TelegramBotWorkflow
             if not (String.IsNullOrWhiteSpace query) && not interaction.IsPrivateChat then
                 return! sendText envelope interaction.TelegramUpdateId interaction.TelegramUserId "song-private" interaction.ChatId (TelegramText.privateChatOnly currentLocale) None cancellationToken
             elif String.IsNullOrWhiteSpace query then
-                let! currentSong = PlayerStateReadModel.loadCurrentSong dataSource clock cancellationToken
+                let! currentSong = TrackRepository.tryGetCurrentPlaying dataSource cancellationToken
                 match currentSong |> mapRepository with
                 | Error error -> return Error error
-                | Ok song when String.IsNullOrWhiteSpace song.FallbackText ->
+                | Ok None ->
                     return! sendText envelope interaction.TelegramUpdateId interaction.TelegramUserId "song-current" interaction.ChatId (TelegramText.nothingPlaying currentLocale) None cancellationToken
-                | Ok song ->
-                    let text =
-                        if String.IsNullOrWhiteSpace song.ExternalUrl then song.FallbackText else song.ExternalUrl
+                | Ok(Some song) ->
+                    let text = TelegramText.trackLinkOrDisplay song.ExternalUrl song.Artist song.Title
                     return! sendText envelope interaction.TelegramUpdateId interaction.TelegramUserId "song-current" interaction.ChatId text None cancellationToken
             else
                 let! matches = TrackRepository.searchActive dataSource query 5 cancellationToken
@@ -637,7 +640,7 @@ type TelegramBotWorkflow
                                 | Error error -> return Error error
                                 | Ok None -> return Ok(CommandOutcome.Rejected "track is unavailable")
                                 | Ok(Some _) ->
-                                    let! selected = TelegramCommandRepository.selectTrackInTransaction connection transaction requestId callback.TelegramUserId trackId clock.UtcNow token
+                                    let! selected = TelegramCommandRepository.selectTrackInTransaction connection transaction requestId callback.TelegramUserId trackId (timeProvider.GetUtcNow()) token
                                     match selected |> mapRepository with
                                     | Error error -> return Error error
                                     | Ok(CommandOutcome.Created _) ->
@@ -675,7 +678,7 @@ type TelegramBotWorkflow
                                 | Ok(Some order) when order.TelegramUserId = callback.TelegramUserId -> return Ok(CommandOutcome.AlreadyApplied order)
                                 | Ok(Some _) -> return Ok(CommandOutcome.Rejected "payment does not belong to callback user")
                                 | Ok None ->
-                                    let paymentId = idGenerator.NewId()
+                                    let paymentId = Uuid.CreateVersion7().ToGuidBigEndian()
                                     let order =
                                         { Id = paymentId
                                           TelegramUserId = callback.TelegramUserId
@@ -684,7 +687,7 @@ type TelegramBotWorkflow
                                           AmountStars = options.RequestPriceStars
                                           InvoicePayload = paymentId.ToString("D")
                                           PayerDisplayName = callback.DisplayName
-                                          CreatedAtUtc = clock.UtcNow }
+                                          CreatedAtUtc = timeProvider.GetUtcNow() }
                                     let! created = TelegramCommandRepository.createRequestPaymentInTransaction connection transaction requestId callback.TelegramUserId order token
                                     match created |> mapRepository with
                                     | Error error -> return Error error
@@ -714,7 +717,7 @@ type TelegramBotWorkflow
                         dataSource
                         (fun connection transaction token ->
                             task {
-                                let! outcome = TelegramCommandRepository.cancelTrackRequestInTransaction connection transaction requestId callback.TelegramUserId clock.UtcNow token
+                                let! outcome = TelegramCommandRepository.cancelTrackRequestInTransaction connection transaction requestId callback.TelegramUserId (timeProvider.GetUtcNow()) token
                                 return outcome |> mapRepository
                             })
                         cancellationToken
@@ -902,7 +905,7 @@ type TelegramBotWorkflow
 
             try
                 let currentLocale = locale input.LanguageCode
-                let receivedAtUtc = clock.UtcNow
+                let receivedAtUtc = timeProvider.GetUtcNow()
 
                 TelegramWorkflowLog.preCheckoutReceived logger input.TelegramUpdateId
 
@@ -914,7 +917,7 @@ type TelegramBotWorkflow
                            currency = input.Currency
                            amountStars = input.TotalAmount
                            invoicePayload = input.InvoicePayload |},
-                        ApiJson.options
+                        DomainJson.options
                     )
 
                 let! validation =
@@ -936,7 +939,7 @@ type TelegramBotWorkflow
                                 | Error error -> return Error error
                                 | Ok decision ->
                                     let record =
-                                        { Id = idGenerator.NewId()
+                                        { Id = Uuid.CreateVersion7().ToGuidBigEndian()
                                           TelegramUpdateId = input.TelegramUpdateId
                                           EventType = "TelegramPreCheckoutQuery"
                                           ReceivedAtUtc = receivedAtUtc

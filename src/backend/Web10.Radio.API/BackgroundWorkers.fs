@@ -1,8 +1,11 @@
 namespace Web10.Radio.API
 
 open System
+open Dodo.Primitives
+open Web10.Radio.Application
 open System.IO
 open System.Text
+open System.Security.Cryptography
 open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
@@ -13,7 +16,6 @@ open Microsoft.Extensions.Logging
 open Npgsql
 open Web10.Radio.Database
 open Web10.Radio.Database.Repositories
-open Web10.Radio.Telegram
 
 [<RequireQualifiedAccess>]
 module private BackgroundWorkerLog =
@@ -26,12 +28,6 @@ module private BackgroundWorkerLog =
             let traceId = current.TraceId.ToString()
             if String.IsNullOrWhiteSpace traceId then String.Empty else traceId
 
-    let private terminalPaymentRejectedMessage =
-        LoggerMessage.Define<Guid, Guid, string, int64, Guid, string>(
-            LogLevel.Warning,
-            EventId(3100, "TerminalPaymentRejected"),
-            "Terminal payment rejected for event {eventId} correlation {correlationId} traceId {traceId} Telegram update {telegramUpdateId} payment {paymentId}: {error}"
-        )
 
     let private backgroundAgentFailedMessage =
         LoggerMessage.Define<string, Guid, string, string>(
@@ -67,11 +63,9 @@ module private BackgroundWorkerLog =
         | UnknownEventType _ -> "unknown_event_type"
         | InvalidPayload _ -> "invalid_payload"
         | StateTransitionRejected _ -> "state_transition_rejected"
-        | TelegramTransportError _ -> "telegram_transport"
         | UnexpectedException _ -> "unexpected_exception"
+        | _ -> "background_worker"
 
-    let terminalPaymentRejected (logger: ILogger) eventId correlationId telegramUpdateId paymentId error =
-        terminalPaymentRejectedMessage.Invoke(logger, eventId, correlationId, currentTraceId (), telegramUpdateId, paymentId, error, null)
 
     let backgroundAgentFailed (logger: ILogger) (error: exn) operation eventId eventType =
         backgroundAgentFailedMessage.Invoke(logger, operation, eventId, eventType, currentTraceId (), error)
@@ -169,8 +163,7 @@ module private JsonPayload =
 module private EventPublishing =
     let publish
         (publisher: IDomainEventPublisher)
-        (idGenerator: IIdGenerator)
-        (clock: IClock)
+        (timeProvider: TimeProvider)
         (eventType: DomainEventType)
         (producer: string)
         (correlationId: Guid option)
@@ -180,106 +173,13 @@ module private EventPublishing =
         : Task<Result<unit, BackgroundWorkerError>> =
         taskResult {
             let! envelope =
-                DomainEventEnvelope.create idGenerator clock eventType producer correlationId causationId payloadJson
+                DomainEventEnvelope.create timeProvider eventType producer correlationId causationId payloadJson
                 |> Result.mapError DomainEventError
 
             do! publisher.PublishDurableAsync envelope cancellationToken
         }
 
 
-module private PaymentAgent =
-    type private DonationPaidPayload =
-        { PaymentId: Guid
-          TelegramUpdateId: int64
-          TelegramPaymentChargeId: string
-          TelegramUserId: int64
-          AmountStars: int
-          Currency: string }
-
-    let private parseDonationPaid payloadJson =
-        result {
-            let! root = JsonPayload.parseObject "DonationPaid" payloadJson
-            let! paymentIdText = JsonPayload.tryGetString "paymentId" root |> Result.requireSome (InvalidPayload("DonationPaid", "paymentId is required."))
-            let mutable paymentId = Guid.Empty
-            do! Guid.TryParse(paymentIdText, &paymentId) |> Result.requireTrue (InvalidPayload("DonationPaid", "paymentId must be a UUID."))
-            let! telegramUpdateId = JsonPayload.tryGetInt64 "telegramUpdateId" root |> Result.requireSome (InvalidPayload("DonationPaid", "telegramUpdateId is required."))
-            do! (telegramUpdateId >= 0L) |> Result.requireTrue (InvalidPayload("DonationPaid", "telegramUpdateId must be non-negative."))
-            let! telegramUserId = JsonPayload.tryGetInt64 "telegramUserId" root |> Result.requireSome (InvalidPayload("DonationPaid", "telegramUserId is required."))
-            do! (telegramUserId > 0L) |> Result.requireTrue (InvalidPayload("DonationPaid", "telegramUserId must be positive."))
-            let! telegramPaymentChargeId =
-                JsonPayload.tryGetString "telegramPaymentChargeId" root
-                |> Result.requireSome (InvalidPayload("DonationPaid", "telegramPaymentChargeId is required."))
-            let! amountStars = JsonPayload.tryGetInt "amountStars" root |> Result.requireSome (InvalidPayload("DonationPaid", "amountStars is required."))
-            do! (amountStars > 0) |> Result.requireTrue (InvalidPayload("DonationPaid", "amountStars must be positive."))
-            let! currency = JsonPayload.tryGetString "currency" root |> Result.requireSome (InvalidPayload("DonationPaid", "currency is required."))
-            do! (currency = "XTR") |> Result.requireTrue (InvalidPayload("DonationPaid", "currency must be XTR."))
-
-            return
-                { PaymentId = paymentId
-                  TelegramUpdateId = telegramUpdateId
-                  TelegramUserId = telegramUserId
-                  TelegramPaymentChargeId = telegramPaymentChargeId
-                  AmountStars = amountStars
-                  Currency = currency }
-        }
-
-    let handle
-        (dataSource: NpgsqlDataSource)
-        (clock: IClock)
-        (logger: ILogger)
-        (envelope: DomainEventEnvelope)
-        (cancellationToken: CancellationToken)
-        : Task<Result<unit, BackgroundWorkerError>> =
-        task {
-            use attempt = FlowTelemetry.startRoot FlowTelemetry.PaymentComplete
-            let metricTags = [ FlowTelemetry.stage "complete" ]
-            FlowTelemetry.addTag "event.id" (string envelope.EventId) attempt
-            FlowTelemetry.addTag "correlation.id" (string envelope.CorrelationId) attempt
-
-            try
-                let! result =
-                    taskResult {
-                        let! payload = parseDonationPaid envelope.PayloadJson
-                        FlowTelemetry.addTag "payment.id" (string payload.PaymentId) attempt
-                        FlowTelemetry.addTag "telegram.update_id" (string payload.TelegramUpdateId) attempt
-
-                        let! outcome =
-                            PaymentRepository.completePayment
-                                dataSource
-                                payload.PaymentId
-                                payload.TelegramUserId
-                                payload.TelegramPaymentChargeId
-                                payload.AmountStars
-                                payload.Currency
-                                clock.UtcNow
-                                cancellationToken
-                            |> TaskResult.mapError RepositoryError
-
-                        match outcome with
-                        | Completed _ -> return "completed"
-                        | Rejected reason ->
-                            BackgroundWorkerLog.terminalPaymentRejected
-                                logger
-                                envelope.EventId
-                                envelope.CorrelationId
-                                payload.TelegramUpdateId
-                                payload.PaymentId
-                                reason
-
-                            return "rejected"
-                    }
-
-                match result with
-                | Ok outcome ->
-                    FlowTelemetry.finish outcome metricTags attempt |> ignore
-                    return Ok ()
-                | Error error ->
-                    FlowTelemetry.finish "error" metricTags attempt |> ignore
-                    return Error error
-            with ex ->
-                FlowTelemetry.finishError "error" metricTags ex attempt |> ignore
-                return raise ex
-        }
 
 module private StreamNodeAgent =
     let private parseFailurePayload eventType payloadJson =
@@ -299,8 +199,7 @@ module private StreamNodeAgent =
 
     let recordFailure
         (dataSource: NpgsqlDataSource)
-        (idGenerator: IIdGenerator)
-        (clock: IClock)
+        (timeProvider: TimeProvider)
         (state: StreamNodeHeartbeatState)
         (envelope: DomainEventEnvelope)
         (cancellationToken: CancellationToken)
@@ -308,12 +207,12 @@ module private StreamNodeAgent =
         taskResult {
             let eventType = DomainEventType.toString envelope.EventType
             let! reason = parseFailurePayload eventType envelope.PayloadJson
-            let heartbeatAtUtc = clock.UtcNow
+            let heartbeatAtUtc = timeProvider.GetUtcNow()
 
             do!
                 StreamNodeHeartbeatRepository.insertHeartbeat
                     dataSource
-                    (idGenerator.NewId())
+                    (Uuid.CreateVersion7().ToGuidBigEndian())
                     "Degraded"
                     heartbeatAtUtc
                     reason
@@ -327,8 +226,7 @@ module private StreamNodeAgent =
 
     let recordHeartbeat
         (dataSource: NpgsqlDataSource)
-        (idGenerator: IIdGenerator)
-        (clock: IClock)
+        (timeProvider: TimeProvider)
         (state: StreamNodeHeartbeatState)
         (envelope: DomainEventEnvelope)
         (cancellationToken: CancellationToken)
@@ -336,12 +234,12 @@ module private StreamNodeAgent =
         taskResult {
             let eventType = DomainEventType.toString envelope.EventType
             let! status, failureReason, metadataJson = parseHeartbeatPayload eventType envelope.PayloadJson
-            let heartbeatAtUtc = clock.UtcNow
+            let heartbeatAtUtc = timeProvider.GetUtcNow()
 
             do!
                 StreamNodeHeartbeatRepository.insertHeartbeat
                     dataSource
-                    (idGenerator.NewId())
+                    (Uuid.CreateVersion7().ToGuidBigEndian())
                     status
                     heartbeatAtUtc
                     failureReason
@@ -367,11 +265,123 @@ module private PayloadValidation =
     let requireString eventType fieldName root =
         JsonPayload.tryGetString fieldName root
         |> Result.requireSome (InvalidPayload(eventType, sprintf "%s is required." fieldName))
+    let private requireProperty (eventType: string) (fieldName: string) (root: JsonElement) =
+        let mutable value = Unchecked.defaultof<JsonElement>
+
+        if root.TryGetProperty(fieldName, &value) then
+            Ok value
+        else
+            Error(InvalidPayload(eventType, sprintf "%s is required." fieldName))
+
+    let private requireInt (eventType: string) (fieldName: string) (root: JsonElement) =
+        result {
+            let! value = requireProperty eventType fieldName root
+            let mutable parsed = 0
+
+            if value.ValueKind = JsonValueKind.Number && value.TryGetInt32(&parsed) then
+                return parsed
+            else
+                return! Error(InvalidPayload(eventType, sprintf "%s must be an integer." fieldName))
+        }
+
+    let private requireInt64 (eventType: string) (fieldName: string) (root: JsonElement) =
+        result {
+            let! value = requireProperty eventType fieldName root
+            let mutable parsed = 0L
+
+            if value.ValueKind = JsonValueKind.Number && value.TryGetInt64(&parsed) then
+                return parsed
+            else
+                return! Error(InvalidPayload(eventType, sprintf "%s must be an integer." fieldName))
+        }
+
+    let private requireArray (eventType: string) (fieldName: string) (root: JsonElement) =
+        result {
+            let! value = requireProperty eventType fieldName root
+
+            if value.ValueKind = JsonValueKind.Array then
+                return ()
+            else
+                return! Error(InvalidPayload(eventType, sprintf "%s must be an array." fieldName))
+        }
+
+    let private requireNullableUuid (eventType: string) (fieldName: string) (root: JsonElement) =
+        result {
+            let! value = requireProperty eventType fieldName root
+
+            if value.ValueKind = JsonValueKind.Null then
+                return ()
+            elif value.ValueKind = JsonValueKind.String then
+                let! _ = requireUuid eventType fieldName root
+                return ()
+            else
+                return! Error(InvalidPayload(eventType, sprintf "%s must be a UUID or null." fieldName))
+        }
+
+    let validateProjectionPayload domainEventType payloadJson =
+        let eventType = DomainEventType.toString domainEventType
+        result {
+            let! root = JsonPayload.parseObject eventType payloadJson
+
+            match domainEventType with
+            | AdminGoalChanged ->
+                let! _ = requireString eventType "title" root
+                let! goalStars = requireInt eventType "goalStars" root
+                do! (goalStars > 0) |> Result.requireTrue (InvalidPayload(eventType, "goalStars must be positive."))
+                return ()
+            | SocialLinkChanged ->
+                let! count = requireInt eventType "count" root
+                do! (count >= 0) |> Result.requireTrue (InvalidPayload(eventType, "count must be non-negative."))
+                return ()
+            | PlaybackReordered ->
+                do! requireArray eventType "queueItemIds" root
+                return ()
+            | PlaybackSkipped
+            | PlaybackRestarted ->
+                let! _ = requireUuid eventType "queueItemId" root
+                let! _ = requireUuid eventType "claimOwner" root
+                let! claimAttempt = requireInt eventType "claimAttempt" root
+                do! (claimAttempt > 0) |> Result.requireTrue (InvalidPayload(eventType, "claimAttempt must be positive."))
+                let! commandGeneration = requireInt64 eventType "commandGeneration" root
+                do! (commandGeneration > 0L) |> Result.requireTrue (InvalidPayload(eventType, "commandGeneration must be positive."))
+                return ()
+            | TrackForcePlayed ->
+                let! _ = requireUuid eventType "queueItemId" root
+                let! _ = requireUuid eventType "trackId" root
+                do! requireNullableUuid eventType "interruptedQueueItemId" root
+                return ()
+            | AdminTrackQueued ->
+                let! _ = requireUuid eventType "queueItemId" root
+                let! _ = requireUuid eventType "trackId" root
+                return ()
+            | TrackMetadataChanged ->
+                let! _ = requireUuid eventType "trackId" root
+                do! requireArray eventType "changedFields" root
+                return ()
+            | TrackMaterialized ->
+                let! _ = requireUuid eventType "trackId" root
+                let! _ = requireUuid eventType "trackFileId" root
+                return ()
+            | PlaylistChanged ->
+                let! _ = requireUuid eventType "playlistId" root
+                return ()
+            | PlaylistTrackQueued ->
+                let! _ = requireUuid eventType "playlistId" root
+                do! requireNullableUuid eventType "playlistItemId" root
+                let! _ = requireUuid eventType "trackId" root
+                let! _ = requireUuid eventType "queueItemId" root
+                let! source = requireString eventType "source" root
+                do! (source = "playlist" || source = "jingle") |> Result.requireTrue (InvalidPayload(eventType, "source must be playlist or jingle."))
+                let! reason = requireString eventType "reason" root
+                do!
+                    [ "general"; "oncePerSongs"; "oncePerMinutes"; "oncePerHour"; "interrupt" ]
+                    |> List.contains reason
+                    |> Result.requireTrue (InvalidPayload(eventType, "reason is invalid."))
+                return ()
+            | _ -> return! Error(UnknownEventType(DomainEventType.toString domainEventType))
+        }
 
 
-module private TelegramInvoiceAgent =
-    let handle (workflow: ITelegramBotWorkflow) envelope cancellationToken =
-        workflow.SendInvoiceAsync envelope cancellationToken
 module private PlaybackQueueAgent =
     let handle (workflow: IPlaybackQueueWorkflow) envelope cancellationToken =
         workflow.HandleAsync envelope cancellationToken
@@ -409,9 +419,7 @@ type private AgentWorkItem(envelope: DomainEventEnvelope, cancellationToken: Can
 type DomainEventDispatcher
     (
         dataSource: NpgsqlDataSource,
-        idGenerator: IIdGenerator,
-        clock: IClock,
-        telegramWorkflow: ITelegramBotWorkflow,
+        timeProvider: TimeProvider,
         streamNodeState: StreamNodeHeartbeatState,
         playbackWorkflow: IPlaybackQueueWorkflow,
         libraryScanWorkflow: ILibraryScanWorkflow,
@@ -457,20 +465,17 @@ type DomainEventDispatcher
             cancellationToken = stoppingToken
         )
 
-    let paymentAgent = startAgent "PaymentAgent" (PaymentAgent.handle dataSource clock logger)
     let playbackQueueAgent = startAgent "PlaybackQueueAgent" (PlaybackQueueAgent.handle playbackWorkflow)
     let libraryScanAgent = startAgent "LibraryScanAgent" (LibraryScanAgent.handle libraryScanWorkflow)
-    let telegramCommandAgent = startAgent "TelegramCommandAgent" telegramWorkflow.HandleInteractionAsync
-    let telegramInvoiceAgent = startAgent "TelegramInvoiceAgent" (TelegramInvoiceAgent.handle telegramWorkflow)
     let streamNodeAgent =
         startAgent
             "StreamNodeAgent"
             (fun envelope cancellationToken ->
                 match envelope.EventType with
                 | StreamNodeFailureDetected ->
-                    StreamNodeAgent.recordFailure dataSource idGenerator clock streamNodeState envelope cancellationToken
+                    StreamNodeAgent.recordFailure dataSource timeProvider streamNodeState envelope cancellationToken
                 | StreamNodeHeartbeatReceived ->
-                    StreamNodeAgent.recordHeartbeat dataSource idGenerator clock streamNodeState envelope cancellationToken
+                    StreamNodeAgent.recordHeartbeat dataSource timeProvider streamNodeState envelope cancellationToken
                 | _ -> Task.FromResult(Ok()))
 
     let dispatchToAgent (agent: MailboxProcessor<AgentWorkItem>) (envelope: DomainEventEnvelope) (cancellationToken: CancellationToken) =
@@ -488,7 +493,6 @@ type DomainEventDispatcher
     interface IDomainEventDispatcher with
         member _.DispatchAsync envelope cancellationToken =
             match envelope.EventType with
-            | DonationPaid -> dispatchToAgent paymentAgent envelope cancellationToken
             | PlaybackQueueItemClaimed
             | PlaybackStarted
             | PlaybackEnded -> dispatchToAgent playbackQueueAgent envelope cancellationToken
@@ -496,16 +500,19 @@ type DomainEventDispatcher
             | TrackDiscovered -> dispatchToAgent libraryScanAgent envelope cancellationToken
             | StreamNodeHeartbeatReceived
             | StreamNodeFailureDetected -> dispatchToAgent streamNodeAgent envelope cancellationToken
-            | TrackRequested
-            | SayMessageSubmitted
-            | TelegramCommandReceived
-            | TelegramCallbackReceived -> dispatchToAgent telegramCommandAgent envelope cancellationToken
-            | DonationInvoiceCreated -> dispatchToAgent telegramInvoiceAgent envelope cancellationToken
-            | PaymentRefunded
-            | TrackRequestMatched
-            | SayMessageModerated
             | AdminGoalChanged
-            | SocialLinkChanged -> Task.FromResult(Ok())
+            | SocialLinkChanged
+            | PlaybackReordered
+            | PlaybackSkipped
+            | PlaybackRestarted
+            | TrackForcePlayed
+            | AdminTrackQueued
+            | TrackMetadataChanged
+            | TrackMaterialized
+            | PlaylistChanged
+            | PlaylistTrackQueued ->
+                Task.FromResult(PayloadValidation.validateProjectionPayload envelope.EventType envelope.PayloadJson)
+            | _ -> Task.FromResult(Error(UnknownEventType(DomainEventType.toString envelope.EventType)))
 
 type DomainEventPublisher(dataSource: NpgsqlDataSource) =
     interface IDomainEventPublisher with
@@ -513,159 +520,26 @@ type DomainEventPublisher(dataSource: NpgsqlDataSource) =
             OutboxEventRepository.append dataSource (OutboxMapping.toOutboxEvent envelope) cancellationToken
             |> TaskResult.mapError RepositoryError
 
-type OutboxRelayHostedService
-    (
-        dataSource: NpgsqlDataSource,
-        dispatcher: IDomainEventDispatcher,
-        clock: IClock,
-        idGenerator: IIdGenerator,
-        logger: ILogger<OutboxRelayHostedService>
-    ) as this =
-    inherit BackgroundService()
 
-    let claimOwner = idGenerator.NewId()
 
-    let toEnvelope eventType (record: OutboxEventRecord) =
-        { EventId = record.Id
-          EventType = eventType
-          OccurredAtUtc = record.OccurredAtUtc
-          Producer = record.Producer
-          CorrelationId = record.CorrelationId |> Option.defaultWith idGenerator.NewId
-          CausationId = record.CausationId
-          PayloadJson = record.PayloadJson }
-
-    let bestEffortMarkFailed (record: OutboxEventRecord) nextAttemptAtUtc failedAtUtc cancellationToken =
-        task {
-            let! result =
-                OutboxEventRepository.markFailed
-                    dataSource
-                    record.Id
-                    record.ClaimOwner
-                    record.ClaimAttempt
-                    nextAttemptAtUtc
-                    failedAtUtc
-                    cancellationToken
-
-            match result with
-            | Ok true -> ()
-            | Ok false ->
-                BackgroundWorkerLog.outboxFailureFenceRejected logger record.Id record.ClaimOwner record.ClaimAttempt
-            | Error _ ->
-                BackgroundWorkerLog.outboxMarkFailed logger record.Id record.ClaimOwner record.ClaimAttempt
-        }
-
-    member _.ProcessDueEventsOnceAsync(cancellationToken: CancellationToken) : Task<Result<int, BackgroundWorkerError>> =
-        task {
-            let! claimResult =
-                OutboxEventRepository.tryClaimDueOrdered dataSource claimOwner clock.UtcNow 1 cancellationToken
-
-            match claimResult with
-            | Error repositoryError -> return Error(RepositoryError repositoryError)
-            | Ok None -> return Ok 0
-            | Ok(Some acquiredLease) ->
-                use lease = acquiredLease
-
-                match lease.Records with
-                | [] -> return Ok 0
-                | record :: _ ->
-                    match DomainEventType.tryParse record.EventType with
-                    | None ->
-                        let nowUtc = clock.UtcNow
-                        do! bestEffortMarkFailed record (nowUtc.AddHours(1.0)) nowUtc cancellationToken
-                        return Error(UnknownEventType record.EventType)
-                    | Some eventType ->
-                        let envelope = toEnvelope eventType record
-                        let! dispatchResult = dispatcher.DispatchAsync envelope cancellationToken
-
-                        match dispatchResult with
-                        | Error error ->
-                            let nowUtc = clock.UtcNow
-                            do! bestEffortMarkFailed record (nowUtc.AddSeconds(2.0)) nowUtc cancellationToken
-                            return Error error
-                        | Ok () ->
-                            let! markResult =
-                                OutboxEventRepository.markProcessed
-                                    dataSource
-                                    record.Id
-                                    record.ClaimOwner
-                                    record.ClaimAttempt
-                                    clock.UtcNow
-                                    cancellationToken
-
-                            match markResult with
-                            | Error repositoryError -> return Error(RepositoryError repositoryError)
-                            | Ok false ->
-                                return Error(StateTransitionRejected("mark fenced outbox event processed", record.Id))
-                            | Ok true -> return Ok 1
-        }
-
-    override _.ExecuteAsync(stoppingToken: CancellationToken) =
-        task {
-            try
-                while not stoppingToken.IsCancellationRequested do
-                    let! result = this.ProcessDueEventsOnceAsync(stoppingToken)
-
-                    match result with
-                    | Ok 0 -> do! Task.Delay(TimeSpan.FromSeconds(1.0), stoppingToken)
-                    | Ok _ -> ()
-                    | Error error ->
-                        BackgroundWorkerLog.operationFailed logger "Outbox relay" error
-                        do! Task.Delay(TimeSpan.FromSeconds(1.0), stoppingToken)
-            with
-            | :? OperationCanceledException when stoppingToken.IsCancellationRequested -> ()
-        }
-        :> Task
-
-type TelegramUpdateEventIngestor(dataSource: NpgsqlDataSource, idGenerator: IIdGenerator, clock: IClock) =
-    interface ITelegramUpdateEventIngestor with
-        member _.TryIngestAsync telegramUpdateId eventType producer payloadJson cancellationToken =
-            task {
-                match DomainEventEnvelope.create idGenerator clock eventType producer None None payloadJson |> Result.mapError DomainEventError with
-                | Error error -> return Error error
-                | Ok envelope ->
-                    let inboxRecord =
-                        { Id = idGenerator.NewId()
-                          TelegramUpdateId = telegramUpdateId
-                          EventType = DomainEventType.toString eventType
-                          ReceivedAtUtc = clock.UtcNow
-                          CorrelationId = Some envelope.CorrelationId
-                          PayloadJson = envelope.PayloadJson }
-
-                    return!
-                        DatabaseSession.withTransactionResult
-                            dataSource
-                            (fun connection transaction cancellationToken ->
-                                taskResult {
-                                    let! wasInserted =
-                                        TelegramUpdateInboxRepository.tryRecordInTransaction connection transaction inboxRecord cancellationToken
-                                        |> TaskResult.mapError RepositoryError
-
-                                    if wasInserted then
-                                        do!
-                                            OutboxEventRepository.appendInTransaction
-                                                connection
-                                                transaction
-                                                (OutboxMapping.toOutboxEvent envelope)
-                                                cancellationToken
-                                            |> TaskResult.mapError RepositoryError
-
-                                    return wasInserted
-                                })
-                            cancellationToken
-            }
-
+type private ScanMetadata =
+    { Title: string
+      Artist: string
+      Album: string option
+      DurationMs: int option
+      MetadataSource: string
+      Cover: ExtractedCover option }
 type LibraryScanHostedService
     (
         dataSource: NpgsqlDataSource,
-        idGenerator: IIdGenerator,
-        clock: IClock,
+        timeProvider: TimeProvider,
         options: Web10Options,
-        s3ObjectEnumerator: IS3ObjectEnumerator,
+        s3ObjectStorage: IS3ObjectStorage,
         logger: ILogger<LibraryScanHostedService>
     ) as this =
     inherit BackgroundService()
 
-    let claimOwner = idGenerator.NewId()
+    let claimOwner = Uuid.CreateVersion7().ToGuidBigEndian()
     let claimLease = TimeSpan.FromMinutes(5.0)
 
     let supportedExtensions =
@@ -705,7 +579,7 @@ type LibraryScanHostedService
             "Unknown Artist", stem
 
     let createLibraryEnvelope eventType payloadJson =
-        DomainEventEnvelope.create idGenerator clock eventType "Web10.Radio.API.LibraryScan" None None payloadJson
+        DomainEventEnvelope.create timeProvider eventType "Web10.Radio.API.LibraryScan" None None payloadJson
         |> Result.mapError DomainEventError
 
     let appendEnvelope connection transaction envelope cancellationToken =
@@ -728,7 +602,7 @@ type LibraryScanHostedService
 
     let renewClaim (job: LibraryScanJobRecord) cancellationToken =
         taskResult {
-            let nowUtc = clock.UtcNow
+            let nowUtc = timeProvider.GetUtcNow()
             let! renewed =
                 LibraryScanRepository.renewJobLease
                     dataSource
@@ -743,27 +617,104 @@ type LibraryScanHostedService
             do! requireTransition "renew library scan lease" job.Id renewed
         }
 
+    let fallbackMetadataFromPath (storagePath: string) =
+        let stem = Path.GetFileNameWithoutExtension(storagePath)
+        let separatorIndex = stem.IndexOf(" - ", StringComparison.Ordinal)
+
+        if separatorIndex > 0 && separatorIndex + 3 < stem.Length then
+            let artist = stem.Substring(0, separatorIndex).Trim()
+            let title = stem.Substring(separatorIndex + 3).Trim()
+            (if String.IsNullOrWhiteSpace artist then "Unknown Artist" else artist),
+            (if String.IsNullOrWhiteSpace title then stem else title)
+        else
+            "Unknown Artist", stem
+
+    let metadataForPath (storagePath: string) (mediaPath: string) : ScanMetadata =
+        let fallbackArtist, fallbackTitle = fallbackMetadataFromPath storagePath
+
+        match TrackMetadata.read mediaPath with
+        | Ok metadata ->
+            let hasEmbeddedText = metadata.Title.IsSome || metadata.Artist.IsSome || metadata.Album.IsSome
+            { Title = metadata.Title |> Option.defaultValue fallbackTitle
+              Artist = metadata.Artist |> Option.defaultValue fallbackArtist
+              Album = metadata.Album
+              DurationMs = metadata.DurationMs
+              MetadataSource = if hasEmbeddedText then "Embedded" else "Filename"
+              Cover = metadata.Cover }
+        | Error error ->
+            logger.LogWarning("ATL metadata parse failed for {StoragePath}: {Error}", storagePath, error)
+            { Title = fallbackTitle
+              Artist = fallbackArtist
+              Album = None
+              DurationMs = None
+              MetadataSource = "Filename"
+              Cover = None }
+
+    let materializeCover (trackId: Guid) (cover: ExtractedCover option) : Task<DiscoveredCover option> =
+        task {
+            match cover with
+            | None -> return None
+            | Some cover ->
+                let directory = Path.Combine(options.Storage.CacheRoot, "covers", trackId.ToString("D"))
+                Directory.CreateDirectory(directory) |> ignore
+                let temporaryDirectory = Path.Combine(options.Storage.CacheRoot, "tmp")
+                Directory.CreateDirectory(temporaryDirectory) |> ignore
+                let temporary = Path.Combine(temporaryDirectory, sprintf "%s.%s.tmp" (Uuid.CreateVersion7().ToGuidBigEndian().ToString("N")) (cover.Extension.TrimStart([| '.' |])))
+                let finalPath = Path.Combine(directory, cover.Sha256 + cover.Extension)
+
+                try
+                    File.WriteAllBytes(temporary, cover.Bytes)
+                    File.Move(temporary, finalPath, true)
+                    return
+                        Some
+                            { CachePath = finalPath
+                              ContentType = cover.ContentType
+                              SizeBytes = int64 cover.Bytes.LongLength
+                              Sha256 = cover.Sha256 }
+                with ex ->
+                    logger.LogWarning(ex, "Cover materialization failed for {TrackId}", trackId)
+
+                    try
+                        if File.Exists temporary then File.Delete temporary
+                    with _ -> ()
+
+                    return None
+        }
+
+    let tryGetExistingTrackFile (backend: StorageBackendRecord) storagePath cancellationToken =
+        LibraryScanRepository.tryGetActiveTrackFileState dataSource backend.Id storagePath cancellationToken
+        |> TaskResult.mapError RepositoryError
     let insertDiscoveredFile
         (job: LibraryScanJobRecord)
         (backend: StorageBackendRecord)
         storagePath
+        mediaPath
         cachePath
         isCached
         sizeBytes
+        emitMaterialized
+        (existing: ActiveTrackFileState option)
         cancellationToken =
         taskResult {
-            let nowUtc = clock.UtcNow
-            let artist, title = metadataFromPath storagePath
+            let nowUtc = timeProvider.GetUtcNow()
+            let metadata = metadataForPath storagePath mediaPath
+            let candidateTrackId = existing |> Option.map _.TrackId |> Option.defaultValue (Uuid.CreateVersion7().ToGuidBigEndian())
+            let candidateTrackFileId = existing |> Option.map _.TrackFileId |> Option.defaultValue (Uuid.CreateVersion7().ToGuidBigEndian())
+            let! cover = materializeCover candidateTrackId metadata.Cover
 
             let discovered =
-                { TrackId = idGenerator.NewId()
-                  TrackFileId = idGenerator.NewId()
+                { TrackId = candidateTrackId
+                  TrackFileId = candidateTrackFileId
                   StorageBackendId = backend.Id
                   StoragePath = storagePath
                   CachePath = cachePath
                   IsCached = isCached
-                  Title = title
-                  Artist = artist
+                  Title = metadata.Title
+                  Artist = metadata.Artist
+                  Album = metadata.Album
+                  DurationMs = metadata.DurationMs
+                  MetadataSource = metadata.MetadataSource
+                  Cover = cover
                   ContentType = contentTypeFor (Path.GetExtension(storagePath).ToLowerInvariant())
                   SizeBytes = sizeBytes
                   DiscoveredAtUtc = nowUtc }
@@ -773,11 +724,12 @@ type LibraryScanHostedService
                     dataSource
                     (fun connection transaction cancellationToken ->
                         taskResult {
-                            let! inserted =
+                            let! discovery =
                                 LibraryScanRepository.insertDiscoveredTrackInTransaction connection transaction discovered cancellationToken
                                 |> TaskResult.mapError RepositoryError
 
-                            if inserted then
+                            match discovery with
+                            | DiscoveredTrackResult.Created identity ->
                                 let! incremented =
                                     LibraryScanRepository.incrementDiscoveredCountInTransaction
                                         connection
@@ -792,12 +744,20 @@ type LibraryScanHostedService
                                 do! requireTransition "increment library scan discovered count" job.Id incremented
                                 let payload =
                                     JsonPayload.objectWithStrings
-                                        [ "trackId", string discovered.TrackId
-                                          "trackFileId", string discovered.TrackFileId
+                                        [ "trackId", string identity.TrackId
+                                          "trackFileId", string identity.TrackFileId
                                           "storagePath", discovered.StoragePath ]
-
                                 let! envelope = createLibraryEnvelope TrackDiscovered payload
                                 do! appendEnvelope connection transaction envelope cancellationToken
+                            | DiscoveredTrackResult.Updated identity when emitMaterialized ->
+                                let payload =
+                                    JsonPayload.objectWithStrings
+                                        [ "trackId", string identity.TrackId
+                                          "trackFileId", string identity.TrackFileId
+                                          "storagePath", discovered.StoragePath ]
+                                let! envelope = createLibraryEnvelope TrackMaterialized payload
+                                do! appendEnvelope connection transaction envelope cancellationToken
+                            | DiscoveredTrackResult.Updated _ -> ()
                         })
                     cancellationToken
         }
@@ -808,15 +768,38 @@ type LibraryScanHostedService
                 Directory.Exists localRoot
                 |> Result.requireTrue (UnexpectedException("LibraryScanHostedService", "local storage root not found"))
 
+            let localRootFull = Path.GetFullPath localRoot
+            let cacheRootFull = Path.GetFullPath options.Storage.CacheRoot
+            let cachePrefix = cacheRootFull.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + string Path.DirectorySeparatorChar
+
             let files =
-                Directory.EnumerateFiles(localRoot, "*", SearchOption.AllDirectories)
+                Directory.EnumerateFiles(localRootFull, "*", SearchOption.AllDirectories)
                 |> Seq.filter (fun path -> supportedExtensions.Contains(Path.GetExtension(path).ToLowerInvariant()))
+                |> Seq.filter (fun path ->
+                    let full = Path.GetFullPath path
+                    not (String.Equals(full, cacheRootFull, StringComparison.OrdinalIgnoreCase)
+                         || full.StartsWith(cachePrefix, StringComparison.OrdinalIgnoreCase)))
 
             for filePath in files do
                 do! renewClaim job cancellationToken
                 let fileInfo = FileInfo(filePath)
-                do! insertDiscoveredFile job backend filePath (Some filePath) true (Some fileInfo.Length) cancellationToken
+                let! existing = tryGetExistingTrackFile backend filePath cancellationToken
+                do! insertDiscoveredFile job backend filePath filePath (Some filePath) true (Some fileInfo.Length) false existing cancellationToken
         }
+
+    let canonicalAudioPath (backend: StorageBackendRecord) (key: string) =
+        let backendBytes = backend.Id |> Option.defaultValue Guid.Empty |> fun value -> value.ToByteArray()
+        Array.Reverse(backendBytes, 0, 4)
+        Array.Reverse(backendBytes, 4, 2)
+        Array.Reverse(backendBytes, 6, 2)
+        let keyBytes = Encoding.UTF8.GetBytes key
+        let material = Array.zeroCreate<byte> (backendBytes.Length + keyBytes.Length)
+        Buffer.BlockCopy(backendBytes, 0, material, 0, backendBytes.Length)
+        Buffer.BlockCopy(keyBytes, 0, material, backendBytes.Length, keyBytes.Length)
+        let digestBytes: byte array = SHA256.HashData(material)
+        let digest = Convert.ToHexString(digestBytes).ToLowerInvariant()
+        let extension = Path.GetExtension(key).ToLowerInvariant()
+        Path.Combine(options.Storage.CacheRoot, "audio", digest + extension)
 
     let processS3Backend (job: LibraryScanJobRecord) (backend: StorageBackendRecord) bucketName cancellationToken =
         taskResult {
@@ -827,27 +810,47 @@ type LibraryScanHostedService
                             do! renewClaim job pageCancellationToken
 
                             for item in items do
-                                if supportedExtensions.Contains(Path.GetExtension(item.Key).ToLowerInvariant()) then
-                                    do!
-                                        insertDiscoveredFile
-                                            job
-                                            backend
-                                            item.Key
-                                            None
-                                            false
-                                            (Some item.SizeBytes)
-                                            pageCancellationToken
+                                if supportedExtensions.Contains(Path.GetExtension(item.Key).ToLowerInvariant()) && S3KeyValidation.isCanonical item.Key then
+                                    let temporaryDirectory = Path.Combine(options.Storage.CacheRoot, "tmp")
+                                    Directory.CreateDirectory(temporaryDirectory) |> ignore
+                                    let temporary = Path.Combine(temporaryDirectory, sprintf "%s%s.tmp" (Uuid.CreateVersion7().ToGuidBigEndian().ToString("N")) (Path.GetExtension(item.Key).ToLowerInvariant()))
+                                    let audioPath = canonicalAudioPath backend item.Key
+                                    Directory.CreateDirectory(Path.GetDirectoryName(audioPath)) |> ignore
+
+                                    try
+                                        do! s3ObjectStorage.DownloadToFileAsync(bucketName, item.Key, temporary, pageCancellationToken)
+                                        File.Move(temporary, audioPath, true)
+                                        let! existing = tryGetExistingTrackFile backend item.Key pageCancellationToken
+                                        let emitMaterialized = existing |> Option.exists (fun value -> not value.IsCached)
+                                        do!
+                                            insertDiscoveredFile
+                                                job
+                                                backend
+                                                item.Key
+                                                audioPath
+                                                (Some audioPath)
+                                                true
+                                                (Some item.SizeBytes)
+                                                emitMaterialized
+                                                existing
+                                                pageCancellationToken
+                                    with ex ->
+                                        logger.LogWarning(ex, "S3 object {ObjectKey} could not be materialized; retrying on next scan", item.Key)
+
+                                        try
+                                            if File.Exists temporary then File.Delete temporary
+                                        with _ -> ()
                         }
 
                     match pageResult with
                     | Ok () -> return ()
-                    | Error error ->
-                        return raise (InvalidOperationException(BackgroundWorkerError.toMessage error))
+                    | Error error -> return raise (InvalidOperationException(BackgroundWorkerError.toMessage error))
                 }
                 :> Task
 
-            do! s3ObjectEnumerator.VisitPagesAsync(bucketName, visitPage, cancellationToken)
+            do! s3ObjectStorage.VisitPagesAsync(bucketName, visitPage, cancellationToken)
         }
+
 
     let completeClaim (job: LibraryScanJobRecord) cancellationToken =
         taskResult {
@@ -857,7 +860,7 @@ type LibraryScanHostedService
                     job.Id
                     job.ClaimOwner
                     job.ClaimAttempt
-                    clock.UtcNow
+                    (timeProvider.GetUtcNow())
                     cancellationToken
                 |> TaskResult.mapError RepositoryError
 
@@ -870,7 +873,7 @@ type LibraryScanHostedService
             job.Id
             job.ClaimOwner
             job.ClaimAttempt
-            clock.UtcNow
+            (timeProvider.GetUtcNow())
             reason
             cancellationToken
         |> TaskResult.mapError RepositoryError
@@ -951,7 +954,7 @@ type LibraryScanHostedService
 
     let claimAndProcess jobId cancellationToken =
         taskResult {
-            let nowUtc = clock.UtcNow
+            let nowUtc = timeProvider.GetUtcNow()
             let leaseExpiresAtUtc = nowUtc + claimLease
             let! job =
                 match jobId with
@@ -1024,8 +1027,7 @@ type LibraryScanHostedService
 type PlaybackCompletionReporter
     (
         dataSource: NpgsqlDataSource,
-        idGenerator: IIdGenerator,
-        clock: IClock
+        timeProvider: TimeProvider
     ) =
     let leaseDuration = TimeSpan.FromSeconds(30.0)
 
@@ -1048,7 +1050,7 @@ type PlaybackCompletionReporter
         member _.RenewLeaseAsync queueItemId claimOwner claimAttempt cancellationToken =
             taskResult {
                 do! validateIdentity queueItemId claimOwner claimAttempt
-                let nowUtc = clock.UtcNow
+                let nowUtc = timeProvider.GetUtcNow()
 
                 return!
                     PlaybackQueueRepository.renewPlayingLease
@@ -1086,8 +1088,7 @@ type PlaybackCompletionReporter
 
                 let! envelope =
                     DomainEventEnvelope.create
-                        idGenerator
-                        clock
+                        timeProvider
                         PlaybackEnded
                         "Web10.Radio.StreamNode"
                         None
@@ -1100,7 +1101,7 @@ type PlaybackCompletionReporter
                         dataSource
                         (fun connection transaction cancellationToken ->
                             taskResult {
-                                let finishedAtUtc = clock.UtcNow
+                                let finishedAtUtc = timeProvider.GetUtcNow()
                                 let! active =
                                     PlaybackQueueRepository.lockOwnedPlayingClaimInTransaction
                                         connection
@@ -1159,17 +1160,16 @@ type PlaybackCompletionReporter
 type PlaybackProgramHostedService
     (
         dataSource: NpgsqlDataSource,
-        idGenerator: IIdGenerator,
-        clock: IClock,
+        timeProvider: TimeProvider,
         logger: ILogger<PlaybackProgramHostedService>
     ) as this =
     inherit BackgroundService()
 
-    let claimOwner = idGenerator.NewId()
+    let claimOwner = Uuid.CreateVersion7().ToGuidBigEndian()
     let claimLease = TimeSpan.FromSeconds(30.0)
 
     let createPlaybackEnvelope eventType payloadJson =
-        DomainEventEnvelope.create idGenerator clock eventType "Web10.Radio.API.PlaybackProgram" None None payloadJson
+        DomainEventEnvelope.create timeProvider eventType "Web10.Radio.API.PlaybackProgram" None None payloadJson
         |> Result.mapError DomainEventError
 
     let appendEnvelope connection transaction envelope cancellationToken =
@@ -1183,13 +1183,35 @@ type PlaybackProgramHostedService
 
     let claimedPayload (claimed: ClaimedPlaybackQueueItem) =
         claimIdentityPayload claimed.QueueItemId claimed.ClaimOwner claimed.ClaimAttempt []
+    let appendPlaylistQueuedEvent (item: PlaybackQueueItem) cancellationToken =
+        taskResult {
+            let! playlistId = item.PlaylistId |> Result.requireSome (InvalidPayload("PlaylistTrackQueued", "playlistId is required."))
+            let! trackId = item.TrackId |> Result.requireSome (InvalidPayload("PlaylistTrackQueued", "trackId is required."))
+            let payload =
+                JsonSerializer.Serialize(
+                    {| playlistId = playlistId.ToString("D")
+                       playlistItemId = item.PlaylistItemId |> Option.map (fun value -> value.ToString("D"))
+                       trackId = trackId.ToString("D")
+                       queueItemId = item.QueueItemId.ToString("D")
+                       source = item.Source
+                       reason = if item.Source = "jingle" then "interrupt" else "general" |},
+                    DomainJson.options
+                )
+            let! envelope = createPlaybackEnvelope PlaylistTrackQueued payload
+            let! _ =
+                DatabaseSession.withTransactionResult
+                    dataSource
+                    (fun connection transaction token -> appendEnvelope connection transaction envelope token)
+                    cancellationToken
+            return ()
+        }
 
     let claimNextQueueItem cancellationToken =
         task {
             use attempt = FlowTelemetry.startRoot FlowTelemetry.QueueClaim
 
             try
-                let nowUtc = clock.UtcNow
+                let nowUtc = timeProvider.GetUtcNow()
 
                 let! result =
                     DatabaseSession.withTransactionResult
@@ -1287,7 +1309,7 @@ type PlaybackProgramHostedService
                     queueItemId
                     owner
                     attempt
-                    clock.UtcNow
+                    (timeProvider.GetUtcNow())
                     failureReason
                     cancellationToken
                 |> TaskResult.mapError RepositoryError
@@ -1301,7 +1323,7 @@ type PlaybackProgramHostedService
             dataSource
             (fun connection transaction cancellationToken ->
                 taskResult {
-                    let nowUtc = clock.UtcNow
+                    let nowUtc = timeProvider.GetUtcNow()
                     let! claimed =
                         PlaybackQueueRepository.getOwnedClaimInTransaction
                             connection
@@ -1384,7 +1406,7 @@ type PlaybackProgramHostedService
                                 queueItemId
                                 owner
                                 attempt
-                                clock.UtcNow
+                                (timeProvider.GetUtcNow())
                                 cancellationToken
                             |> TaskResult.mapError RepositoryError
 
@@ -1401,7 +1423,7 @@ type PlaybackProgramHostedService
                                 queueItemId
                                 owner
                                 attempt
-                                clock.UtcNow
+                                (timeProvider.GetUtcNow())
                                 reason
                                 cancellationToken
                             |> TaskResult.mapError RepositoryError
@@ -1420,13 +1442,17 @@ type PlaybackProgramHostedService
             if initiallyClaimed then
                 return true
             else
-                let! _ =
+                let! enqueued =
                     PlaybackQueueRepository.enqueueNextActivePlaylistItemIfIdle
                         dataSource
-                        (idGenerator.NewId())
-                        clock.UtcNow
+                        (Uuid.CreateVersion7().ToGuidBigEndian())
+                        (timeProvider.GetUtcNow())
                         cancellationToken
                     |> TaskResult.mapError RepositoryError
+
+                match enqueued with
+                | Some item -> do! appendPlaylistQueuedEvent item cancellationToken
+                | None -> ()
 
                 return! claimNextQueueItem cancellationToken
         }
@@ -1459,9 +1485,19 @@ type PlaybackProgramHostedService
             | _ -> return! Error(InvalidPayload(eventType, "event is not handled by PlaybackQueueAgent."))
         }
 
+
     override _.ExecuteAsync(stoppingToken: CancellationToken) =
         task {
             try
+                let! initialized =
+                    AdminContentRepository.ensureAllTracksPlaylist
+                        dataSource
+                        (Uuid.CreateVersion7().ToGuidBigEndian())
+                        (timeProvider.GetUtcNow())
+                        stoppingToken
+                match initialized with
+                | Ok _ -> ()
+                | Error error -> logger.LogError("Failed to initialize the built-in All tracks playlist: {Error}", error.ToString())
                 while not stoppingToken.IsCancellationRequested do
                     let! result = this.ProcessOneQueueItemAsync(stoppingToken)
 
@@ -1482,9 +1518,6 @@ type PlaybackProgramHostedService
 module BackgroundWorkerComposition =
     let addBackgroundWorkers (options: Web10Options) (services: IServiceCollection) : IServiceCollection =
         services.AddSingleton<Web10Options>(options) |> ignore
-        services.AddSingleton<TelegramBotWorkflow>() |> ignore
-        services.AddSingleton<ITelegramBotWorkflow>(fun provider -> provider.GetRequiredService<TelegramBotWorkflow>() :> ITelegramBotWorkflow) |> ignore
-        services.AddSingleton<ITelegramPreCheckoutWorkflow>(fun provider -> provider.GetRequiredService<TelegramBotWorkflow>() :> ITelegramPreCheckoutWorkflow) |> ignore
         services.AddSingleton<LibraryScanHostedService>() |> ignore
         services.AddSingleton<ILibraryScanWorkflow>(fun provider ->
             provider.GetRequiredService<LibraryScanHostedService>() :> ILibraryScanWorkflow)
@@ -1496,8 +1529,15 @@ module BackgroundWorkerComposition =
         services.AddSingleton<IDomainEventDispatcher, DomainEventDispatcher>() |> ignore
         services.AddSingleton<IDomainEventPublisher, DomainEventPublisher>() |> ignore
         services.AddSingleton<IPlaybackCompletionReporter, PlaybackCompletionReporter>() |> ignore
-        services.AddSingleton<ITelegramUpdateEventIngestor, TelegramUpdateEventIngestor>() |> ignore
-        services.AddHostedService<OutboxRelayHostedService>() |> ignore
+        services.AddHostedService(fun provider ->
+            OutboxRelayHostedService(
+                OutboxAudience.Api,
+                provider.GetRequiredService<NpgsqlDataSource>(),
+                provider.GetRequiredService<IDomainEventDispatcher>(),
+                provider.GetRequiredService<TimeProvider>(),
+                provider.GetRequiredService<ILogger<OutboxRelayHostedService>>()
+            ))
+        |> ignore
         services.AddHostedService(fun provider -> provider.GetRequiredService<LibraryScanHostedService>()) |> ignore
         services.AddHostedService(fun provider -> provider.GetRequiredService<PlaybackProgramHostedService>()) |> ignore
         services

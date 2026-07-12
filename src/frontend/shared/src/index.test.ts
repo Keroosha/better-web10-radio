@@ -44,6 +44,8 @@ describe('@web10/shared public contracts', () => {
         album: '',
         durationMs: 0,
         hasCachedFile: true,
+        coverImageUrl: '',
+        metadataSource: 'filename',
       }).hasCachedFile,
     ).toBe(true);
     expect(
@@ -52,6 +54,18 @@ describe('@web10/shared public contracts', () => {
         name: 'Night shift',
         description: null,
         isActive: true,
+        type: 'general',
+        source: 'manual',
+        order: 'sequential',
+        weight: 3,
+        isJingle: false,
+        interrupt: false,
+        avoidDuplicates: true,
+        playEverySongs: null,
+        playEveryMinutes: null,
+        playAtMinute: null,
+        schedules: [],
+        isSystem: false,
         itemCount: 0,
       }).isActive,
     ).toBe(true);

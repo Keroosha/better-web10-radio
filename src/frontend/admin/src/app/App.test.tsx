@@ -191,6 +191,8 @@ test('renders every admin section without a 501 or unpinned badge after session 
   expect(screen.queryByText(/unpinned/i)).toBeNull();
   for (const section of [
     'Dashboard',
+    'Queue',
+    'Tracks',
     'Social links',
     'Donation goal',
     'Playlists',

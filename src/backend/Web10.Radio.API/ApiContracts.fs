@@ -174,31 +174,11 @@ type CurrentSongDto =
       ExternalUrl: string
       FallbackText: string }
 
-type TelegramHealthDto =
-    { IsConfigured: bool
-      ChannelIdOrUsername: string
-      LastUpdateId: int64 Nullable
-      LastError: string }
 
 type StreamFileDto =
     { CachePath: string
       ContentType: string }
 
-type AdminSayMessageDto =
-    { Id: string
-      TelegramUserId: Nullable<int64>
-      DisplayName: string
-      Text: string
-      AmountStars: int
-      Color: string
-      Status: string
-      SubmittedAtUtc: string
-      PaidAtUtc: string
-      ModeratedAtUtc: string
-      ModerationReason: string }
-
-type RejectSayMessageRequest =
-    { Reason: string }
 
 type AdminAuthSessionDto =
     { Username: string
@@ -223,15 +203,32 @@ type AdminTrackDto =
       Artist: string
       Album: string
       DurationMs: int
-      HasCachedFile: bool }
+      HasCachedFile: bool
+      CoverImageUrl: string
+      MetadataSource: string }
+
+type AdminTrackPageDto =
+    { Items: AdminTrackDto list
+      NextCursor: string }
+
+type QueueReorderRequestDto =
+    { QueueItemIds: string list }
 
 type PlaybackQueueAcceptedDto =
     { QueueItemId: string }
 
+type StreamNodePlaybackCommandDto =
+    { Generation: int64
+      Action: string
+      QueueItemId: string
+      ClaimOwner: string
+      ClaimAttempt: int }
+
 type StreamNodeControlDto =
     { DesiredState: string
-      RestartGeneration: int }
-
+      RestartGeneration: int
+      PlaybackCommands: StreamNodePlaybackCommandDto list
+      NextPlaybackGeneration: int64 }
 type StreamNodeStatusDto =
     { Status: string
       DesiredState: string
@@ -251,12 +248,33 @@ type CurrentPlaybackAssignmentDto =
       Artist: string
       DurationMs: int }
 
+type PlaylistScheduleDto =
+    { Id: string
+      DaysOfWeek: int list
+      StartTime: string
+      EndTime: string
+      StartDate: string
+      EndDate: string
+      TimeZoneId: string }
+
 type PlaylistSummaryDto =
     { Id: string
       Name: string
       Description: string
       IsActive: bool
-      ItemCount: int }
+      Type: string
+      Source: string
+      Order: string
+      Weight: int
+      IsJingle: bool
+      Interrupt: bool
+      AvoidDuplicates: bool
+      PlayEverySongs: int option
+      PlayEveryMinutes: int option
+      PlayAtMinute: int option
+      IsSystem: bool
+      ItemCount: int
+      Schedules: PlaylistScheduleDto list }
 
 type PlaylistItemDto =
     { Id: string

@@ -49,6 +49,13 @@ export function StageScene({
 }: StageSceneProps): ReactElement {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [ready, setReady] = useState(false);
+  // A player snapshot carries position/duration fields that change every tick. Keep
+  // only the values that can alter the WebGL scene in the effect's dependency set.
+  const hasTrack = nowPlaying !== undefined;
+  const trackId = nowPlaying?.trackId;
+  const title = nowPlaying?.title;
+  const artist = nowPlaying?.artist;
+  const coverImageUrl = nowPlaying?.coverImageUrl;
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -62,14 +69,17 @@ export function StageScene({
         setReady(true);
       }
     };
-    const options: RadioSceneOptions =
-      nowPlaying === undefined
-        ? { pointerEnabled, onReady }
-        : {
-            pointerEnabled,
-            onReady,
-            track: { title: nowPlaying.title, artist: nowPlaying.artist },
-          };
+    const options: RadioSceneOptions = !hasTrack
+      ? { pointerEnabled, onReady }
+      : {
+          pointerEnabled,
+          onReady,
+          track: {
+            title: title ?? '',
+            artist: artist ?? '',
+            coverImageUrl: coverImageUrl ?? '',
+          },
+        };
     const handle = createScene(canvas, options);
     // NOTE: we intentionally do NOT call handle.resize() — createRadioScene registers its
     // own window 'resize' listener and the canvas is fixed-fullscreen, so calling it here
@@ -79,7 +89,7 @@ export function StageScene({
       setReady(false);
       handle.dispose();
     };
-  }, [createScene, pointerEnabled, nowPlaying]);
+  }, [artist, coverImageUrl, createScene, hasTrack, pointerEnabled, title, trackId]);
 
   return (
     <>

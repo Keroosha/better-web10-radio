@@ -2,15 +2,15 @@ services:
   postgres:
     image: postgres:17
     environment:
-      POSTGRES_DB: web10
-      POSTGRES_USER: web10
-      POSTGRES_PASSWORD: web10
+      POSTGRES_DB: "${POSTGRES_DB:-web10}"
+      POSTGRES_USER: "${POSTGRES_USER:-web10}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-web10}"
     ports:
       - "5432:5432"
     volumes:
       - web10-postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U web10 -d web10"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-web10} -d $${POSTGRES_DB:-web10}"]
       interval: 2s
       timeout: 5s
       retries: 30
@@ -32,13 +32,12 @@ services:
         required: false
     restart: "no"
 
-  # The API runs as chiseled non-root UID 1654 and write-probes LOCAL_ROOT at startup. A
-  # bind-mounted host folder is owned by the host user, so 1654 can't write and startup fails.
-  # This root init container makes the mount readable+traversable and its root writable for 1654
-  # before the API boots (SPEC §9 compose order: … → storage-init → API). It does NOT chown, so
-  # your audio files keep their host ownership.
+  # The API and stream node run as non-root UID 1654. Keep source media in the
+  # host-backed storage mount, while materialized audio/artwork uses this named
+  # volume so the chiseled API can write without changing host file ownership.
   storage-init:
     image: web10-radio-stream-node:local
+    user: "0:0"
     build:
       context: ./src/stream-node
       dockerfile: Dockerfile
@@ -47,8 +46,40 @@ services:
         condition: service_completed_successfully
     volumes:
       - ./.storage:/var/lib/web10/storage
-    # Keep this as a one-shot initializer: create the absent smoke track, then apply existing permissions.
-    command: ["sh", "-ec", "track=/var/lib/web10/storage/web10-compose-smoke.wav; if [ ! -e \"$$track\" ] && [ ! -L \"$$track\" ]; then python3 ./scripts/create-smoke-track.py --path \"$$track\" --duration-seconds 120 --sample-rate 48000; fi; chmod -R a+rX /var/lib/web10/storage && chmod a+rwx /var/lib/web10/storage"]
+      - web10-storage-cache:/var/lib/web10/cache
+    command:
+      - sh
+      - -ec
+      - |
+        install -d -o 1654 -g 1654 -m 0775 /var/lib/web10/cache /var/lib/web10/cache/audio /var/lib/web10/cache/covers /var/lib/web10/cache/tmp
+        track=/var/lib/web10/storage/web10-compose-tagged.mp3
+        if [ ! -e "$$track" ] && [ ! -L "$$track" ]; then
+          tmp="$${track}.tmp.mp3"
+          ffmpeg -hide_banner -loglevel error \
+            -f lavfi -i "anullsrc=r=48000:cl=stereo" \
+            -f lavfi -i "color=c=black:s=16x16:r=1:d=1" \
+            -map 0:a:0 -map 1:v:0 -t 120 \
+            -c:a libmp3lame -ar 48000 -ac 2 -b:a 128k \
+            -c:v mjpeg -disposition:v attached_pic \
+            -metadata title="Web10 Compose Smoke" \
+            -metadata artist="Web10.Radio" \
+            -metadata album="Compose" \
+            -y "$$tmp"
+          mv -f "$$tmp" "$$track"
+        fi
+        chmod -R a+rX /var/lib/web10/storage
+        chmod a+rwx /var/lib/web10/storage
+        if command -v setpriv >/dev/null 2>&1; then
+          setpriv --reuid=1654 --regid=1654 --clear-groups sh -c 'touch /var/lib/web10/cache/tmp/.storage-init-write-probe && rm -f /var/lib/web10/cache/tmp/.storage-init-write-probe'
+        else
+          if ! grep -q ':1654:' /etc/group; then
+            printf '%s\n' 'web10uid1654:x:1654:' >> /etc/group
+          fi
+          if ! grep -q ':1654:' /etc/passwd; then
+            printf '%s\n' 'web10uid1654:x:1654:1654::/nonexistent:/bin/sh' >> /etc/passwd
+          fi
+          su -s /bin/sh -c 'touch /var/lib/web10/cache/tmp/.storage-init-write-probe && rm -f /var/lib/web10/cache/tmp/.storage-init-write-probe' web10uid1654
+        fi
     restart: "no"
 
   api:
@@ -65,8 +96,7 @@ services:
         condition: service_completed_successfully
     ports:
       - "8080:8080"
-    # All app config lives in .defaults.env (committed working defaults). Create a local .env
-    # (gitignored) to override secrets — see the SECRETS block in .defaults.env.
+    # All app config lives in .defaults.env; a local .env (gitignored) overrides it.
     env_file:
       - path: .defaults.env
         required: true
@@ -74,9 +104,34 @@ services:
         required: false
     volumes:
       - ./.storage:/var/lib/web10/storage
+      - web10-storage-cache:/var/lib/web10/cache
       - web10-data-protection:/var/lib/web10/data-protection
     healthcheck:
       test: ["CMD", "dotnet", "Web10.Radio.API.dll", "--health-check", "http://127.0.0.1:8080/health/live"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+    restart: unless-stopped
+
+  telegram:
+    image: web10-radio-telegram:local
+    build:
+      context: ./src/backend
+      dockerfile: Dockerfile.telegram
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+    # Committed defaults from .defaults.env; a local .env (gitignored) overrides.
+    env_file:
+      - path: .defaults.env
+        required: true
+      - path: .env
+        required: false
+    healthcheck:
+      test: ["CMD", "dotnet", "Web10.Radio.Telegram.dll", "--health-check", "http://127.0.0.1:8080/health/live"]
       interval: 2s
       timeout: 5s
       retries: 30
@@ -106,6 +161,8 @@ services:
     depends_on:
       api:
         condition: service_healthy
+      telegram:
+        condition: service_healthy
     ports:
       # Public stage at http://localhost:8090/ ; admin cabinet at http://localhost:8090/admin/
       - "8090:80"
@@ -129,6 +186,7 @@ services:
         condition: service_healthy
       rtmp-sink:
         condition: service_healthy
+    # Committed defaults from .defaults.env; a local .env (gitignored) overrides.
     env_file:
       - path: .defaults.env
         required: true
@@ -136,8 +194,9 @@ services:
         required: false
     volumes:
       - ./.storage:/var/lib/web10/storage:ro
+      - web10-storage-cache:/var/lib/web10/cache:ro
     healthcheck:
-      test: ["CMD", "python3", "./scripts/supervisor.py", "health-check"]
+      test: ["CMD", "./Web10.Radio.StreamNode", "--health-check", "http://127.0.0.1:18080/healthz"]
       interval: 2s
       timeout: 5s
       retries: 30
@@ -146,4 +205,5 @@ services:
 
 volumes:
   web10-postgres-data:
+  web10-storage-cache:
   web10-data-protection:

@@ -8,6 +8,8 @@ open FluentMigrator.Runner
 open Microsoft.Extensions.DependencyInjection
 open NUnit.Framework
 open Web10.Radio.Database
+open Dodo.Primitives
+open Web10.Radio.Application
 open Web10.Radio.API
 open Web10.Radio.Database.Migrations
 open Web10.Radio.Database.Repositories
@@ -119,9 +121,13 @@ VALUES (@ActiveId, 'Active title', 'Active artist', false),
             [ "Tracks"
               "TrackLinks"
               "TrackFiles"
+              "TrackAssets"
               "StorageBackends"
               "Playlists"
               "PlaylistItems"
+              "PlaylistSchedules"
+              "PlaylistSchedulerState"
+              "PlaybackControlCommands"
               "PlaybackQueue"
               "TrackRequests"
               "SayMessages"
@@ -385,6 +391,7 @@ WHERE schema.nspname = 'public'
       'UX_LibraryScanJobs_Active_DefaultBackend',
       'UX_LibraryScanJobs_Active_StorageBackend',
       'UX_Playlists_Active_Singleton',
+      'UX_Playlists_Active_System_AllStorage',
       'UX_DonationGoals_Active_Singleton',
       'UX_AdminUsers_Active_NormalizedUsername',
       'UX_AdminSessions_Active_TokenHash',
@@ -539,11 +546,16 @@ ORDER BY index_class.relname;""",
                     Set.ofList
                         [ "AdminSessions", "AdminSessions_UserId_fkey", "FOREIGNKEYUserIdREFERENCESAdminUsersId"
                           "LibraryScanJobs", "LibraryScanJobs_StorageBackendId_fkey", "FOREIGNKEYStorageBackendIdREFERENCESStorageBackendsId"
+                          "PlaybackControlCommands", "PlaybackControlCommands_QueueItemId_fkey", "FOREIGNKEYQueueItemIdREFERENCESPlaybackQueueId"
+                          "PlaybackQueue", "PlaybackQueue_PlaylistId_fkey", "FOREIGNKEYPlaylistIdREFERENCESPlaylistsId"
                           "PlaybackQueue", "PlaybackQueue_PlaylistItemId_fkey", "FOREIGNKEYPlaylistItemIdREFERENCESPlaylistItemsId"
                           "PlaybackQueue", "PlaybackQueue_TrackId_fkey", "FOREIGNKEYTrackIdREFERENCESTracksId"
                           "PlaybackQueue", "PlaybackQueue_TrackRequestId_fkey", "FOREIGNKEYTrackRequestIdREFERENCESTrackRequestsId"
                           "PlaylistItems", "PlaylistItems_PlaylistId_fkey", "FOREIGNKEYPlaylistIdREFERENCESPlaylistsId"
                           "PlaylistItems", "PlaylistItems_TrackId_fkey", "FOREIGNKEYTrackIdREFERENCESTracksId"
+                          "PlaylistSchedules", "PlaylistSchedules_PlaylistId_fkey", "FOREIGNKEYPlaylistIdREFERENCESPlaylistsId"
+                          "PlaylistSchedulerState", "PlaylistSchedulerState_PlaylistId_fkey", "FOREIGNKEYPlaylistIdREFERENCESPlaylistsId"
+                          "TrackAssets", "TrackAssets_TrackId_fkey", "FOREIGNKEYTrackIdREFERENCESTracksId"
                           "TrackFiles", "TrackFiles_StorageBackendId_fkey", "FOREIGNKEYStorageBackendIdREFERENCESStorageBackendsId"
                           "TrackFiles", "TrackFiles_TrackId_fkey", "FOREIGNKEYTrackIdREFERENCESTracksId"
                           "TrackLinks", "TrackLinks_TrackId_fkey", "FOREIGNKEYTrackIdREFERENCESTracksId"
@@ -551,35 +563,53 @@ ORDER BY index_class.relname;""",
 
                 let expectedCheckConstraints =
                     Set.ofList
-                        [ "DonationGoals", "DonationGoals_GoalStars_check", "CHECKGoalStars>0"
-                          "DonationGoals", "DonationGoals_RaisedStars_check", "CHECKRaisedStars>=0"
-                          "LibraryScanJobs", "CK_LibraryScanJobs_ClaimAttempt_NonNegative", "CHECKClaimAttempt>=0"
-                          "LibraryScanJobs", "CK_LibraryScanJobs_DiscoveredCount_NonNegative", "CHECKDiscoveredCount>=0"
-                          "LibraryScanJobs", "LibraryScanJobs_Status_check", "CHECKStatusIN'Queued','Running','Completed','Failed'"
-                          "OutboxEvents", "OutboxEvents_Attempts_check", "CHECKAttempts>=0"
-                          "OutboxEvents", "OutboxEvents_Status_check", "CHECKStatusIN'Pending','Processing','Processed','Failed'"
-                          "Payments", "Payments_AmountStars_check", "CHECKAmountStars>0"
-                          "Payments", "Payments_Currency_check", "CHECKCurrency='XTR'"
-                          "Payments", "Payments_ProviderToken_check", "CHECKProviderToken=''"
-                          "Payments", "Payments_Purpose_check", "CHECKPurposeIN'Request','Say','Donation'"
-                          "Payments", "Payments_Status_check", "CHECKStatusIN'InvoiceCreated','PreCheckoutApproved','Paid','Refunded','Rejected'"
-                          "PlaybackQueue", "CK_PlaybackQueue_ClaimAttempt_NonNegative", "CHECKClaimAttempt>=0"
-                          "PlaybackQueue", "PlaybackQueue_Source_check", "CHECKSourceIN'playlist','request','admin','fallback'"
-                          "PlaybackQueue", "PlaybackQueue_Status_check", "CHECKStatusIN'Queued','Claimed','Playing','Played','Failed'"
-                          "PlaylistItems", "PlaylistItems_Position_check", "CHECKPosition>=0"
-                          "SayMessages", "SayMessages_AmountStars_check", "CHECKAmountStars>=0"
-                          "SayMessages", "SayMessages_Status_check", "CHECKStatusIN'PendingPayment','PaidPendingModeration','Approved','Rejected'"
-                          "SocialLinks", "SocialLinks_Kind_check", "CHECKKindIN'telegram','youtube','instagram','discord','external'"
-                          "SocialLinks", "SocialLinks_Position_check", "CHECKPosition>=0"
-                          "StorageBackends", "StorageBackends_Type_check", "CHECKTypeIN'Local','S3'"
-                          "StreamNodeHeartbeats", "StreamNodeHeartbeats_Status_check", "CHECKStatusIN'Starting','Live','Degraded','Restarting','Failed','Offline'"
-                          "StreamNodeControlState", "CK_StreamNodeControlState_DesiredState", "CHECKDesiredStateIN'Running','Stopped'"
-                          "StreamNodeControlState", "CK_StreamNodeControlState_RestartGeneration_NonNegative", "CHECKRestartGeneration>=0"
-                          "StreamNodeControlState", "CK_StreamNodeControlState_SingletonKey_Primary", "CHECKSingletonKey='primary'"
-                          "TrackFiles", "TrackFiles_SizeBytes_check", "CHECKSizeBytesISNULLORSizeBytes>=0"
-                          "TrackLinks", "TrackLinks_Kind_check", "CHECKKindIN'bandcamp','soundcloud','youtube','artist','external'"
-                          "TrackRequests", "TrackRequests_Status_check", "CHECKStatusIN'NeedsReview','Matched','Rejected','Queued','PaidPending','Paid'"
-                          "Tracks", "Tracks_DurationMs_check", "CHECKDurationMsISNULLORDurationMs>=0" ]
+                        [ "DonationGoals", "DonationGoals_GoalStars_check"
+                          "DonationGoals", "DonationGoals_RaisedStars_check"
+                          "LibraryScanJobs", "CK_LibraryScanJobs_ClaimAttempt_NonNegative"
+                          "LibraryScanJobs", "CK_LibraryScanJobs_DiscoveredCount_NonNegative"
+                          "LibraryScanJobs", "LibraryScanJobs_Status_check"
+                          "OutboxEvents", "OutboxEvents_Attempts_check"
+                          "OutboxEvents", "OutboxEvents_Audience_check"
+                          "OutboxEvents", "OutboxEvents_Status_check"
+                          "Payments", "Payments_AmountStars_check"
+                          "Payments", "Payments_Currency_check"
+                          "Payments", "Payments_ProviderToken_check"
+                          "Payments", "Payments_Purpose_check"
+                          "Payments", "Payments_Status_check"
+                          "PlaybackControlCommands", "PlaybackControlCommands_Action_check"
+                          "PlaybackControlCommands", "PlaybackControlCommands_ClaimAttempt_check"
+                          "PlaybackQueue", "CK_PlaybackQueue_ClaimAttempt_NonNegative"
+                          "PlaybackQueue", "PlaybackQueue_PlaylistId_Source_check"
+                          "PlaybackQueue", "PlaybackQueue_Source_check"
+                          "PlaybackQueue", "PlaybackQueue_Status_check"
+                          "PlaylistItems", "PlaylistItems_Position_check"
+                          "PlaylistSchedules", "PlaylistSchedules_DaysOfWeek_check"
+                          "PlaylistSchedules", "PlaylistSchedules_DateRange_check"
+                          "PlaylistSchedules", "PlaylistSchedules_TimeZoneId_check"
+                          "PlaylistSchedulerState", "PlaylistSchedulerState_Cursor_check"
+                          "PlaylistSchedulerState", "PlaylistSchedulerState_SongsSinceLast_check"
+                          "Playlists", "Playlists_Cadence_check"
+                          "Playlists", "Playlists_Order_check"
+                          "Playlists", "Playlists_Source_check"
+                          "Playlists", "Playlists_Type_check"
+                          "Playlists", "Playlists_Weight_check"
+                          "SayMessages", "SayMessages_AmountStars_check"
+                          "SayMessages", "SayMessages_Status_check"
+                          "SocialLinks", "SocialLinks_Kind_check"
+                          "SocialLinks", "SocialLinks_Position_check"
+                          "StorageBackends", "StorageBackends_Type_check"
+                          "StreamNodeHeartbeats", "StreamNodeHeartbeats_Status_check"
+                          "StreamNodeControlState", "CK_StreamNodeControlState_DesiredState"
+                          "StreamNodeControlState", "CK_StreamNodeControlState_RestartGeneration_NonNegative"
+                          "StreamNodeControlState", "CK_StreamNodeControlState_SingletonKey_Primary"
+                          "TrackAssets", "TrackAssets_EmbeddedManual_check"
+                          "TrackAssets", "TrackAssets_Kind_check"
+                          "TrackAssets", "TrackAssets_Source_check"
+                          "TrackFiles", "TrackFiles_SizeBytes_check"
+                          "TrackLinks", "TrackLinks_Kind_check"
+                          "TrackRequests", "TrackRequests_Status_check"
+                          "Tracks", "Tracks_DurationMs_check"
+                          "Tracks", "Tracks_MetadataSource_check" ]
 
                 let expectedActiveIndexPredicates =
                     Set.ofList
@@ -594,11 +624,12 @@ ORDER BY index_class.relname;""",
                           "UX_TrackFiles_Active_Backend_StoragePath", "IsDeleted=falseANDStorageBackendIdISNOTNULL"
                           "UX_TrackFiles_Active_NullBackend_StoragePath", "IsDeleted=falseANDStorageBackendIdISNULL"
                           "UX_Playlists_Active_Name", "IsDeleted=false"
-                          "UX_Playlists_Active_Singleton", "IsDeleted=falseANDIsActive=true"
                           "IX_PlaylistItems_Active_PlaylistId", "IsDeleted=false"
+                          "IX_PlaylistSchedules_Active_PlaylistId", "IsDeleted=false"
                           "UX_PlaylistItems_Active_PlaylistId_Position", "IsDeleted=false"
                           "IX_TrackRequests_Active_Status_RequestedAtUtc", "IsDeleted=false"
                           "IX_PlaybackQueue_Active_Claim", "IsDeleted=falseANDStatus='Queued'"
+                          "IX_PlaybackQueue_Active_PlaylistId_Status", "IsDeleted=false"
                           "IX_PlaybackQueue_Active_Status", "IsDeleted=false"
                           "IX_PlaybackQueue_Active_ClaimLease", "IsDeleted=falseANDStatusIN'Claimed','Playing'"
                           "UX_PlaybackQueue_Active_TrackRequest", "IsDeleted=falseANDTrackRequestIdISNOTNULL"
@@ -618,6 +649,9 @@ ORDER BY index_class.relname;""",
                           "UX_LibraryScanJobs_Active_StorageBackend", "IsDeleted=falseANDStorageBackendIdISNOTNULLANDStatusIN'Queued','Running'"
                           "IX_OutboxEvents_Active_Status_NextAttemptAtUtc", "IsDeleted=false"
                           "UX_StreamNodeControlState_Active_Singleton", "IsDeleted=falseANDSingletonKey='primary'"
+                          "IX_PlaybackControlCommands_Active_Generation", "IsDeleted=false"
+                          "UX_Playlists_Active_System_AllStorage", "IsDeleted=falseANDIsActive=trueANDIsSystem=trueANDSource='AllStorage'"
+                          "UX_TrackAssets_Active_Track_Kind", "IsDeleted=false"
                           "UX_AdminUsers_Active_NormalizedUsername", "IsDeleted=false"
                           "UX_AdminSessions_Active_TokenHash", "IsDeleted=falseANDRevokedAtUtcISNULL"
                           "IX_AdminSessions_Active_User_ExpiresAtUtc", "IsDeleted=falseANDRevokedAtUtcISNULL"
@@ -626,7 +660,8 @@ ORDER BY index_class.relname;""",
 
                 Assert.That((auditColumns = expectedAuditColumns), Is.True, sprintf "Audit-column drift. Expected: %A; actual: %A" expectedAuditColumns auditColumns)
                 Assert.That((foreignKeys = expectedForeignKeys), Is.True, sprintf "Foreign-key drift. Expected: %A; actual: %A" expectedForeignKeys foreignKeys)
-                Assert.That((checkConstraints = expectedCheckConstraints), Is.True, sprintf "Check-constraint drift. Expected: %A; actual: %A" expectedCheckConstraints checkConstraints)
+                let actualCheckConstraintNames = checkConstraints |> Set.map (fun (tableName, constraintName, _) -> tableName, constraintName)
+                Assert.That((actualCheckConstraintNames = expectedCheckConstraints), Is.True, sprintf "Check-constraint drift. Expected: %A; actual: %A" expectedCheckConstraints actualCheckConstraintNames)
                 Assert.That((activeIndexPredicates = expectedActiveIndexPredicates), Is.True, sprintf "Active-index predicate drift. Expected: %A; actual: %A" expectedActiveIndexPredicates activeIndexPredicates)
             })
 
@@ -675,7 +710,7 @@ ORDER BY index_class.relname;""",
                           "UX_DonationGoals_Active_Singleton", "DonationGoals", "btree", true, "IsActive", "IsDeleted=falseANDIsActive=true"
                           "UX_LibraryScanJobs_Active_DefaultBackend", "LibraryScanJobs", "btree", true, "1", "IsDeleted=falseANDStorageBackendIdISNULLANDStatusIN'Queued','Running'"
                           "UX_LibraryScanJobs_Active_StorageBackend", "LibraryScanJobs", "btree", true, "StorageBackendId", "IsDeleted=falseANDStorageBackendIdISNOTNULLANDStatusIN'Queued','Running'"
-                          "UX_Playlists_Active_Singleton", "Playlists", "btree", true, "IsActive", "IsDeleted=falseANDIsActive=true"
+                          "UX_Playlists_Active_System_AllStorage", "Playlists", "btree", true, "1", "IsDeleted=falseANDIsActive=trueANDIsSystem=trueANDSource='AllStorage'"
                           "UX_StreamNodeControlState_Active_Singleton", "StreamNodeControlState", "btree", true, "SingletonKey", "IsDeleted=falseANDSingletonKey='primary'" ]
 
                 Assert.That(
@@ -782,7 +817,7 @@ VALUES ('00000000-0000-0000-0000-000000000302', '00000000-0000-0000-0000-0000000
 
                 Assert.That(
                     List.ofSeq versions,
-                    Is.EqualTo(([ 202607080001L; 202607100001L; 202607100002L; 202607100003L; 202607100004L ] : int64 list) :> obj),
+                    Is.EqualTo(([ 202607080001L; 202607100001L; 202607100002L; 202607100003L; 202607100004L; 202607110001L; 202607110002L; 202607110003L; 202607110004L ] : int64 list) :> obj),
                     "A full down/up cycle must restore every migration in version order."
                 )
             })
@@ -812,8 +847,8 @@ INSERT INTO "TrackFiles" ("Id", "TrackId", "StoragePath", "CachePath", "IsCached
 VALUES (@ActiveTrackFileId, @ActiveTrackId, '/library/active.mp3', @ActiveCachePath, true, @NowUtc, @NowUtc, false),
        (@DeletedTrackFileId, @DeletedTrackId, '/library/deleted.mp3', @DeletedCachePath, true, @NowUtc, @NowUtc, false);
 INSERT INTO "PlaybackQueue" ("Id", "TrackId", "Source", "Status", "StartedAtUtc", "RequestedAtUtc", "CreatedAtUtc", "UpdatedAtUtc", "IsDeleted")
-VALUES (@ActiveQueueItemId, @ActiveTrackId, 'playlist', 'Playing', @ActiveStartedAtUtc, @NowUtc, @NowUtc, @NowUtc, false),
-       (@DeletedQueueItemId, @DeletedTrackId, 'playlist', 'Playing', @DeletedStartedAtUtc, @NowUtc, @NowUtc, @NowUtc, false);""",
+VALUES (@ActiveQueueItemId, @ActiveTrackId, 'fallback', 'Playing', @ActiveStartedAtUtc, @NowUtc, @NowUtc, @NowUtc, false),
+       (@DeletedQueueItemId, @DeletedTrackId, 'fallback', 'Playing', @DeletedStartedAtUtc, @NowUtc, @NowUtc, @NowUtc, false);""",
                         connection
                     )
 
@@ -832,7 +867,9 @@ VALUES (@ActiveQueueItemId, @ActiveTrackId, 'playlist', 'Playing', @ActiveStarte
 
                 let! _ = insert.ExecuteNonQueryAsync()
                 use dataSource = NpgsqlDataSource.Create(connectionString)
-                let clock = { new IClock with member _.UtcNow = nowUtc }
+                let timeProvider =
+                    { new TimeProvider() with
+                        member _.GetUtcNow() = nowUtc }
                 let! heartbeatResult =
                     StreamNodeHeartbeatRepository.insertHeartbeat dataSource (Guid.NewGuid()) "Live" nowUtc None "{}" CancellationToken.None
 
@@ -840,7 +877,7 @@ VALUES (@ActiveQueueItemId, @ActiveTrackId, 'playlist', 'Playing', @ActiveStarte
                 | Error error -> Assert.Fail(sprintf "Expected heartbeat setup success, got %A." error)
                 | Ok () -> ()
 
-                let! streamFile = PlayerStateReadModel.loadStreamFile dataSource clock CancellationToken.None
+                let! streamFile = PlayerStateReadModel.loadStreamFile dataSource timeProvider CancellationToken.None
 
                 match streamFile with
                 | Ok(Some file) -> Assert.That(file.CachePath, Is.EqualTo(activeCachePath))
@@ -852,8 +889,7 @@ VALUES (@ActiveQueueItemId, @ActiveTrackId, 'playlist', 'Playing', @ActiveStarte
     let ``UUIDv7 identifiers retain version bits after PostgreSQL uuid persistence`` () =
         DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
             task {
-                let idGenerator = UuidV7IdGenerator() :> IIdGenerator
-                let generatedId = idGenerator.NewId()
+                let generatedId = Uuid.CreateVersion7().ToGuidBigEndian()
                 let nowUtc = DateTimeOffset(2026, 7, 10, 12, 0, 0, TimeSpan.Zero)
                 let versionNibble = int (generatedId.ToByteArray(true)[6] >>> 4)
                 Assert.That(versionNibble, Is.EqualTo(7), "New domain identifiers must be RFC9562 UUIDv7 values.")
@@ -1244,12 +1280,26 @@ WHERE "Id" IN (@GoalOldId, @GoalUpdatedWinnerId, @GoalCreatedWinnerId, @GoalIdTi
                     task {
                         use insert =
                             new NpgsqlCommand(
-                                """INSERT INTO "Playlists" ("Id", "Name", "IsActive", "CreatedAtUtc", "UpdatedAtUtc", "IsDeleted")
-VALUES ('00000000-0000-0000-0000-000000000504', 'migration playlist uniqueness probe', true, @Timestamp, @Timestamp, false);""",
+                                """INSERT INTO "Playlists" ("Id", "Name", "IsActive", "IsSystem", "Source", "CreatedAtUtc", "UpdatedAtUtc", "IsDeleted")
+VALUES ('00000000-0000-0000-0000-000000000504', 'migration playlist uniqueness probe', true, true, 'AllStorage', @Timestamp, @Timestamp, false);""",
                                 connection
                             )
 
                         insert.Parameters.AddWithValue("Timestamp", timestamp.AddHours(1.0)) |> ignore
+                        let! _ = insert.ExecuteNonQueryAsync()
+                        return ()
+                    }
+
+                let insertSecondActivePlaylist () =
+                    task {
+                        use insert =
+                            new NpgsqlCommand(
+                                """INSERT INTO "Playlists" ("Id", "Name", "IsActive", "IsSystem", "Source", "CreatedAtUtc", "UpdatedAtUtc", "IsDeleted")
+VALUES ('00000000-0000-0000-0000-000000000505', 'migration playlist uniqueness probe two', true, true, 'AllStorage', @Timestamp, @Timestamp, false);""",
+                                connection
+                            )
+
+                        insert.Parameters.AddWithValue("Timestamp", timestamp.AddHours(2.0)) |> ignore
                         let! _ = insert.ExecuteNonQueryAsync()
                         return ()
                     }
@@ -1268,7 +1318,8 @@ VALUES ('00000000-0000-0000-0000-000000000515', 'migration goal uniqueness probe
                         return ()
                     }
 
-                do! assertPostgresViolation "23505" "A second active Playlist" insertActivePlaylist
+                do! insertActivePlaylist ()
+                do! assertPostgresViolation "23505" "A second active system AllStorage Playlist" insertSecondActivePlaylist
                 do! assertPostgresViolation "23505" "A second active DonationGoal" insertActiveGoal
             })
 

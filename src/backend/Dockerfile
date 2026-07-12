@@ -3,6 +3,7 @@ WORKDIR /src
 
 COPY Web10.Radio.sln ./
 COPY Web10.Radio.API/Web10.Radio.API.fsproj Web10.Radio.API/
+COPY Web10.Radio.Application/Web10.Radio.Application.fsproj Web10.Radio.Application/
 COPY Web10.Radio.Database/Web10.Radio.Database.fsproj Web10.Radio.Database/
 COPY Web10.Radio.Telegram/Web10.Radio.Telegram.fsproj Web10.Radio.Telegram/
 COPY Web10.Radio.Tests/Web10.Radio.Tests.fsproj Web10.Radio.Tests/

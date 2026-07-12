@@ -39,7 +39,7 @@ rtmp_target = "#{rtmp_url}#{rtmp_key}"
 captured_video = input.ffmpeg(
   id="web10-video",
   format="x11grab",
-  int_args=[("framerate", framerate)],
+  int_args=[("framerate", framerate), ("draw_mouse", 0)],
   string_args=[("video_size", "#{width}x#{height}")],
   display
 )

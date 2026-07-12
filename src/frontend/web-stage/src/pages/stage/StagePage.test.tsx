@@ -39,6 +39,30 @@ describe('StagePage', () => {
     expect(screen.queryByText('FOLLOW US')).toBeNull();
   });
 
+  test('capture mode hides the document cursor and cleans up on exit', () => {
+    const fake = makeFakeConnector();
+    const view = render(
+      <StagePage
+        createScene={fakeScene}
+        connector={fake.connector}
+        fetchImpl={rejectingFetch}
+        captureEnabled
+      />,
+    );
+    expect(document.documentElement.classList.contains('capture-mode')).toBe(true);
+    view.rerender(
+      <StagePage
+        createScene={fakeScene}
+        connector={fake.connector}
+        fetchImpl={rejectingFetch}
+        captureEnabled={false}
+      />,
+    );
+    expect(document.documentElement.classList.contains('capture-mode')).toBe(false);
+    view.unmount();
+    expect(document.documentElement.classList.contains('capture-mode')).toBe(false);
+  });
+
   test('renders live data and fires a donation toast on a new donation', async () => {
     const fake = makeFakeConnector();
     render(

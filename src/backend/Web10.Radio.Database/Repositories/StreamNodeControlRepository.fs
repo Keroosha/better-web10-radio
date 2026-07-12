@@ -17,6 +17,13 @@ type StreamNodeControlState =
       CreatedAtUtc: DateTimeOffset
       UpdatedAtUtc: DateTimeOffset }
 
+type StreamNodePlaybackCommand =
+    { Generation: int64
+      Action: string
+      QueueItemId: Guid
+      ClaimOwner: Guid
+      ClaimAttempt: int }
+
 module StreamNodeControlRepository =
     let private databaseError operation (ex: exn) = DatabaseError(operation, ex.Message)
 
@@ -135,5 +142,45 @@ RETURNING "Id", "DesiredState", "RestartGeneration", "CreatedAtUtc", "UpdatedAtU
                     with
                     | :? OperationCanceledException as ex when token.IsCancellationRequested -> return raise ex
                     | ex -> return Error(databaseError "StreamNodeControlRepository.restart" ex)
+                })
+            cancellationToken
+
+    let getPlaybackCommands
+        (dataSource: NpgsqlDataSource)
+        (afterGeneration: int64)
+        (limit: int)
+        (cancellationToken: CancellationToken)
+        : Task<Result<StreamNodePlaybackCommand list * int64, RepositoryError>> =
+        DatabaseSession.withTransactionResult
+            dataSource
+            (fun connection transaction token ->
+                task {
+                    try
+                        use command = new NpgsqlCommand("""SELECT "Generation", "Action", "QueueItemId", "ClaimOwner", "ClaimAttempt"
+FROM "PlaybackControlCommands"
+WHERE "IsDeleted" = false AND "Generation" > @AfterGeneration
+ORDER BY "Generation" ASC
+LIMIT @Limit;""", connection, transaction)
+                        command.Parameters.AddWithValue("AfterGeneration", afterGeneration) |> ignore
+                        command.Parameters.AddWithValue("Limit", limit) |> ignore
+                        use! reader = command.ExecuteReaderAsync(token)
+                        let values = ResizeArray<StreamNodePlaybackCommand>()
+                        let mutable reading = true
+                        while reading do
+                            let! found = reader.ReadAsync(token)
+                            if found then
+                                values.Add
+                                    { Generation = reader.GetInt64(0)
+                                      Action = reader.GetString(1).ToLowerInvariant()
+                                      QueueItemId = reader.GetGuid(2)
+                                      ClaimOwner = reader.GetGuid(3)
+                                      ClaimAttempt = reader.GetInt32(4) }
+                            else
+                                reading <- false
+                        let nextGeneration = if values.Count = 0 then afterGeneration else values[values.Count - 1].Generation
+                        return Ok(List.ofSeq values, nextGeneration)
+                    with
+                    | :? OperationCanceledException as ex when token.IsCancellationRequested -> return raise ex
+                    | ex -> return Error(databaseError "StreamNodeControlRepository.getPlaybackCommands" ex)
                 })
             cancellationToken

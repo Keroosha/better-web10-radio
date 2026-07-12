@@ -17,11 +17,6 @@ module ConfigurationTests =
 
     let private requiredEnvironmentVariables =
         [ "WEB10_POSTGRES__CONNECTION_STRING"
-          "WEB10_TELEGRAM__BOT_TOKEN"
-          "WEB10_TELEGRAM__WEBHOOK_SECRET"
-          "WEB10_TELEGRAM__CHANNEL_ID_OR_USERNAME"
-          "WEB10_TELEGRAM__REQUEST_PRICE_STARS"
-          "WEB10_TELEGRAM__SAY_PRICE_STARS"
           "WEB10_STREAM__RTMP_URL"
           "WEB10_STREAM__RTMP_KEY"
           "WEB10_STREAM__STAGE_URL"
@@ -35,16 +30,12 @@ module ConfigurationTests =
     let private configurationPairs (root: string) =
         Map.ofList
             [ "POSTGRES:CONNECTION_STRING", "Host=127.0.0.1;Port=5432;Database=web10;Username=web10;Password=postgres-secret-42"
-              "TELEGRAM:BOT_TOKEN", "123456:AbcdefghijklmnopQRSTuvwx"
-              "TELEGRAM:WEBHOOK_SECRET", "webhook-Secret_12345"
-              "TELEGRAM:CHANNEL_ID_OR_USERNAME", "@netscapedidnothingwrong"
-              "TELEGRAM:REQUEST_PRICE_STARS", "100"
-              "TELEGRAM:SAY_PRICE_STARS", "50"
               "STREAM:RTMP_URL", "rtmps://dc4-1.rtmp.t.me/s/"
               "STREAM:RTMP_KEY", "rtmp-key-Secret_12345"
               "STREAM:STAGE_URL", "https://stage.web10.radio/"
               "STREAM:CALLBACK_TOKEN", "stream-callback-token-Secret_123456"
               "STORAGE:TYPE", "Local"
+              "STORAGE:CACHE_ROOT", Path.Combine(root, "cache")
               "STORAGE:LOCAL_ROOT", Path.Combine(root, "library")
               "ADMIN:USERNAME", "test-admin"
               "ADMIN:PASSWORD", "test-admin-password-1234567890"
@@ -70,8 +61,6 @@ module ConfigurationTests =
 
     let private assertNoSecretsWereLeaked (pairs: Map<string, string>) (message: string) =
         [ "POSTGRES:CONNECTION_STRING"
-          "TELEGRAM:BOT_TOKEN"
-          "TELEGRAM:WEBHOOK_SECRET"
           "STREAM:RTMP_KEY"
           "STREAM:CALLBACK_TOKEN"
           "ADMIN:PASSWORD" ]
@@ -139,30 +128,6 @@ module ConfigurationTests =
           { Name = "OTLP URI uses a disallowed scheme"
             Overrides = [ "OTEL:EXPORTER_OTLP_ENDPOINT", Some "ftp://otel.web10.radio/v1/traces" ]
             ExpectedErrorFragments = [ "WEB10_OTEL__EXPORTER_OTLP_ENDPOINT" ] }
-          { Name = "Telegram token has invalid syntax"
-            Overrides = [ "TELEGRAM:BOT_TOKEN", Some "telegram-token-secret" ]
-            ExpectedErrorFragments = [ "WEB10_TELEGRAM__BOT_TOKEN" ] }
-          { Name = "Telegram channel has invalid syntax"
-            Overrides = [ "TELEGRAM:CHANNEL_ID_OR_USERNAME", Some "@bad!" ]
-            ExpectedErrorFragments = [ "WEB10_TELEGRAM__CHANNEL_ID_OR_USERNAME" ] }
-          { Name = "Telegram request price is required"
-            Overrides = [ "TELEGRAM:REQUEST_PRICE_STARS", None ]
-            ExpectedErrorFragments = [ "WEB10_TELEGRAM__REQUEST_PRICE_STARS must be a positive 32-bit integer." ] }
-          { Name = "Telegram say price is required"
-            Overrides = [ "TELEGRAM:SAY_PRICE_STARS", None ]
-            ExpectedErrorFragments = [ "WEB10_TELEGRAM__SAY_PRICE_STARS must be a positive 32-bit integer." ] }
-          { Name = "Telegram request price must be an integer"
-            Overrides = [ "TELEGRAM:REQUEST_PRICE_STARS", Some "100.0" ]
-            ExpectedErrorFragments = [ "WEB10_TELEGRAM__REQUEST_PRICE_STARS must be a positive 32-bit integer." ] }
-          { Name = "Telegram say price must be an integer"
-            Overrides = [ "TELEGRAM:SAY_PRICE_STARS", Some "fifty" ]
-            ExpectedErrorFragments = [ "WEB10_TELEGRAM__SAY_PRICE_STARS must be a positive 32-bit integer." ] }
-          { Name = "Telegram request price must be positive"
-            Overrides = [ "TELEGRAM:REQUEST_PRICE_STARS", Some "0" ]
-            ExpectedErrorFragments = [ "WEB10_TELEGRAM__REQUEST_PRICE_STARS must be a positive 32-bit integer." ] }
-          { Name = "Telegram say price must be positive"
-            Overrides = [ "TELEGRAM:SAY_PRICE_STARS", Some "-50" ]
-            ExpectedErrorFragments = [ "WEB10_TELEGRAM__SAY_PRICE_STARS must be a positive 32-bit integer." ] }
           { Name = "S3 bucket has invalid syntax"
             Overrides =
                 [ "STORAGE:TYPE", Some "S3"
@@ -267,79 +232,6 @@ module ConfigurationTests =
             requiredEnvironmentVariables
             |> List.iter (fun environmentVariable -> Assert.That(message, Does.Contain(environmentVariable)))
 
-    [<Test>]
-    let ``load reads configured Telegram Stars prices`` () =
-        withTemporaryDirectory (fun root ->
-            match Configuration.load (configurationPairs root |> buildConfiguration) with
-            | Ok options ->
-                Assert.That(options.Telegram.RequestPriceStars, Is.EqualTo(100))
-                Assert.That(options.Telegram.SayPriceStars, Is.EqualTo(50))
-            | Error errors -> Assert.Fail(sprintf "Expected configured Telegram Stars prices to be accepted, but got %s." (joinedErrors errors)))
-
-    [<Test>]
-    let ``load defaults an omitted Telegram update mode to Webhook`` () =
-        withTemporaryDirectory (fun root ->
-            match Configuration.load (configurationPairs root |> buildConfiguration) with
-            | Ok options -> Assert.That(options.Telegram.UpdateMode, Is.EqualTo(Web10.Radio.Telegram.TelegramUpdateMode.Webhook))
-            | Error errors -> Assert.Fail(sprintf "Expected omitted Telegram update mode to default to Webhook, but got %s." (joinedErrors errors)))
-
-    [<Test>]
-    let ``load accepts only the exact LongPolling Telegram update mode`` () =
-        withTemporaryDirectory (fun root ->
-            let pairs = configurationPairs root |> Map.add "TELEGRAM:UPDATE_MODE" "LongPolling"
-
-            match Configuration.load (buildConfiguration pairs) with
-            | Ok options -> Assert.That(options.Telegram.UpdateMode, Is.EqualTo(Web10.Radio.Telegram.TelegramUpdateMode.LongPolling))
-            | Error errors -> Assert.Fail(sprintf "Expected exact LongPolling Telegram update mode to be accepted, but got %s." (joinedErrors errors)))
-
-    [<Test>]
-    let ``load rejects an invalid Telegram update mode without leaking its value or configured secrets`` () =
-        withTemporaryDirectory (fun root ->
-            let invalidMode = "invalid-update-mode-secret-987654"
-            let pairs = configurationPairs root |> Map.add "TELEGRAM:UPDATE_MODE" invalidMode
-
-            match Configuration.load (buildConfiguration pairs) with
-            | Ok _ -> Assert.Fail("Expected an invalid Telegram update mode to be rejected.")
-            | Error errors ->
-                let message = joinedErrors errors
-                Assert.That(errors, Is.EqualTo(box [ "WEB10_TELEGRAM__UPDATE_MODE must be exactly Webhook or LongPolling." ]))
-                Assert.That(message, Does.Not.Contain(invalidMode), "Configuration diagnostics must not echo the invalid update-mode value.")
-                assertNoSecretsWereLeaked pairs message)
-
-    [<Test>]
-    let ``load aggregates exact Telegram Stars price diagnostics`` () =
-        withTemporaryDirectory (fun root ->
-            let pairs =
-                configurationPairs root
-                |> Map.remove "TELEGRAM:REQUEST_PRICE_STARS"
-                |> Map.add "TELEGRAM:SAY_PRICE_STARS" "0"
-
-            match Configuration.load (buildConfiguration pairs) with
-            | Ok _ -> Assert.Fail("Expected missing and non-positive Telegram Stars prices to be rejected.")
-            | Error errors ->
-                let expected =
-                    Set.ofList
-                        [ "WEB10_TELEGRAM__REQUEST_PRICE_STARS must be a positive 32-bit integer."
-                          "WEB10_TELEGRAM__SAY_PRICE_STARS must be a positive 32-bit integer." ]
-
-                let hasExactErrors = (errors |> Set.ofList) = expected
-                Assert.That(hasExactErrors, Is.True))
-
-    [<Test>]
-    let ``load rejects every Telegram Stars price validation failure with exact diagnostics`` () =
-        withTemporaryDirectory (fun root ->
-            let baseline = configurationPairs root
-
-            invalidConfigurationCases root
-            |> List.filter (fun case -> case.Name.StartsWith("Telegram ", StringComparison.Ordinal) && case.Name.Contains(" price ", StringComparison.Ordinal))
-            |> List.iter (fun case ->
-                let pairs = baseline |> applyOverrides <| case.Overrides
-
-                match Configuration.load (buildConfiguration pairs) with
-                | Ok _ -> Assert.Fail(sprintf "%s: expected Telegram Stars price validation failure." case.Name)
-                | Error errors ->
-                    let hasExactErrors = errors = case.ExpectedErrorFragments
-                    Assert.That(hasExactErrors, Is.True, sprintf "%s: expected only the exact Telegram Stars price diagnostic." case.Name)))
 
     [<Test>]
     let ``load rejects every semantic invalid configuration category without leaking secrets`` () =

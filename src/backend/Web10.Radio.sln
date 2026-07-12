@@ -13,6 +13,8 @@ Project("{F2A71F9B-5D33-465A-A702-920D77279786}") = "Web10.Radio.Tests", "Web10.
 EndProject
 Project("{F2A71F9B-5D33-465A-A702-920D77279786}") = "Web10.Radio.Migrator", "Web10.Radio.Migrator\Web10.Radio.Migrator.fsproj", "{D5C47A4B-6C3D-46A5-A181-4C5FA8607D64}"
 EndProject
+Project("{F2A71F9B-5D33-465A-A702-920D77279786}") = "Web10.Radio.Application", "Web10.Radio.Application\Web10.Radio.Application.fsproj", "{8DCC5C34-8F51-4776-9A93-B068E702B168}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -83,6 +85,18 @@ Global
 		{D5C47A4B-6C3D-46A5-A181-4C5FA8607D64}.Release|x64.Build.0 = Release|Any CPU
 		{D5C47A4B-6C3D-46A5-A181-4C5FA8607D64}.Release|x86.ActiveCfg = Release|Any CPU
 		{D5C47A4B-6C3D-46A5-A181-4C5FA8607D64}.Release|x86.Build.0 = Release|Any CPU
+    {8DCC5C34-8F51-4776-9A93-B068E702B168}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+    {8DCC5C34-8F51-4776-9A93-B068E702B168}.Debug|Any CPU.Build.0 = Debug|Any CPU
+    {8DCC5C34-8F51-4776-9A93-B068E702B168}.Debug|x64.ActiveCfg = Debug|Any CPU
+    {8DCC5C34-8F51-4776-9A93-B068E702B168}.Debug|x64.Build.0 = Debug|Any CPU
+    {8DCC5C34-8F51-4776-9A93-B068E702B168}.Debug|x86.ActiveCfg = Debug|Any CPU
+    {8DCC5C34-8F51-4776-9A93-B068E702B168}.Debug|x86.Build.0 = Debug|Any CPU
+    {8DCC5C34-8F51-4776-9A93-B068E702B168}.Release|Any CPU.ActiveCfg = Release|Any CPU
+    {8DCC5C34-8F51-4776-9A93-B068E702B168}.Release|Any CPU.Build.0 = Release|Any CPU
+    {8DCC5C34-8F51-4776-9A93-B068E702B168}.Release|x64.ActiveCfg = Release|Any CPU
+    {8DCC5C34-8F51-4776-9A93-B068E702B168}.Release|x64.Build.0 = Release|Any CPU
+    {8DCC5C34-8F51-4776-9A93-B068E702B168}.Release|x86.ActiveCfg = Release|Any CPU
+    {8DCC5C34-8F51-4776-9A93-B068E702B168}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

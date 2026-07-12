@@ -13,12 +13,16 @@
     <Compile Include="Migrations\TrackDuplicateCleanup.fs" />
     <Compile Include="Migrations\TelegramBotPayments.fs" />
     <Compile Include="Migrations\FrontendBlockers.fs" />
+    <Compile Include="Migrations\TrackMetadataAndAssets.fs" />
+    <Compile Include="Migrations\PlaybackControlCommands.fs" />
+    <Compile Include="Migrations\PlaylistPolicies.fs" />
+    <Compile Include="Migrations\TelegramServiceOutboxPartition.fs" />
     <Compile Include="Repositories\RepositoryError.fs" />
     <Compile Include="Repositories\AdminIdentityRepository.fs" />
+    <Compile Include="Repositories\OutboxEventRepository.fs" />
     <Compile Include="Repositories\AdminContentRepository.fs" />
     <Compile Include="Repositories\StreamNodeControlRepository.fs" />
     <Compile Include="Repositories\TrackRepository.fs" />
-    <Compile Include="Repositories\OutboxEventRepository.fs" />
     <Compile Include="Repositories\TelegramUpdateInboxRepository.fs" />
     <Compile Include="Repositories\LibraryScanRepository.fs" />
     <Compile Include="Repositories\PaymentRepository.fs" />
@@ -31,6 +35,7 @@
 
   <ItemGroup>
     <PackageReference Include="FsToolkit.ErrorHandling" Version="5.2.0" />
+    <PackageReference Include="Dodo.Primitives" Version="5.0.0" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.9" />
     <PackageReference Include="FluentMigrator" Version="8.0.1" />
     <PackageReference Include="Npgsql" Version="10.0.3" />

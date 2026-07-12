@@ -4,6 +4,7 @@ namespace Web10.Radio.API
 
 open System
 open System.Collections.Generic
+open System.IO
 open System.Threading
 open System.Threading.Tasks
 open Amazon
@@ -15,15 +16,28 @@ type S3ObjectDescriptor =
     { Key: string
       SizeBytes: int64 }
 
-type IS3ObjectEnumerator =
+type IS3ObjectStorage =
     abstract member VisitPagesAsync:
         bucketName: string *
         visitPage: (IReadOnlyList<S3ObjectDescriptor> -> CancellationToken -> Task) *
-        cancellationToken: CancellationToken ->
-            Task
+        cancellationToken: CancellationToken -> Task
 
     abstract member ProbeBucketAsync: bucketName: string * cancellationToken: CancellationToken -> Task
 
+    abstract member DownloadToFileAsync:
+        bucketName: string * key: string * destination: string * cancellationToken: CancellationToken -> Task
+
+module S3KeyValidation =
+    let isCanonical (key: string) =
+        not (String.IsNullOrWhiteSpace key)
+        && not (key.Contains("\u0000", StringComparison.Ordinal))
+        && not (key.Contains("\\", StringComparison.Ordinal))
+        && (key.Split('/', StringSplitOptions.None)
+            |> Array.forall (fun segment -> not (String.IsNullOrEmpty segment) && segment <> "." && segment <> ".."))
+
+    let requireCanonical key =
+        if not (isCanonical key) then
+            raise (ArgumentException("S3 object key is not canonical.", nameof key))
 
 type S3ObjectEnumerator(client: IAmazonS3) =
     let listPage bucketName maxKeys continuationToken cancellationToken =
@@ -36,7 +50,7 @@ type S3ObjectEnumerator(client: IAmazonS3) =
 
         client.ListObjectsV2Async(request, cancellationToken)
 
-    interface IS3ObjectEnumerator with
+    interface IS3ObjectStorage with
         member _.VisitPagesAsync(bucketName, visitPage, cancellationToken) =
             task {
                 ArgumentException.ThrowIfNullOrWhiteSpace bucketName
@@ -70,7 +84,6 @@ type S3ObjectEnumerator(client: IAmazonS3) =
             }
             :> Task
 
-
         member _.ProbeBucketAsync(bucketName, cancellationToken) =
             task {
                 ArgumentException.ThrowIfNullOrWhiteSpace bucketName
@@ -80,7 +93,24 @@ type S3ObjectEnumerator(client: IAmazonS3) =
             }
             :> Task
 
-type private DeferredS3ObjectEnumerator(options: StorageOptions) =
+        member _.DownloadToFileAsync(bucketName, key, destination, cancellationToken) =
+            task {
+                ArgumentException.ThrowIfNullOrWhiteSpace bucketName
+                S3KeyValidation.requireCanonical key
+                ArgumentException.ThrowIfNullOrWhiteSpace destination
+                cancellationToken.ThrowIfCancellationRequested()
+
+                let request = GetObjectRequest(BucketName = bucketName, Key = key)
+                use! response = client.GetObjectAsync(request, cancellationToken)
+                use input = response.ResponseStream
+                use output = new FileStream(destination, FileMode.Create, FileAccess.Write, FileShare.None, 128 * 1024, FileOptions.Asynchronous ||| FileOptions.SequentialScan)
+                do! input.CopyToAsync(output, 128 * 1024, cancellationToken)
+                do! output.FlushAsync(cancellationToken)
+            }
+            :> Task
+
+
+type private DeferredS3ObjectStorage(options: StorageOptions) =
     let client =
         lazy
             if options.Type = S3 then
@@ -94,16 +124,17 @@ type private DeferredS3ObjectEnumerator(options: StorageOptions) =
 
                 new AmazonS3Client(config) :> IAmazonS3
             else
-                // A non-default S3 StorageBackends row uses the standard AWS credential and region provider chains.
                 new AmazonS3Client() :> IAmazonS3
 
-    let implementation = lazy (new S3ObjectEnumerator(client.Value) :> IS3ObjectEnumerator)
+    let implementation = lazy (new S3ObjectEnumerator(client.Value) :> IS3ObjectStorage)
 
-    interface IS3ObjectEnumerator with
+    interface IS3ObjectStorage with
         member _.VisitPagesAsync(bucketName, visitPage, cancellationToken) =
             implementation.Value.VisitPagesAsync(bucketName, visitPage, cancellationToken)
         member _.ProbeBucketAsync(bucketName, cancellationToken) =
             implementation.Value.ProbeBucketAsync(bucketName, cancellationToken)
+        member _.DownloadToFileAsync(bucketName, key, destination, cancellationToken) =
+            implementation.Value.DownloadToFileAsync(bucketName, key, destination, cancellationToken)
 
     interface IDisposable with
         member _.Dispose() =
@@ -113,4 +144,4 @@ type private DeferredS3ObjectEnumerator(options: StorageOptions) =
 [<RequireQualifiedAccess>]
 module S3StorageComposition =
     let addS3ObjectStorage (options: StorageOptions) (services: IServiceCollection) =
-        services.AddSingleton<IS3ObjectEnumerator>(fun _ -> new DeferredS3ObjectEnumerator(options) :> IS3ObjectEnumerator)
+        services.AddSingleton<IS3ObjectStorage>(fun _ -> new DeferredS3ObjectStorage(options) :> IS3ObjectStorage)

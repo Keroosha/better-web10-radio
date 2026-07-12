@@ -11,6 +11,8 @@ const tracks = [
     album: 'Launch set',
     durationMs: 184000,
     hasCachedFile: true,
+    coverImageUrl: '/api/v0/player/assets/cover/018f0aaa-0000-7000-8000-000000000020',
+    metadataSource: 'embedded' as const,
   },
   {
     id: '018f0aaa-0000-7000-8000-000000000021',
@@ -19,16 +21,52 @@ const tracks = [
     album: 'Launch set',
     durationMs: 198000,
     hasCachedFile: true,
+    coverImageUrl: '/api/v0/player/assets/cover/018f0aaa-0000-7000-8000-000000000021',
+    metadataSource: 'filename' as const,
   },
 ];
+
+const playlistPolicy = {
+  type: 'general' as const,
+  source: 'manual' as const,
+  order: 'sequential' as const,
+  weight: 3,
+  isJingle: false,
+  interrupt: false,
+  avoidDuplicates: true,
+  playEverySongs: null,
+  playEveryMinutes: null,
+  playAtMinute: null,
+  schedules: [],
+};
+
+const playlistMutation = {
+  name: 'Launch rotation',
+  description: 'Morning and night',
+  isActive: true,
+  ...playlistPolicy,
+};
 
 const playlist = {
   id: '018f0aaa-0000-7000-8000-000000000030',
   name: 'Launch rotation',
   description: 'Morning and night',
   isActive: true,
+  type: 'general' as const,
+  source: 'manual' as const,
+  order: 'sequential' as const,
+  weight: 3,
+  isJingle: false,
+  interrupt: false,
+  avoidDuplicates: true,
+  playEverySongs: null,
+  playEveryMinutes: null,
+  playAtMinute: null,
+  schedules: [],
+  isSystem: false,
   itemCount: 2,
 };
+
 
 const items = [
   {
@@ -75,14 +113,14 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-test('searches scanned tracks and queues the selected track without waiting for a payment', async () => {
+test('lists the scanned library up front, narrows by search, and queues without waiting for a payment', async () => {
   const calls: RequestCall[] = [];
   vi.stubGlobal('fetch', (input: RequestInfo | URL, init?: RequestInit) => {
     const path = pathOf(input);
     const method = init?.method ?? 'GET';
     calls.push({ path, method, body: typeof init?.body === 'string' ? init.body : null });
     if (path.startsWith('/api/v0/admin/tracks')) {
-      return Promise.resolve(json(tracks));
+      return Promise.resolve(json({ items: tracks, nextCursor: null }));
     }
     if (path === '/api/v0/admin/playback/queue') {
       return Promise.resolve(json({ queueItemId: '018f0aaa-0000-7000-8000-000000000040' }, 202));
@@ -94,14 +132,18 @@ test('searches scanned tracks and queues the selected track without waiting for 
   });
 
   render(<PlaylistsPage />);
-  await screen.findByLabelText('Track search');
-  fireEvent.change(screen.getByLabelText('Track search'), { target: { value: 'Dawn' } });
-  fireEvent.click(screen.getByRole('button', { name: 'Search tracks' }));
+  // List-first: the full library loads on mount with an empty query.
   await screen.findByText('Dawn signal');
-  fireEvent.click(screen.getByRole('button', { name: 'Queue Dawn signal now' }));
+  expect(calls.some((call) => call.path === '/api/v0/admin/tracks?query=&limit=100')).toBe(true);
 
+  // Typing narrows the list via a debounced server query.
+  fireEvent.change(screen.getByLabelText('Track search'), { target: { value: 'Dawn' } });
+  await waitFor(() =>
+    expect(calls.some((call) => call.path === '/api/v0/admin/tracks?query=Dawn&limit=100')).toBe(true),
+  );
+
+  fireEvent.click(screen.getByRole('button', { name: 'Queue Dawn signal now' }));
   await waitFor(() => expect(screen.getByText('Queued')).toBeTruthy());
-  expect(calls.some((call) => call.path === '/api/v0/admin/tracks?query=Dawn&limit=100')).toBe(true);
   const enqueue = calls.find((call) => call.path === '/api/v0/admin/playback/queue');
   expect(enqueue?.body).toBe(JSON.stringify({ trackId: tracks[0]!.id }));
 });
@@ -125,7 +167,7 @@ test('creates and edits the active playlist with its pinned request shape', asyn
     if (path === `/api/v0/admin/playlists/${playlist.id}/items`) {
       return Promise.resolve(json([]));
     }
-    return Promise.resolve(json(tracks));
+    return Promise.resolve(json({ items: tracks, nextCursor: null }));
   });
 
   render(<PlaylistsPage />);
@@ -145,12 +187,15 @@ test('creates and edits the active playlist with its pinned request shape', asyn
 
   await waitFor(() => expect(screen.getByText('Saved')).toBeTruthy());
   const create = calls.find((call) => call.path === '/api/v0/admin/playlists' && call.method === 'POST');
-  expect(create?.body).toBe(
-    JSON.stringify({ name: 'Launch rotation', description: 'Morning and night', isActive: true }),
-  );
+  expect(create?.body).toBe(JSON.stringify(playlistMutation));
   const update = calls.find((call) => call.path === `/api/v0/admin/playlists/${playlist.id}` && call.method === 'PUT');
   expect(update?.body).toBe(
-    JSON.stringify({ name: 'Updated rotation', description: null, isActive: false }),
+    JSON.stringify({
+      name: 'Updated rotation',
+      description: null,
+      isActive: false,
+      ...playlistPolicy,
+    }),
   );
 });
 
@@ -169,7 +214,12 @@ test('reorders and removes playlist items by replacing the remaining ordered col
     if (path === `/api/v0/admin/playlists/${playlist.id}/items` && method === 'PUT') {
       return Promise.resolve(json([items[1]]));
     }
-    return Promise.resolve(json(tracks));
+    // The track picker loads the library; keep it empty so its rows do not collide
+    // with the playlist-item titles this test asserts on.
+    if (path.startsWith('/api/v0/admin/tracks')) {
+      return Promise.resolve(json({ items: [], nextCursor: null }));
+    }
+    return Promise.resolve(json([]));
   });
 
   render(<PlaylistsPage />);

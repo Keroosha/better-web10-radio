@@ -1,3 +1,18 @@
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+WORKDIR /src
+
+COPY Web10.Radio.StreamNode/Web10.Radio.StreamNode.fsproj Web10.Radio.StreamNode/
+COPY Web10.Radio.StreamNode.Tools/Web10.Radio.StreamNode.Tools.fsproj Web10.Radio.StreamNode.Tools/
+RUN dotnet restore Web10.Radio.StreamNode/Web10.Radio.StreamNode.fsproj
+COPY . .
+RUN dotnet publish Web10.Radio.StreamNode/Web10.Radio.StreamNode.fsproj \
+    --configuration Release \
+    --runtime linux-x64 \
+    --self-contained true \
+    -p:PublishTrimmed=false \
+    -p:PublishSingleFile=false \
+    --output /app/publish
+
 FROM debian:trixie-slim
 
 ARG LIQUIDSOAP_DEB_URL="https://github.com/savonet/liquidsoap/releases/download/v2.4.0/liquidsoap_2.4.0-debian-trixie-ocaml4.14.2-3_amd64.deb"
@@ -7,9 +22,9 @@ ARG DMO_KEYRING_DEB_SHA256="8dc6cbb266c701cfe58bd1d2eb9fe2245a1d6341c7110cfbfe3a
 
 RUN set -eu; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates python3 gpgv; \
+    apt-get install -y --no-install-recommends ca-certificates curl gpgv; \
     keyring_deb=/tmp/deb-multimedia-keyring.deb; \
-    python3 -c "from urllib.request import urlretrieve; urlretrieve('${DMO_KEYRING_DEB_URL}', '${keyring_deb}')"; \
+    curl --fail --location --proto '=https' --tlsv1.2 "${DMO_KEYRING_DEB_URL}" --output "${keyring_deb}"; \
     printf '%s  %s\n' "${DMO_KEYRING_DEB_SHA256}" "${keyring_deb}" | sha256sum --check --status -; \
     dpkg -i "${keyring_deb}"; \
     rm -f "${keyring_deb}"; \
@@ -26,25 +41,26 @@ RUN set -eu; \
         ffmpeg \
         xvfb \
         dumb-init \
-        socat; \
+        socat \
+        unclutter-xfixes; \
     liquidsoap_deb=/tmp/liquidsoap.deb; \
-    python3 -c "from urllib.request import urlretrieve; urlretrieve('${LIQUIDSOAP_DEB_URL}', '${liquidsoap_deb}')"; \
+    curl --fail --location --proto '=https' --tlsv1.2 "${LIQUIDSOAP_DEB_URL}" --output "${liquidsoap_deb}"; \
     printf '%s  %s\n' "${LIQUIDSOAP_DEB_SHA256}" "${liquidsoap_deb}" | sha256sum --check --status -; \
     apt-get install -y --no-install-recommends "${liquidsoap_deb}"; \
     rm -f "${liquidsoap_deb}"; \
-    apt-get purge -y deb-multimedia-keyring gpgv; \
+    groupadd --gid 1654 web10; \
+    useradd --uid 1654 --gid 1654 --create-home --home-dir /home/web10 --shell /usr/sbin/nologin web10; \
+    apt-get purge -y curl gpgv deb-multimedia-keyring; \
     rm -f /etc/apt/sources.list.d/dmo.sources; \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/web10/stream-node
-
-COPY scripts/supervisor.py ./scripts/supervisor.py
+COPY --from=build /app/publish/ ./
 COPY scripts/check-runtime.sh ./scripts/check-runtime.sh
-COPY scripts/create-smoke-track.py ./scripts/create-smoke-track.py
 COPY liquidsoap/web10.liq ./liquidsoap/web10.liq
+RUN chmod 0755 ./scripts/check-runtime.sh \
+    && install -d -o 1654 -g 1654 -m 0775 /run/web10 /var/lib/web10/storage /var/lib/web10/cache
 
-RUN chmod 0755 ./scripts/check-runtime.sh ./scripts/create-smoke-track.py \
-    && install -d -m 0775 /run/web10
-
+HEALTHCHECK --interval=2s --timeout=5s --retries=30 --start-period=5s CMD ["./Web10.Radio.StreamNode", "--health-check", "http://127.0.0.1:18080/healthz"]
 ENTRYPOINT ["/usr/bin/dumb-init", "--"]
-CMD ["python3", "./scripts/supervisor.py", "run"]
+CMD ["./Web10.Radio.StreamNode", "run"]

@@ -4,6 +4,8 @@ open System
 open System.Text.Json
 open NUnit.Framework
 open Web10.Radio.API
+open Dodo.Primitives
+open Web10.Radio.Application
 
 module DomainEventTests =
     let private expectedEventLiterals =
@@ -24,19 +26,25 @@ module DomainEventTests =
           "StreamNodeHeartbeatReceived"
           "StreamNodeFailureDetected"
           "AdminGoalChanged"
-          "SocialLinkChanged" ]
+          "SocialLinkChanged"
+          "PlaybackReordered"
+          "PlaybackSkipped"
+          "PlaybackRestarted"
+          "TrackForcePlayed"
+          "AdminTrackQueued"
+          "TrackMetadataChanged"
+          "TrackMaterialized"
+          "PlaylistChanged"
+          "PlaylistTrackQueued" ]
 
-    type private FixedClock(nowUtc: DateTimeOffset) =
-        interface IClock with
-            member _.UtcNow = nowUtc
+    type private FixedTimeProvider(nowUtc: DateTimeOffset) =
+        inherit TimeProvider()
+        override _.GetUtcNow() = nowUtc
 
-    let private idGenerator () = UuidV7IdGenerator() :> IIdGenerator
-
-    let private clockAt value = FixedClock(value) :> IClock
+    let private clockAt value = FixedTimeProvider(value) :> TimeProvider
 
     let private createEnvelope payloadJson =
         DomainEventEnvelope.create
-            (idGenerator ())
             (clockAt (DateTimeOffset(2026, 7, 8, 12, 30, 0, TimeSpan.Zero)))
             DomainEventType.TrackRequested
             "web10.radio.tests"
@@ -100,7 +108,6 @@ module DomainEventTests =
 
         let result =
             DomainEventEnvelope.create
-                (idGenerator ())
                 (clockAt occurredAtUtc)
                 DomainEventType.DonationPaid
                 "web10.radio.tests"

@@ -110,6 +110,8 @@ describe('pinned admin DTO schemas', () => {
       album: '',
       durationMs: 0,
       hasCachedFile: true,
+      coverImageUrl: '',
+      metadataSource: 'filename',
     };
 
     expect(AdminTrackSchema.parse(track)).toEqual(track);
@@ -123,6 +125,18 @@ describe('pinned admin DTO schemas', () => {
       name: 'Night shift',
       description: null,
       isActive: true,
+      type: 'general',
+      source: 'manual',
+      order: 'sequential',
+      weight: 3,
+      isJingle: false,
+      interrupt: false,
+      avoidDuplicates: true,
+      playEverySongs: null,
+      playEveryMinutes: null,
+      playAtMinute: null,
+      schedules: [],
+      isSystem: false,
       itemCount: 0,
     };
 

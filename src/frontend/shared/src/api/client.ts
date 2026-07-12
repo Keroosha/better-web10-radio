@@ -112,15 +112,29 @@ export interface SendRequest<TBody extends object> extends AdminRequestContext {
   /** Injected `fetch` for tests; defaults to the global. */
   readonly fetchImpl?: FetchImpl;
 }
+/** A raw binary or multipart request whose successful response is JSON. */
+export interface UploadRequest<TResponse> extends AdminRequestContext {
+  readonly schema: z.ZodType<TResponse>;
+  readonly method: string;
+  readonly body: BodyInit;
+  /** Explicit media type for raw bodies; omit for FormData so fetch sets its boundary. */
+  readonly contentType?: string;
+  readonly signal?: AbortSignal;
+  readonly fetchImpl?: FetchImpl;
+}
+ 
 
 
 function createHeaders(
   request: AdminRequestContext,
   method: string,
   includesJsonBody: boolean,
+  contentType?: string,
 ): Record<string, string> {
   const headers: Record<string, string> = { Accept: 'application/json' };
-  if (includesJsonBody) {
+  if (contentType !== undefined) {
+    headers['Content-Type'] = contentType;
+  } else if (includesJsonBody) {
     headers['Content-Type'] = 'application/json';
   }
   if (
@@ -143,6 +157,16 @@ function createRequestInit<TBody extends object>(
     headers: createHeaders(request, method, request.body !== undefined),
     ...(request.admin === true ? { credentials: 'include' as const } : {}),
     ...(request.body !== undefined ? { body: JSON.stringify(request.body) } : {}),
+    ...(request.signal ? { signal: request.signal } : {}),
+  };
+}
+
+function createUploadRequestInit<TResponse>(request: UploadRequest<TResponse>): RequestInit {
+  return {
+    method: request.method,
+    headers: createHeaders(request, request.method, false, request.contentType),
+    ...(request.admin === true ? { credentials: 'include' as const } : {}),
+    body: request.body,
     ...(request.signal ? { signal: request.signal } : {}),
   };
 }
@@ -177,6 +201,18 @@ export async function apiFetch<TResponse, TBody extends object = never>(
   return req.schema.parse(await res.json());
 }
 
+/** Perform a raw binary or multipart request and validate its JSON response. */
+export async function apiUpload<TResponse>(
+  path: string,
+  req: UploadRequest<TResponse>,
+): Promise<TResponse> {
+  const doFetch = req.fetchImpl ?? fetch;
+  const res = await doFetch(`${apiBaseUrl}${path}`, createUploadRequestInit(req));
+  if (!res.ok) {
+    return throwForError(res, req);
+  }
+  return req.schema.parse(await res.json());
+}
 /** Perform a request that returns no body on success (such as `204`). */
 export async function apiSend<TBody extends object>(
   path: string,

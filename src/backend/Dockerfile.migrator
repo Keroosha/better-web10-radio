@@ -1,5 +1,6 @@
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
+COPY Web10.Radio.Application/Web10.Radio.Application.fsproj Web10.Radio.Application/
 COPY Web10.Radio.Database/Web10.Radio.Database.fsproj Web10.Radio.Database/
 COPY Web10.Radio.Migrator/Web10.Radio.Migrator.fsproj Web10.Radio.Migrator/
 RUN dotnet restore Web10.Radio.Migrator/Web10.Radio.Migrator.fsproj

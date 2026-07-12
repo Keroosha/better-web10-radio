@@ -16,3 +16,10 @@ body {
 * {
   box-sizing: border-box;
 }
+
+/* Stream-node capture must not burn a mouse cursor into the RTMP frame. The class lives
+   on <html> so fixed canvases, overlays and native controls all inherit the same rule. */
+.capture-mode,
+.capture-mode * {
+  cursor: none !important;
+}

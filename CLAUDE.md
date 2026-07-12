@@ -8,28 +8,25 @@ Web10.Radio is a 24/7 radio station for the Telegram channel `@netscapedidnothin
 
 ## Current state — read before assuming anything exists
 
-The repo is at the **contract/planning stage**. Nothing has been built yet. What exists:
+The repository has the backend, frontend, stream-node, migrations, Dockerfiles, and Compose runtime implemented. The canonical source of truth remains `docs/SPEC.md`; implementation checklists are `docs/PLAN-FRONTEND.md` and `docs/PLAN-BACKEND.md`.
 
-- `docs/SPEC.md` — **the canonical source of truth** for product, architecture, HTTP contracts, event model, DB invariants, and milestones. Read it first for any real work.
-- `docs/PLAN-FRONTEND.md` — Claude's implementation checklist for `src/frontend/*` (Milestone FRONTEND).
-- `docs/PLAN-BACKEND.md` — ChatGPT/OMP's checklist for `src/backend/*` and `src/stream-node/*` (Milestone BACKEND).
-- `src/frontend/web-stage/mocks/` — design handoff bundle (HTML/CSS/JS prototype) for the public stage.
-
-There is **no** `src/backend/`, `src/frontend/admin/`, `src/frontend/shared/`, `src/stream-node/`, `package.json`, `tsconfig`, `.sln`, or Dockerfile yet. Do not reference build/test commands as if they exist — scaffold them per the plan when starting a phase. The docs are written in Russian prose with English contract/checklist terms; keep contract names in English exactly as specified.
+- `src/backend/` contains independent F# API, Application, Database, Migrator, Telegram, and NUnit/Testcontainers projects.
+- `src/frontend/` contains Bun workspaces `shared`, `web-stage`, and `admin`.
+- `src/stream-node/` contains the F# runtime, typed smoke/control Tools project, LiquidSoap script, and Debian container packaging.
+- `compose.yaml` runs PostgreSQL, migrator, API, standalone Telegram, frontend, RTMP sink, and stream-node.
+- `docs/getting_started.md` and `README.md` contain executable local configuration and smoke commands. Do not describe the repository as an unscaffolded planning stage.
 
 ## Division of labor
 
-- **Frontend is Claude's milestone.** Backend and stream-node are owned by another agent (ChatGPT/OMP).
-- The `/api/v0/*` HTTP contract in `SPEC.md` §5 is the fixed integration boundary between them. Frontend only *consumes* `/api/v0/player/*` and `/api/v0/admin/*`; it never invents route names. Backend must keep these routes stable once frontend work starts.
+- Frontend and backend are both implemented; preserve the `/api/v0/*` integration boundary. Frontend consumes `/api/v0/player/*` and `/api/v0/admin/*`; Telegram routes are served by the standalone Telegram process and exposed through the reverse proxy.
 
 ## Architecture (from SPEC.md §4)
 
-- **Backend is a modular monolith, not microservices.** One deployable ASP.NET host (`Web10.Radio.API`) owns HTTP routes, background workers, config validation, DI, OTEL, health checks.
-- `Web10.Radio.Telegram` (Funogram adapter) is an in-process module/hosted service inside the API process, not a separate service in v0.
-- `Web10.Radio.Database` owns SQL migrations, ADO.NET repositories, and transaction helpers.
-- `src/stream-node/` is a separate container (Xvfb + kiosk Chromium + LiquidSoap + FFmpeg/x11grab → Telegram RTMP) because it needs OS-level deps and process supervision.
+- **Backend has separate deployables.** `Web10.Radio.API` owns player/admin/library/playback/stream-node HTTP routes and API workers; `Web10.Radio.Telegram` is a standalone Funogram service owning Telegram ingress, Stars workflows, and its Telegram outbox relay.
+- `Web10.Radio.Application` is the shared event/relay/health kernel; `Web10.Radio.Database` owns SQL migrations, ADO.NET repositories, and transaction helpers.
+- `src/stream-node/` is a separate F# container (Xvfb + kiosk Chromium + LiquidSoap + FFmpeg/x11grab → Telegram RTMP) because it needs OS-level deps and process supervision.
 - Frontend is a **Bun monorepo** with workspaces `web-stage`, `admin`, `shared`.
-- **Side effects are modeled as domain events**, not procedural chains. In-process handling uses F# `MailboxProcessor` agents; durable events go through `OutboxEvents`. Event types and the envelope shape are in SPEC.md §6.
+- **Durable side effects are audience-partitioned domain events.** API and Telegram relays claim only their audience from `OutboxEvents`; there is no API-hosted Telegram worker.
 
 ## Non-negotiable invariants
 
@@ -61,9 +58,9 @@ These are enforced constraints from the SPEC, not preferences. Violating them is
 - **Do not** port `support.js` or `image-slot.js` into production runtime — they are Claude Design's `<x-dc>`/`<sc-if>`/`<x-import>` template runtime, not app code.
 - Replace the mock's random timers with real API/SSE state.
 
-## Intended toolchain (when scaffolding)
+## Implemented toolchain
 
-Not yet present — establish per plan when you start a phase:
 - Frontend: **Bun** workspaces; React + Three.js; per-app + workspace scripts for typecheck / build / test.
-- Backend: **.NET / F#** (`dotnet` CLI), NUnit integration tests. Integration tests are preferred over unit tests — v0 risk is in contracts, DB concurrency, Telegram payment state, and process boundaries (SPEC.md §12).
-- Deploy: Docker containers for API, frontend, stream-node, plus Docker Compose with PostgreSQL.
+- Backend: **.NET / F#** (`dotnet` CLI), NUnit/Testcontainers integration tests. Integration tests are preferred over unit tests — v0 risk is in contracts, DB concurrency, Telegram payment state, and process boundaries (SPEC.md §12).
+- Stream-node: F# runtime and Tools project in a Debian container with Xvfb, Chromium, LiquidSoap, FFmpeg/x11grab, and RTMP.
+- Deploy: Docker containers for API, standalone Telegram, frontend, stream-node, plus Docker Compose with PostgreSQL and migrator.

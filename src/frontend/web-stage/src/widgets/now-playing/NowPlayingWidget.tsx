@@ -1,5 +1,4 @@
-import type { CSSProperties, ReactElement } from 'react';
-
+import { useEffect, useState, type CSSProperties, type ReactElement } from 'react';
 import type { NowPlaying, StreamStatus } from '@web10/shared';
 
 import type { StageTheme } from '../../shared/ui/theme';
@@ -35,11 +34,18 @@ const ellipsis: CSSProperties = {
   maxWidth: '300px',
 };
 
+export function formatProgress(milliseconds: number): string {
+  const safeMilliseconds = Number.isFinite(milliseconds) && milliseconds >= 0 ? Math.floor(milliseconds) : 0;
+  const totalSeconds = Math.floor(safeMilliseconds / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+}
+
 /**
- * NOW PLAYING bar (mock L50-72): channel glyph, title/artist, an animated equalizer,
- * and a status pill (LIVE with a pulsing dot only when the stream is live; otherwise
- * the current status). Blank track fields fall back to the channel identity, so the
- * bar still reads correctly while offline.
+ * NOW PLAYING bar (mock L50-72): cover art, title/artist/album, formatted progress,
+ * an animated equalizer, and a status pill. Broken or absent artwork intentionally falls
+ * back to the channel glyph so offline and legacy states keep a visible identity.
  */
 export function NowPlayingWidget({
   nowPlaying,
@@ -50,12 +56,21 @@ export function NowPlayingWidget({
   const isLive = streamStatus === 'live';
   const title = nowPlaying.title.trim() === '' ? '@netscapedidnothingwrong' : nowPlaying.title;
   const artist = nowPlaying.artist.trim() === '' ? 'web 1.0 radio · 24/7' : nowPlaying.artist;
+  const album = nowPlaying.album.trim();
+  const coverUrl = nowPlaying.coverImageUrl.trim();
+  const [coverFailed, setCoverFailed] = useState(false);
+
+  useEffect(() => {
+    setCoverFailed(false);
+  }, [coverUrl, nowPlaying.trackId]);
+
+  const showCover = coverUrl !== '' && !coverFailed;
+  const coverAlt = `${title} cover art`;
 
   return (
     <div style={windowStyle}>
       <div style={{ display: 'flex', alignItems: 'center', gap: '11px', padding: '8px 13px 8px 9px' }}>
         <div
-          aria-hidden="true"
           style={{
             width: '34px',
             height: '34px',
@@ -64,15 +79,25 @@ export function NowPlayingWidget({
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
+            overflow: 'hidden',
             fontWeight: 900,
             color: '#fff',
             background: 'linear-gradient(150deg,#8ec9ff,#3b7bd0)',
             boxShadow: '0 0 0 1px rgba(255,255,255,0.6), 0 2px 6px rgba(0,0,0,0.2)',
           }}
         >
-          ◈
+          {showCover ? (
+            <img
+              src={coverUrl}
+              alt={coverAlt}
+              onError={(): void => setCoverFailed(true)}
+              style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
+            />
+          ) : (
+            <span aria-hidden="true">◈</span>
+          )}
         </div>
-        <div style={{ minWidth: 0 }}>
+        <div style={{ minWidth: 0, flex: 1 }}>
           <div
             style={{
               fontSize: '9px',
@@ -88,6 +113,14 @@ export function NowPlayingWidget({
             {title}
           </div>
           <div style={{ fontSize: '11px', opacity: 0.75, ...ellipsis }}>{artist}</div>
+          {album !== '' && <div style={{ fontSize: '10px', opacity: 0.64, ...ellipsis }}>{album}</div>}
+          <div
+            data-testid="now-playing-progress"
+            aria-label={`Progress ${formatProgress(nowPlaying.positionMs)} of ${formatProgress(nowPlaying.durationMs)}`}
+            style={{ fontSize: '10px', opacity: 0.62, fontVariantNumeric: 'tabular-nums' }}
+          >
+            {formatProgress(nowPlaying.positionMs)} / {formatProgress(nowPlaying.durationMs)}
+          </div>
         </div>
         <div
           aria-hidden="true"

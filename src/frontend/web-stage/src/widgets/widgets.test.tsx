@@ -1,4 +1,4 @@
-import { render, screen, cleanup } from '@testing-library/react';
+import { render, screen, cleanup, fireEvent } from '@testing-library/react';
 import { afterEach, describe, expect, test } from 'vitest';
 
 import {
@@ -32,6 +32,36 @@ describe('NowPlayingWidget', () => {
     );
     expect(screen.getByText('LIVE')).toBeTruthy();
     expect(screen.getByText(state.nowPlaying.title)).toBeTruthy();
+  });
+
+  test('shows cover art, album and formatted progress', () => {
+    const state = validPlayerState();
+    render(
+      <NowPlayingWidget
+        nowPlaying={state.nowPlaying}
+        streamStatus="live"
+        theme={theme}
+        windowStyle={layout.now}
+      />,
+    );
+    expect(screen.getByAltText(`${state.nowPlaying.title} cover art`)).toBeTruthy();
+    expect(screen.getByText(state.nowPlaying.album)).toBeTruthy();
+    expect(screen.getByTestId('now-playing-progress').textContent).toBe('00:42 / 04:00');
+  });
+
+  test('broken cover art falls back to the channel glyph', () => {
+    const state = validPlayerState();
+    render(
+      <NowPlayingWidget
+        nowPlaying={state.nowPlaying}
+        streamStatus="live"
+        theme={theme}
+        windowStyle={layout.now}
+      />,
+    );
+    fireEvent.error(screen.getByRole('img'));
+    expect(screen.queryByRole('img')).toBeNull();
+    expect(screen.getByText('◈')).toBeTruthy();
   });
 
   test('offline: shows OFFLINE and channel fallback text', () => {

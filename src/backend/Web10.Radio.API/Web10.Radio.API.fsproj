@@ -7,31 +7,27 @@
 
   <ItemGroup>
     <Compile Include="Configuration.fs" />
-    <Compile Include="Application.fs" />
     <Compile Include="S3Storage.fs" />
-    <Compile Include="Events.fs" />
-    <Compile Include="BackgroundWorkerContracts.fs" />
     <Compile Include="Health.fs" />
     <Compile Include="Observability.fs" />
     <Compile Include="ApiContracts.fs" />
     <Compile Include="AdminIdentity.fs" />
     <Compile Include="ApiReadModels.fs" />
-    <Compile Include="TelegramBotWorkflow.fs" />
+    <Compile Include="TrackMetadata.fs" />
     <Compile Include="BackgroundWorkers.fs" />
     <Compile Include="DevelopmentFixtures.fs" />
     <Compile Include="ApiEndpoints.fs" />
-    <Compile Include="TelegramLongPolling.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\Web10.Radio.Application\Web10.Radio.Application.fsproj" />
     <ProjectReference Include="..\Web10.Radio.Database\Web10.Radio.Database.fsproj" />
-    <ProjectReference Include="..\Web10.Radio.Telegram\Web10.Radio.Telegram.fsproj" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="AWSSDK.S3" Version="4.0.100.3" />
-    <PackageReference Include="Dodo.Primitives" Version="5.0.0" />
+    <PackageReference Include="z440.atl.core" Version="7.15.3" />
     <PackageReference Include="FsToolkit.ErrorHandling" Version="5.2.0" />
     <PackageReference Include="Microsoft.Extensions.Identity.Core" Version="10.0.9" />
     <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.16.0" />

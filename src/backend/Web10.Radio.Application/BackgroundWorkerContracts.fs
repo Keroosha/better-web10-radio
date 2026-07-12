@@ -1,10 +1,10 @@
-namespace Web10.Radio.API
+namespace Web10.Radio.Application
 
 open System
 open System.Threading
 open System.Threading.Tasks
-open Web10.Radio.Database.Repositories
 open Web10.Radio.Database
+open Web10.Radio.Database.Repositories
 
 type BackgroundWorkerError =
     | DomainEventError of DomainEventError
@@ -15,6 +15,7 @@ type BackgroundWorkerError =
     | TelegramTransportError of methodName: string * description: string
     | UnexpectedException of operation: string * message: string
 
+[<RequireQualifiedAccess>]
 module BackgroundWorkerError =
     let toMessage error =
         match error with
@@ -32,6 +33,7 @@ type IDomainEventDispatcher =
 type IDomainEventPublisher =
     abstract member PublishDurableAsync: DomainEventEnvelope -> CancellationToken -> Task<Result<unit, BackgroundWorkerError>>
 
+/// Workflow contracts shared by the application worker composition roots.
 type IPlaybackQueueWorkflow =
     abstract member HandleAsync: DomainEventEnvelope -> CancellationToken -> Task<Result<unit, BackgroundWorkerError>>
 
@@ -58,6 +60,8 @@ type IPlaybackCompletionReporter =
         CancellationToken ->
             Task<Result<bool, BackgroundWorkerError>>
 
+/// Telegram ingress/workflow contracts remain source-compatible while Telegram
+/// is being split into its independent executable.
 type ITelegramUpdateEventIngestor =
     abstract member TryIngestAsync:
         telegramUpdateId: int64 ->

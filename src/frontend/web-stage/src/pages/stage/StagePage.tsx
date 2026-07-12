@@ -1,4 +1,4 @@
-import { useMemo, type ReactElement } from 'react';
+import { useEffect, useMemo, type ReactElement } from 'react';
 
 import type { FetchImpl, OverlayLayout, OverlayStyle, SseConnector } from '@web10/shared';
 
@@ -85,10 +85,26 @@ export function StagePage({
   const layout = getOverlayLayout(params.layout ?? state.overlay.layout);
   const capture = captureEnabled ?? params.capture;
 
+  useEffect(() => {
+    if (!capture || typeof document === 'undefined') {
+      return;
+    }
+    const root = document.documentElement;
+    root.classList.add('capture-mode');
+    return () => {
+      root.classList.remove('capture-mode');
+    };
+  }, [capture]);
+
   // Stabilise the scene track on identity fields only — position ticks (new snapshots
   // every second) must NOT re-run StageScene's build effect, which would flash the loader.
-  const { trackId, title, artist } = state.nowPlaying;
-  const sceneTrack = useMemo(() => selectSceneTrack(state.nowPlaying), [trackId, title, artist]);
+  const { trackId, title, artist, coverImageUrl } = state.nowPlaying;
+  const sceneTrack = useMemo(() => selectSceneTrack(state.nowPlaying), [
+    artist,
+    coverImageUrl,
+    title,
+    trackId,
+  ]);
 
   const sceneProps: StageSceneProps = {
     pointerEnabled: !capture,

@@ -1,4 +1,4 @@
-namespace Web10.Radio.API
+namespace Web10.Radio.Telegram
 
 open System
 open System.Threading
@@ -6,7 +6,7 @@ open System.Threading.Tasks
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Logging
-open Web10.Radio.Telegram
+open Web10.Radio.Application
 open Funogram.Telegram.Types
 
 [<RequireQualifiedAccess>]
@@ -75,7 +75,7 @@ type TelegramLongPollingHostedService
                         use scope = scopeFactory.CreateScope()
 
                         let! outcome =
-                            ApiEndpoints.processTelegramUpdate scope.ServiceProvider update stoppingToken
+                            TelegramEndpoints.processTelegramUpdate scope.ServiceProvider update stoppingToken
 
                         match outcome with
                         | TelegramUpdateAccepted ->

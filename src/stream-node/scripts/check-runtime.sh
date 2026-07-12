@@ -1,12 +1,12 @@
 #!/bin/sh
 set -eu
 
-for command in python3 liquidsoap Xvfb chromium ffmpeg; do
+for command in liquidsoap Xvfb chromium ffmpeg unclutter; do
     command -v "$command" >/dev/null
 done
 
-# Validate the same required configuration that the supervised runtime uses.
-python3 ./scripts/supervisor.py validate-config
+# Validate the same required configuration that the F# runtime uses.
+./Web10.Radio.StreamNode validate-config
 liquidsoap --check ./liquidsoap/web10.liq
 
 width="${WEB10_STREAM__WIDTH:-1280}"
@@ -17,13 +17,17 @@ display=":${display_number}"
 runtime_dir=$(mktemp -d)
 chromium_profile="${runtime_dir}/chromium"
 flv_output="${runtime_dir}/capture.flv"
-xvfb_pid=""
+unclutter_pid=""
 chromium_pid=""
 
 cleanup() {
     if [ -n "$chromium_pid" ] && kill -0 "$chromium_pid" 2>/dev/null; then
         kill "$chromium_pid" 2>/dev/null || true
         wait "$chromium_pid" 2>/dev/null || true
+    fi
+    if [ -n "$unclutter_pid" ] && kill -0 "$unclutter_pid" 2>/dev/null; then
+        kill "$unclutter_pid" 2>/dev/null || true
+        wait "$unclutter_pid" 2>/dev/null || true
     fi
 
     if [ -n "$xvfb_pid" ] && kill -0 "$xvfb_pid" 2>/dev/null; then
@@ -59,6 +63,13 @@ while [ ! -S "/tmp/.X11-unix/X${display_number}" ]; do
     fi
     sleep 0.1
 done
+DISPLAY="$display" unclutter --timeout 0 --start-hidden >/dev/null 2>&1 &
+unclutter_pid=$!
+sleep 0.2
+if ! kill -0 "$unclutter_pid" 2>/dev/null; then
+    echo "unclutter exited during X11 capability check" >&2
+    exit 1
+fi
 
 DISPLAY="$display" chromium \
     --kiosk \

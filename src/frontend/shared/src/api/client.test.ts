@@ -4,6 +4,7 @@ import { z } from 'zod';
 import {
   apiFetch,
   apiSend,
+  apiUpload,
   ApiError,
   clearAdminSession,
   getPlayerState,
@@ -133,6 +134,31 @@ describe('admin session transport', () => {
         fetchImpl,
       }),
     ).resolves.toBeUndefined();
+  });
+
+  test('sends FormData without overriding its boundary and still includes admin CSRF', async () => {
+    setAdminSession(activeSession);
+    const form = new FormData();
+    form.set('cover', new Blob(['image bytes'], { type: 'image/png' }));
+    let captured: RequestInit | undefined;
+    const fetchImpl: FetchImpl = vi.fn((_url, init) => {
+      captured = init;
+      return Promise.resolve(jsonResponse({ uploaded: true }));
+    });
+
+    const result = await apiUpload('/api/v0/admin/tracks/track-1/cover', {
+      schema: z.object({ uploaded: z.boolean() }).strict(),
+      method: 'PUT',
+      body: form,
+      admin: true,
+      fetchImpl,
+    });
+
+    expect(result.uploaded).toBe(true);
+    expect(captured?.body).toBe(form);
+    const headers = new Headers(captured?.headers);
+    expect(headers.get('content-type')).toBeNull();
+    expect(headers.get('x-csrf-token')).toBe('csrf-token');
   });
 
   test('does not invalidate an authenticated session when an auth probe returns 401', async () => {

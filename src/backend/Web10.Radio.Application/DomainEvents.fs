@@ -1,12 +1,14 @@
-namespace Web10.Radio.API
+namespace Web10.Radio.Application
 
 open System
 open System.IO
 open System.Text
 open System.Text.Json
+open Dodo.Primitives
 open FsToolkit.ErrorHandling
 open Web10.Radio.Database.Repositories
 
+/// Durable events exchanged by the API, Telegram service, and stream workers.
 type DomainEventType =
     | TrackRequested
     | TrackRequestMatched
@@ -26,7 +28,17 @@ type DomainEventType =
     | StreamNodeFailureDetected
     | AdminGoalChanged
     | SocialLinkChanged
+    | PlaybackReordered
+    | PlaybackSkipped
+    | PlaybackRestarted
+    | TrackForcePlayed
+    | AdminTrackQueued
+    | TrackMetadataChanged
+    | TrackMaterialized
+    | PlaylistChanged
+    | PlaylistTrackQueued
 
+[<RequireQualifiedAccess>]
 module DomainEventType =
     let all =
         [ TrackRequested
@@ -46,7 +58,16 @@ module DomainEventType =
           StreamNodeHeartbeatReceived
           StreamNodeFailureDetected
           AdminGoalChanged
-          SocialLinkChanged ]
+          SocialLinkChanged
+          PlaybackReordered
+          PlaybackSkipped
+          PlaybackRestarted
+          TrackForcePlayed
+          AdminTrackQueued
+          TrackMetadataChanged
+          TrackMaterialized
+          PlaylistChanged
+          PlaylistTrackQueued ]
 
     let toString eventType =
         match eventType with
@@ -68,6 +89,15 @@ module DomainEventType =
         | StreamNodeFailureDetected -> "StreamNodeFailureDetected"
         | AdminGoalChanged -> "AdminGoalChanged"
         | SocialLinkChanged -> "SocialLinkChanged"
+        | PlaybackReordered -> "PlaybackReordered"
+        | PlaybackSkipped -> "PlaybackSkipped"
+        | PlaybackRestarted -> "PlaybackRestarted"
+        | TrackForcePlayed -> "TrackForcePlayed"
+        | AdminTrackQueued -> "AdminTrackQueued"
+        | TrackMetadataChanged -> "TrackMetadataChanged"
+        | TrackMaterialized -> "TrackMaterialized"
+        | PlaylistChanged -> "PlaylistChanged"
+        | PlaylistTrackQueued -> "PlaylistTrackQueued"
 
     let tryParse value =
         match value with
@@ -89,13 +119,67 @@ module DomainEventType =
         | "StreamNodeFailureDetected" -> Some StreamNodeFailureDetected
         | "AdminGoalChanged" -> Some AdminGoalChanged
         | "SocialLinkChanged" -> Some SocialLinkChanged
+        | "PlaybackReordered" -> Some PlaybackReordered
+        | "PlaybackSkipped" -> Some PlaybackSkipped
+        | "PlaybackRestarted" -> Some PlaybackRestarted
+        | "TrackForcePlayed" -> Some TrackForcePlayed
+        | "AdminTrackQueued" -> Some AdminTrackQueued
+        | "TrackMetadataChanged" -> Some TrackMetadataChanged
+        | "TrackMaterialized" -> Some TrackMaterialized
+        | "PlaylistChanged" -> Some PlaylistChanged
+        | "PlaylistTrackQueued" -> Some PlaylistTrackQueued
         | _ -> None
+
+/// The event audience is intentionally exhaustive: adding a new event requires
+/// choosing which process is allowed to claim and dispatch it.
+[<RequireQualifiedAccess>]
+module DomainEventAudience =
+    let forType eventType =
+        match eventType with
+        | TrackRequested
+        | TrackRequestMatched
+        | SayMessageSubmitted
+        | SayMessageModerated
+        | TelegramCommandReceived
+        | TelegramCallbackReceived
+        | DonationInvoiceCreated
+        | DonationPaid
+        | PaymentRefunded -> OutboxAudience.Telegram
+        | LibraryScanRequested
+        | TrackDiscovered
+        | PlaybackQueueItemClaimed
+        | PlaybackStarted
+        | PlaybackEnded
+        | StreamNodeHeartbeatReceived
+        | StreamNodeFailureDetected
+        | AdminGoalChanged
+        | SocialLinkChanged
+        | PlaybackReordered
+        | PlaybackSkipped
+        | PlaybackRestarted
+        | TrackForcePlayed
+        | AdminTrackQueued
+        | TrackMetadataChanged
+        | TrackMaterialized
+        | PlaylistChanged
+        | PlaylistTrackQueued -> OutboxAudience.Api
+
+[<RequireQualifiedAccess>]
+module DomainJson =
+    /// The canonical serializer for event payloads crossing process boundaries.
+    let options = JsonSerializerOptions(JsonSerializerDefaults.Web)
+
+    do
+        options.PropertyNamingPolicy <- JsonNamingPolicy.CamelCase
+        options.DictionaryKeyPolicy <- JsonNamingPolicy.CamelCase
+
 
 type DomainEventError =
     | ProducerRequired
     | PayloadMustBeJsonObject
     | PayloadJsonInvalid of message: string
 
+[<RequireQualifiedAccess>]
 module DomainEventError =
     let toMessage error =
         match error with
@@ -112,6 +196,7 @@ type DomainEventEnvelope =
       CausationId: Guid option
       PayloadJson: string }
 
+[<RequireQualifiedAccess>]
 module DomainEventEnvelope =
     let private payloadJsonObject (payloadJson: string) : Result<string, DomainEventError> =
         if String.IsNullOrWhiteSpace payloadJson then
@@ -133,9 +218,11 @@ module DomainEventEnvelope =
                 else
                     Error PayloadMustBeJsonObject)
 
+    /// Creates an envelope using the platform time abstraction and UUIDv7.
+    /// Event and implicit correlation identifiers are generated only after the
+    /// producer/payload validations succeed, preserving the old failure behavior.
     let create
-        (idGenerator: IIdGenerator)
-        (clock: IClock)
+        (timeProvider: TimeProvider)
         (eventType: DomainEventType)
         (producer: string)
         (correlationId: Guid option)
@@ -145,12 +232,12 @@ module DomainEventEnvelope =
         result {
             do! (not (String.IsNullOrWhiteSpace producer)) |> Result.requireTrue ProducerRequired
             let! payloadJson = payloadJsonObject payloadJson
-            let correlationId = correlationId |> Option.defaultWith idGenerator.NewId
+            let correlationId = correlationId |> Option.defaultWith (fun () -> Uuid.CreateVersion7().ToGuidBigEndian())
 
             return
-                { EventId = idGenerator.NewId()
+                { EventId = Uuid.CreateVersion7().ToGuidBigEndian()
                   EventType = eventType
-                  OccurredAtUtc = clock.UtcNow
+                  OccurredAtUtc = timeProvider.GetUtcNow()
                   Producer = producer
                   CorrelationId = correlationId
                   CausationId = causationId
@@ -177,10 +264,11 @@ module DomainEventEnvelope =
         writer.Flush()
         Encoding.UTF8.GetString(buffer.ToArray())
 
-module internal OutboxMapping =
-    let toOutboxEvent (envelope: DomainEventEnvelope) =
+module OutboxMapping =
+    let toOutboxEvent (envelope: DomainEventEnvelope) : OutboxEventToAppend =
         { Id = envelope.EventId
           EventType = DomainEventType.toString envelope.EventType
+          Audience = DomainEventAudience.forType envelope.EventType
           OccurredAtUtc = envelope.OccurredAtUtc
           Producer = envelope.Producer
           CorrelationId = Some envelope.CorrelationId

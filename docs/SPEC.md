@@ -19,31 +19,32 @@ Web10.Radio должен работать как круглосуточная Te
 
 ### Milestone FRONTEND — Claude
 
-- [ ] Create Bun workspace under `src/frontend/` with workspaces `web-stage`, `admin`, and `shared`.
-- [ ] Recreate the mock stage in `src/frontend/web-stage` using React + Three.js + strict TypeScript.
-- [ ] Build `src/frontend/admin` as a React admin cabinet.
-- [ ] Consume only `/api/v0/player/*` and `/api/v0/admin/*` contracts defined in this SPEC.
-- [ ] Keep all domain contracts in `src/frontend/shared`; no JavaScript files, no `any`, no `unknown`, no untyped API payloads in authored source.
-- [ ] Use Feature-Sliced Design layers `app`, `pages`, `widgets`, `features`, `entities`, `shared`; do not use the deprecated `processes` layer.
+- [x] Create Bun workspace under `src/frontend/` with workspaces `web-stage`, `admin`, and `shared`.
+- [x] Recreate the mock stage in `src/frontend/web-stage` using React + Three.js + strict TypeScript.
+- [x] Build `src/frontend/admin` as a React admin cabinet.
+- [x] Consume only `/api/v0/player/*` and `/api/v0/admin/*` contracts defined in this SPEC.
+- [x] Keep all domain contracts in `src/frontend/shared`; no JavaScript files, no `any`, no `unknown`, no untyped API payloads in authored source.
+- [x] Use Feature-Sliced Design layers `app`, `pages`, `widgets`, `features`, `entities`, `shared`; do not use the deprecated `processes` layer.
 
 ### Milestone BACKEND — ChatGPT/OMP
 
-- [ ] Create F# solution `src/backend/Web10.Radio.sln`.
-- [ ] Create projects `Web10.Radio.API`, `Web10.Radio.Telegram`, and `Web10.Radio.Database`.
-- [ ] Implement ASP.NET API mounts `/api/v0/player/*`, `/api/v0/telegram/*`, `/api/v0/admin/*` as a modular monolith.
-- [ ] Implement Funogram bot flows for Stars payments, `/request`, `/say`, `/song`, `/terms`, and `/paysupport`.
-- [ ] Implement PostgreSQL persistence with ADO.NET only, SQL migrations, soft delete via `IsDeleted`, and pessimistic queue concurrency using `SELECT ... FOR UPDATE SKIP LOCKED`.
-- [ ] Create `src/stream-node/` infrastructure for Xvfb + Chromium + LiquidSoap + FFmpeg pipeline that sends RTMP to Telegram.
-- [ ] Package all runtime apps in Docker containers.
+- [x] Create F# solution `src/backend/Web10.Radio.sln`.
+- [x] Create projects `Web10.Radio.API`, `Web10.Radio.Telegram`, `Web10.Radio.Database`, and shared `Web10.Radio.Application`.
+- [x] Implement separate ASP.NET API and Telegram service mounts for `/api/v0/player/*`, `/api/v0/telegram/*`, `/api/v0/admin/*` with reverse-proxy routing for Telegram.
+- [x] Implement Funogram bot flows for Stars payments, `/request`, `/say`, `/song`, `/terms`, and `/paysupport`.
+- [x] Implement PostgreSQL persistence with ADO.NET only, SQL migrations, soft delete via `IsDeleted`, and pessimistic queue concurrency using `SELECT ... FOR UPDATE SKIP LOCKED`.
+- [x] Implement `src/stream-node/` with the F# runtime, Xvfb + Chromium + LiquidSoap + FFmpeg pipeline, and Telegram RTMP output.
+- [x] Package all runtime apps in Docker containers.
 
 Frontend can start from the mock + SPEC DTOs immediately. Backend can start from SPEC contracts immediately. Integration begins when `/api/v0/player/state`, `/api/v0/player/events`, and admin auth assumptions are documented and kept stable.
 
 ### Phase S0 — Готовность контрактного пакета
 
-- [ ] Keep `docs/SPEC.md` as the canonical source for product, architecture, contracts, and milestones.
-- [ ] Keep `docs/PLAN-FRONTEND.md` consuming section names from this SPEC instead of duplicating private decisions.
-- [ ] Keep `docs/PLAN-BACKEND.md` implementing the same `/api/v0/*` contracts without route drift.
-- [ ] Validate that every payment, database, frontend, and stream-node invariant has one canonical home in this SPEC.
+- [x] Keep `docs/SPEC.md` as the canonical source for product, architecture, contracts, and milestones.
+- [x] Keep `docs/PLAN-FRONTEND.md` consuming section names from this SPEC instead of duplicating private decisions.
+- [x] Keep `docs/PLAN-BACKEND.md` implementing the same `/api/v0/*` contracts without route drift.
+- [x] Validate that every payment, database, frontend, and stream-node invariant has one canonical home in this SPEC.
+
 
 ## 4. Архитектура системы
 
@@ -65,12 +66,11 @@ flowchart LR
 
 Архитектурные решения v0:
 
-- Backend — modular monolith, not microservices: первая версия выигрывает от one deployable unit, in-process module boundaries и простых транзакций.
-- `Web10.Radio.API` — ASP.NET host. Он владеет HTTP routes, background workers, configuration validation, DI composition, OTEL и health checks.
-- `Web10.Radio.Telegram` — project/module для Telegram adapter logic на Funogram. В v0 он hosted by API process как module/hosted service или webhook handler; это не отдельный service, пока реализация не докажет необходимость.
-- `Web10.Radio.Database` владеет migrations, SQL helpers, ADO.NET repositories, transaction helpers и database invariants.
-- `src/stream-node/` — отдельный container/process group, потому что Chromium/Xvfb/LiquidSoap/FFmpeg требуют OS-level dependencies и process supervision.
-- `src/frontend/web-stage` и `src/frontend/admin` — frontend workspaces внутри одного Bun monorepo.
+- Backend has separate deployables: `Web10.Radio.API` owns player/admin/library/playback/stream-node HTTP routes and API workers; `Web10.Radio.Telegram` owns Telegram ingress, Funogram workflows, Stars payments, and Telegram outbox delivery.
+- `Web10.Radio.Application` is the shared event, relay, and health kernel; `Web10.Radio.Database` owns migrations, SQL helpers, ADO.NET repositories, transaction helpers, and database invariants.
+- `/api/v0/telegram/*` is served by the Telegram process and exposed through the reverse proxy; the API process has no Telegram adapter reference.
+- `src/stream-node/` is an F# container/process group because Chromium/Xvfb/LiquidSoap/FFmpeg require OS-level dependencies and process supervision.
+- `src/frontend/web-stage` and `src/frontend/admin` are frontend workspaces inside one Bun monorepo.
 
 ## 5. Backend contract: HTTP API v0
 
@@ -190,11 +190,10 @@ SSE route contract:
 
 | Method | Route | Purpose |
 | --- | --- | --- |
-| `POST` | `/api/v0/telegram/webhook` | Accept Telegram Bot API update webhook. |
+| `POST` | `/api/v0/telegram/webhook` | Accept Telegram Bot API update webhook in the standalone Telegram service. |
 | `GET` | `/api/v0/telegram/health` | Bot adapter health and last update id. |
 
-В v0 Telegram ingestion выбирается через optional `WEB10_TELEGRAM__UPDATE_MODE`: exact `Webhook|LongPolling`, default `Webhook`. В Webhook mode Telegram вызывает route ниже; он требует ровно один `X-Telegram-Bot-Api-Secret-Token`, сравнивает его fixed-time, ограничивает body 1 MiB и принимает typed Funogram `Update`. В LongPolling mode API hosted service сперва вызывает `deleteWebhook(dropPendingUpdates=false)`, затем invokes `getUpdates` with a monotonic offset. Оба транспорта используют один typed ingress: обычные commands/callbacks/`successful_payment` проходят durable inbox/outbox path; `pre_checkout_query` обрабатывается синхронно, потому что protocol acknowledgement нельзя ждать ordered relay. Polling acknowledges an update only after `Accepted` or permanent `Rejected`; transient ingestion/pre-checkout failure retains the offset and retries after a bounded delay.
-
+В v0 Telegram ingestion выбирается через `WEB10_TELEGRAM__UPDATE_MODE`: exact `Webhook|LongPolling`, default `Webhook`. В Webhook mode Telegram service validates exactly one `X-Telegram-Bot-Api-Secret-Token` with fixed-time comparison, limits body to 1 MiB, and parses a typed Funogram `Update`. In LongPolling mode the standalone Telegram service first calls `deleteWebhook(dropPendingUpdates=false)`, then invokes `getUpdates` with a monotonic offset. Оба транспорта используют один typed ingress: обычные commands/callbacks/`successful_payment` проходят durable inbox/outbox path; `pre_checkout_query` обрабатывается синхронно. Polling acknowledges an update only after `Accepted` or permanent rejection. Reverse proxy exposes these routes at the public `/api/v0/telegram/*` paths; the API process does not host Telegram workers.
 ### Stream-node callback and control routes
 
 Эти internal-to-deployment routes требуют `Authorization: Bearer <WEB10_STREAM__CALLBACK_TOKEN>` under policy `Web10StreamNode`. Этот token не совпадает с Telegram RTMP key и не участвует в admin authentication.
@@ -275,7 +274,7 @@ All read/list routes return `200`. Admin queue, stream-control, and scan accepta
 - First moderation атомарно меняет `PaidPendingModeration -> Approved|Rejected` и append-ит `SayMessageModerated`. Approval сразу попадает в player state; rejection остается hidden. Связанный `Payments.Status` остается `Paid`; automatic refund не является частью этого route contract.
 ## 6. Event model вместо процедурных действий
 
-Backend side effects model as events handled by in-process agents/queues, not as direct procedural chains. В v0 F# `MailboxProcessor` — in-process event handler primitive: он serializes mutable state updates through a message queue, упрощает reasoning about queue/payment/stream state и сохраняет transactional boundary в modular monolith. Durable effects append an event envelope in the same database transaction as the state change; relay ordering, not an HTTP handler, dispatches the effect.
+Backend side effects are modeled as events and durable outbox relays, not direct procedural chains. The shared `Web10.Radio.Application` kernel defines the envelope and audience mapping; API and Telegram deployables consume only their own `OutboxEvents.Audience` partition. In-process `MailboxProcessor` agents remain local serialization primitives where needed, but cross-process delivery is database-backed and relay-owned. Durable effects append the event envelope in the same database transaction as the state change; relay ordering, not an HTTP handler, dispatches the effect.
 
 Event envelope:
 
@@ -495,17 +494,17 @@ Web-stage visual invariants from the mock:
 
 ## 11. stream-node contract
 
-`src/stream-node/` is its own runtime area. It is a supervised process group, not a binary probe: `dumb-init` starts one `scripts/supervisor.py` child, which owns Xvfb, kiosk Chromium, Liquidsoap, FFmpeg/x11grab, the loopback-only callback listener, and the Unix Liquidsoap command socket. It uses no third-party Python packages.
+`src/stream-node/` is its own F# runtime area, not a Python supervisor or binary probe. `Web10.Radio.StreamNode` owns the supervised process group and `Web10.Radio.StreamNode.Tools` provides typed smoke/control commands. `dumb-init` starts the runtime, which owns Xvfb, kiosk Chromium, LiquidSoap, FFmpeg/x11grab, the loopback-only callback listener, and the Unix Liquidsoap command socket.
 
-- Image base is glibc `debian:trixie-slim`, never Alpine/libmusl. It retains `dumb-init`, installs `python3` and `socat`, and installs the official Savonet x86-64 Trixie Liquidsoap package `https://github.com/savonet/liquidsoap/releases/download/v2.4.0/liquidsoap_2.4.0-debian-trixie-ocaml4.14.2-3_amd64.deb` only after SHA-256 verification against `dd437f1a6af842aa4ebc61090fc3270890a592a0a531026e16b49e7b78c858fe`. Debian's Liquidsoap 2.3.2 is not an acceptable substitute because it lacks the required end callback.
-- Exact supervisor configuration is `WEB10_API__BASE_URL`, `WEB10_STREAM__CALLBACK_TOKEN`, `WEB10_STREAM__STAGE_URL`, `WEB10_STREAM__RTMP_URL`, `WEB10_STREAM__RTMP_KEY`, `WEB10_STREAM__DISPLAY=:99`, `WEB10_STREAM__WIDTH=1280`, `WEB10_STREAM__HEIGHT=720`, `WEB10_STREAM__FRAMERATE=30`, and `WEB10_STREAM__BITRATE_KBPS=192`. Heartbeat and lease cadence is 10 seconds; control and assignment polling cadence is two seconds; restart budget is five restarts in five minutes.
-- The supervisor starts Xvfb on `:99`, then Chromium kiosk at the configured stage URL with `capture=1` merged query-safely into the URL. Chromium uses `--enable-unsafe-swiftshader`, `--no-sandbox`, `--autoplay-policy=no-user-gesture-required`, and fixed window size. Early child exit is `degraded`. On SIGTERM it terminates the complete child process group and attempts a best-effort `offline` heartbeat before exit.
+- Image base is glibc `debian:trixie-slim`, never Alpine/libmusl. It installs `dumb-init`, `socat`, Xvfb, Chromium, FFmpeg, and the verified Savonet Liquidsoap 2.4 package.
+- Runtime configuration is `WEB10_API__BASE_URL`, `WEB10_STREAM__CALLBACK_TOKEN`, `WEB10_STREAM__STAGE_URL`, `WEB10_STREAM__RTMP_URL`, `WEB10_STREAM__RTMP_KEY`, `WEB10_STREAM__DISPLAY=:99`, `WEB10_STREAM__WIDTH=1280`, `WEB10_STREAM__HEIGHT=720`, `WEB10_STREAM__FRAMERATE=30`, and `WEB10_STREAM__BITRATE_KBPS=192`. Heartbeat and lease cadence is 10 seconds; control and assignment polling cadence is two seconds; restart budget is five restarts in five minutes.
+- The runtime starts Xvfb on `:99`, then Chromium kiosk at the configured stage URL with `capture=1` merged query-safely. Chromium uses `--enable-unsafe-swiftshader`, `--no-sandbox`, `--autoplay-policy=no-user-gesture-required`, and fixed window size. Early child exit is `degraded`. On SIGTERM it terminates the complete child process group and attempts a best-effort `offline` heartbeat before exit.
 - `liquidsoap/web10.liq` uses the verified Liquidsoap 2.4 API: `request.queue(id="web10")` with safe blank fallback; native `input.ffmpeg(format="x11grab")` against `:99`; `source.mux.video`; `%ffmpeg(format="flv", AAC audio, H.264 video)`; self-synchronized `output.url` to `${RTMP_URL}${RTMP_KEY}`; and `on_position(remaining=true, allow_partial=true)` for track-end reporting. It enables only a filesystem Unix command socket at `/run/web10/liquidsoap.sock`; it exposes no unauthenticated TCP/telnet control port.
-- The supervisor polls `GET /api/v0/stream-node/playback/current`. For an assignment it verifies that `cachePath` exists under mounted storage root, pushes exactly one annotated file URI through the `web10` request-queue socket, and renews the existing fenced lease every 10 seconds. Liquidsoap `on_track` and `on_position(remaining=true, allow_partial=true)` callbacks post assignment metadata to the loopback listener; start marks the node `live` and end invokes the existing completion route with `played`.
-- Missing file, no start callback in five seconds, decoder/output failure, or callback error invokes fenced completion with `failed` and a bounded reason, then emits `degraded`. An RTMP output exit during an active assignment reports the exact `RTMP output failed` reason, enters terminal failure without consuming blind restart attempts, and requires an admin restart after the target is restored. The node never treats a callback as authorization: backend lease/completion fencing remains authoritative.
-- The supervisor polls `GET /api/v0/stream-node/control`. `stopped` tears down Liquidsoap/FFmpeg while retaining supervisor, Xvfb, and Chromium and heartbeats `offline`; a larger `restartGeneration` restarts the media pipeline once and resumes `running`. Other child crashes emit `restarting` with exponential 1/2/4/8/16-second delays. Exceeding the restart budget emits `failed` and remains a healthy control daemon until an admin raises restart generation.
-- It reports `live` only when Xvfb, Chromium, Liquidsoap, FFmpeg video input/output, and an active playback assignment are healthy. With healthy processes and no assignment it reports `starting`. Every heartbeat includes bitrate, restart attempt, and current queue item (or null). Valid statuses are exact lowercase `starting|live|degraded|restarting|failed|offline` at the API boundary.
-- `check-runtime.sh` validates actual runtime capability rather than binary presence: `python3`, `liquidsoap --check web10.liq`, Chromium/Xvfb startup, FFmpeg `x11grab` and FLV encoders, and supervisor configuration validation must succeed.
+- The runtime polls `GET /api/v0/stream-node/playback/current`. For an assignment it verifies that `cachePath` exists under mounted storage root, pushes exactly one annotated file URI through the `web10` request-queue socket, and renews the fenced lease every 10 seconds. Liquidsoap callbacks post assignment metadata to the loopback listener; start marks the node `live` and end invokes the completion route with `played`.
+- Missing file, no start callback in five seconds, decoder/output failure, or callback error invokes fenced completion with `failed` and a bounded reason, then emits `degraded`. An RTMP output exit during an active assignment reports the exact `RTMP output failed` reason, enters terminal failure without consuming blind restart attempts, and requires an admin restart after the target is restored.
+- The runtime polls `GET /api/v0/stream-node/control`. `stopped` tears down LiquidSoap/FFmpeg while retaining supervisor, Xvfb, and Chromium and heartbeats `offline`; a larger `restartGeneration` restarts the media pipeline once and resumes `running`. Other child crashes emit `restarting` with exponential 1/2/4/8/16-second delays. Exceeding the restart budget emits `failed` and remains a healthy control daemon until an admin raises restart generation.
+- It reports `live` only when Xvfb, Chromium, LiquidSoap, FFmpeg input/output, and an active playback assignment are healthy. Valid statuses are exact lowercase `starting|live|degraded|restarting|failed|offline` at the API boundary. Every heartbeat includes bitrate, restart attempt, and current queue item (or null).
+- `check-runtime.sh` validates actual runtime capability: required binaries, F# `validate-config`, LiquidSoap syntax, Chromium/Xvfb startup, and FFmpeg `x11grab`/FLV capture. The F# Tools smoke suite covers playback controls and callback/configuration contracts.
 ## 12. Testing and acceptance
 
 Integration tests are preferred over unit tests because v0 risk sits at contracts, database concurrency, Telegram payment state, and process boundaries. Required test/check areas:

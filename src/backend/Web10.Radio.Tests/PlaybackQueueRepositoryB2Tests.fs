@@ -5,11 +5,11 @@ open System.Threading
 open Npgsql
 open NUnit.Framework
 open Web10.Radio.API
+open Dodo.Primitives
 open Web10.Radio.Database.Repositories
 
 module PlaybackQueueRepositoryB2Tests =
-    let private newId () =
-        (UuidV7IdGenerator() :> IIdGenerator).NewId()
+    let private newId () = Uuid.CreateVersion7().ToGuidBigEndian()
 
     let private claim description result =
         match result with
@@ -47,8 +47,8 @@ VALUES (@FirstTrackId, 'First title', 'Artist', false),
        (@SecondTrackId, 'Second title', 'Artist', false);
 
 INSERT INTO "PlaybackQueue" ("Id", "TrackId", "Source", "Status", "Priority", "RequestedAtUtc")
-VALUES (@FirstQueueItemId, @FirstTrackId, 'playlist', 'Queued', 0, @RequestedAtUtc),
-       (@SecondQueueItemId, @SecondTrackId, 'playlist', 'Queued', 0, @SecondRequestedAtUtc);""",
+VALUES (@FirstQueueItemId, @FirstTrackId, 'fallback', 'Queued', 0, @RequestedAtUtc),
+       (@SecondQueueItemId, @SecondTrackId, 'fallback', 'Queued', 0, @SecondRequestedAtUtc);""",
                         connection
                     )
 
@@ -141,8 +141,8 @@ WHERE "Id" = @QueueItemId;""",
 VALUES (@RecoverableTrackId, 'Recoverable title', 'Artist', false),
        (@NextTrackId, 'Next title', 'Artist', false);
 INSERT INTO "PlaybackQueue" ("Id", "TrackId", "Source", "Status", "Priority", "RequestedAtUtc")
-VALUES (@RecoverableQueueItemId, @RecoverableTrackId, 'playlist', 'Queued', 0, @RequestedAtUtc),
-       (@NextQueueItemId, @NextTrackId, 'playlist', 'Queued', 0, @NextRequestedAtUtc);""",
+VALUES (@RecoverableQueueItemId, @RecoverableTrackId, 'fallback', 'Queued', 0, @RequestedAtUtc),
+       (@NextQueueItemId, @NextTrackId, 'fallback', 'Queued', 0, @NextRequestedAtUtc);""",
                         connection
                     )
 
@@ -281,6 +281,9 @@ WHERE "Id" = @QueueItemId;""",
                 let firstPlaylistItemId = newId ()
                 let middlePlaylistItemId = newId ()
                 let lastPlaylistItemId = newId ()
+                let firstTrackFileId = newId ()
+                let middleTrackFileId = newId ()
+                let lastTrackFileId = newId ()
                 let priorQueueItemId = newId ()
                 let nextQueueItemId = newId ()
                 let wrappedQueueItemId = newId ()
@@ -303,14 +306,22 @@ VALUES (@FirstPlaylistItemId, @PlaylistId, @FirstTrackId, 0, false),
        (@MiddlePlaylistItemId, @PlaylistId, @MiddleTrackId, 4, false),
        (@LastPlaylistItemId, @PlaylistId, @LastTrackId, 9, false);
 
-INSERT INTO "PlaybackQueue" ("Id", "TrackId", "PlaylistItemId", "Source", "Status", "Priority", "RequestedAtUtc", "FinishedAtUtc")
-VALUES (@PriorQueueItemId, @MiddleTrackId, @MiddlePlaylistItemId, 'playlist', 'Played', 0, @PriorRequestedAtUtc, @PriorFinishedAtUtc);""",
+INSERT INTO "TrackFiles" ("Id", "TrackId", "StoragePath", "CachePath", "IsCached", "IsDeleted")
+VALUES (@FirstTrackFileId, @FirstTrackId, '/library/first.mp3', '/cache/first.mp3', true, false),
+       (@MiddleTrackFileId, @MiddleTrackId, '/library/middle.mp3', '/cache/middle.mp3', true, false),
+       (@LastTrackFileId, @LastTrackId, '/library/last.mp3', '/cache/last.mp3', true, false);
+
+INSERT INTO "PlaybackQueue" ("Id", "TrackId", "PlaylistItemId", "PlaylistId", "Source", "Status", "Priority", "RequestedAtUtc", "FinishedAtUtc")
+VALUES (@PriorQueueItemId, @MiddleTrackId, @MiddlePlaylistItemId, @PlaylistId, 'playlist', 'Played', 0, @PriorRequestedAtUtc, @PriorFinishedAtUtc);""",
                         connection
                     )
 
                 for name, value in
                     [ "FirstTrackId", box firstTrackId
                       "MiddleTrackId", box middleTrackId
+                      "FirstTrackFileId", box firstTrackFileId
+                      "MiddleTrackFileId", box middleTrackFileId
+                      "LastTrackFileId", box lastTrackFileId
                       "LastTrackId", box lastTrackId
                       "PlaylistId", box playlistId
                       "FirstPlaylistItemId", box firstPlaylistItemId

@@ -10,23 +10,16 @@ open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Logging.Abstractions
 open Npgsql
 open NUnit.Framework
+open Web10.Radio.Application
 open Web10.Radio.API
 open Web10.Radio.Database.Repositories
 open Web10.Radio.Telegram
 open Funogram.Telegram.Types
 
 module TelegramBotTests =
-    type private FixedClock(nowUtc: DateTimeOffset) =
-        interface IClock with
-            member _.UtcNow = nowUtc
-
-    type private SequentialIdGenerator() =
-        let mutable next = 0
-
-        interface IIdGenerator with
-            member _.NewId() =
-                next <- next + 1
-                Guid(next, 0s, 0s, [| 0uy; 0uy; 0uy; 0uy; 0uy; 0uy; 0uy; 0uy |])
+    type private FixedTimeProvider(nowUtc: DateTimeOffset) =
+        inherit TimeProvider()
+        override _.GetUtcNow() = nowUtc
 
     type private TestAdapterState() =
         let errors = ResizeArray<string>()
@@ -125,8 +118,7 @@ module TelegramBotTests =
         let workflow =
             TelegramBotWorkflow(
                 dataSource,
-                SequentialIdGenerator() :> IIdGenerator,
-                FixedClock(nowUtc) :> IClock,
+                FixedTimeProvider(nowUtc) :> TimeProvider,
                 options requestPrice sayPrice,
                 client :> ITelegramBotClient,
                 adapter :> ITelegramAdapterState,

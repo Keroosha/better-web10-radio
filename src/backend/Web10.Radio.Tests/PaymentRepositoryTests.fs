@@ -5,12 +5,12 @@ open System.Threading
 open Npgsql
 open NUnit.Framework
 open Web10.Radio.API
+open Dodo.Primitives
 open Web10.Radio.Database
 open Web10.Radio.Database.Repositories
 
 module PaymentRepositoryTests =
-    let private newId () =
-        (UuidV7IdGenerator() :> IIdGenerator).NewId()
+    let private newId () = Uuid.CreateVersion7().ToGuidBigEndian()
 
     let private atUtc = DateTimeOffset(2026, 7, 10, 13, 0, 0, TimeSpan.Zero)
 

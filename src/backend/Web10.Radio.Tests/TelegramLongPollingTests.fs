@@ -12,6 +12,7 @@ open Microsoft.Extensions.Logging.Abstractions
 open NUnit.Framework
 open Web10.Radio.API
 open Web10.Radio.Telegram
+open Web10.Radio.Application
 
 module TelegramLongPollingTests =
     let private shortTimeout = TimeSpan.FromSeconds(5.0)
@@ -72,7 +73,7 @@ module TelegramLongPollingTests =
         interface ITelegramUpdateEventIngestor with
             member _.TryIngestAsync telegramUpdateId eventType _producer _payloadJson _cancellationToken =
                 let attempt = Interlocked.Increment(&attempts)
-                ingested.Enqueue(telegramUpdateId, eventType)
+                ingested.Enqueue((telegramUpdateId, eventType))
 
                 if failFirstAttempt && attempt = 1 then
                     Task.FromResult(Error(UnexpectedException("ingest", "transient failure")))

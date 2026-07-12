@@ -7,7 +7,7 @@ open Microsoft.Extensions.Configuration
 open Microsoft.Extensions.DependencyInjection
 open System.Text.Json
 open Web10.Radio.Database
-open Web10.Radio.Telegram
+open Web10.Radio.Application
 
 type ApiProgramMarker = class end
 
@@ -55,8 +55,6 @@ module Program =
             builder.Services
             |> DatabaseComposition.addDatabase options.Postgres
             |> ApplicationComposition.addApplicationServices
-            |> TelegramComposition.addTelegram options.Telegram
-            |> TelegramLongPollingComposition.addTelegramLongPolling options.Telegram.UpdateMode
             |> BackgroundWorkerComposition.addBackgroundWorkers options
             |> ApiEndpoints.addApiServices options.Admin options.DevelopmentFixturesEnabled options.Stream
             |> HealthComposition.addHealthChecks options

@@ -1,6 +1,8 @@
 /** All real admin cabinet pages. */
 export type AdminPageId =
   | 'dashboard'
+  | 'queue'
+  | 'tracks'
   | 'social-links'
   | 'donation-goal'
   | 'playlists'
@@ -16,6 +18,8 @@ export interface AdminNavItem {
 
 export const ADMIN_NAV_ITEMS: readonly AdminNavItem[] = [
   { id: 'dashboard', label: 'Dashboard' },
+  { id: 'queue', label: 'Queue' },
+  { id: 'tracks', label: 'Tracks' },
   { id: 'social-links', label: 'Social links' },
   { id: 'donation-goal', label: 'Donation goal' },
   { id: 'playlists', label: 'Playlists' },

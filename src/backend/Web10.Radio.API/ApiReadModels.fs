@@ -1,11 +1,55 @@
 namespace Web10.Radio.API
 
 open System
+open Dodo.Primitives
 open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
+open System.IO
 open Npgsql
 open Web10.Radio.Database.Repositories
+
+type ManagedCoverRead =
+    { CachePath: string
+      ContentType: string
+      SizeBytes: int64
+      Sha256: string }
+
+[<RequireQualifiedAccess>]
+module TrackAssetReadModel =
+    let tryCanonicalCachePath (cacheRoot: string) (cachePath: string) =
+        try
+            let root = Path.GetFullPath cacheRoot |> fun value -> value.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            let candidate = Path.GetFullPath cachePath
+            let prefix = root + string Path.DirectorySeparatorChar
+            if candidate.StartsWith(prefix, StringComparison.Ordinal) then Some candidate else None
+        with
+        | :? ArgumentException
+        | :? IOException
+        | :? NotSupportedException -> None
+
+    let tryGetManagedCover
+        (dataSource: NpgsqlDataSource)
+        (trackId: Guid)
+        (cancellationToken: CancellationToken)
+        : Task<Result<ManagedCoverRead option, RepositoryError>> =
+        task {
+            let! result = TrackRepository.tryGetActiveCover dataSource trackId cancellationToken
+            return
+                result
+                |> Result.map (function
+                    | Some cover when (cover.Source = "Embedded" || cover.Source = "Manual") ->
+                        match cover.CachePath, cover.ContentType, cover.SizeBytes, cover.Sha256 with
+                        | Some cachePath, Some contentType, Some sizeBytes, Some sha256
+                            when contentType = "image/jpeg" || contentType = "image/png" || contentType = "image/webp" ->
+                            Some
+                                { CachePath = cachePath
+                                  ContentType = contentType
+                                  SizeBytes = sizeBytes
+                                  Sha256 = sha256 }
+                        | _ -> None
+                    | _ -> None)
+        }
 
 module private ApiReadModelHelpers =
     let databaseError operation (ex: exn) = DatabaseError(operation, ex.Message)
@@ -110,7 +154,7 @@ LIMIT 1;"""
     t."Title",
     t."Artist",
     t."Album",
-    t."CoverImageUrl",
+    COALESCE(cover."CoverImageUrl", ''),
     t."DurationMs",
     q."Source",
     q."StartedAtUtc",
@@ -125,6 +169,18 @@ LEFT JOIN LATERAL (
     ORDER BY CASE WHEN tl."IsPrimary" THEN 0 ELSE 1 END, tl."CreatedAtUtc" ASC
     LIMIT 1
 ) link ON true
+LEFT JOIN LATERAL (
+    SELECT CASE
+        WHEN asset."Source" = 'LegacyExternal' THEN COALESCE(asset."ExternalUrl", '')
+        WHEN asset."Sha256" IS NOT NULL THEN '/api/v0/player/assets/cover/' || t."Id"::text || '?v=' || asset."Sha256"
+        ELSE ''
+    END AS "CoverImageUrl"
+    FROM "TrackAssets" asset
+    WHERE asset."TrackId" = t."Id"
+      AND asset."Kind" = 'Cover'
+      AND asset."IsDeleted" = false
+    LIMIT 1
+) cover ON true
 WHERE q."IsDeleted" = false
   AND q."Status" = 'Playing'
 ORDER BY q."StartedAtUtc" DESC NULLS LAST, q."UpdatedAtUtc" DESC
@@ -241,8 +297,8 @@ LIMIT 1;"""
         { Style = "aero"
           Layout = "corners" }
 
-    let private streamStateFromHeartbeat (clock: IClock) heartbeat =
-        let nowUtc = clock.UtcNow
+    let private streamStateFromHeartbeat (timeProvider: TimeProvider) heartbeat =
+        let nowUtc = timeProvider.GetUtcNow()
 
         match heartbeat with
         | None ->
@@ -280,8 +336,8 @@ LIMIT 1;"""
               StartedAtUtc = ApiTime.toIsoUtc heartbeat.HeartbeatAtUtc
               OfflineReason = offlineReason }
 
-    let private isStreamReadableHeartbeat (clock: IClock) heartbeat =
-        PersistedHeartbeatFreshness.isFresh clock.UtcNow heartbeat.HeartbeatAtUtc
+    let private isStreamReadableHeartbeat (timeProvider: TimeProvider) heartbeat =
+        PersistedHeartbeatFreshness.isFresh (timeProvider.GetUtcNow()) heartbeat.HeartbeatAtUtc
         && match mapStreamStatus heartbeat.Status with
            | "live"
            | "degraded" -> true
@@ -305,14 +361,13 @@ LIMIT 1;"""
                 return None
         }
 
-    let private loadNowPlayingFromConnection (connection: NpgsqlConnection) (clock: IClock) (cancellationToken: CancellationToken) =
+    let private loadNowPlayingFromConnection (connection: NpgsqlConnection) (timeProvider: TimeProvider) (cancellationToken: CancellationToken) =
         task {
             use command = new NpgsqlCommand(nowPlayingSql, connection)
             let! reader = command.ExecuteReaderAsync(cancellationToken)
             use reader = reader
             let! hasRow = reader.ReadAsync(cancellationToken)
-            let nowUtc = clock.UtcNow
-
+            let nowUtc = timeProvider.GetUtcNow()
             if not hasRow then
                 return emptyNowPlaying nowUtc
             else
@@ -485,22 +540,22 @@ LIMIT 1;"""
             return List.ofSeq socials
         }
 
-    let loadSnapshot (dataSource: NpgsqlDataSource) (clock: IClock) (cancellationToken: CancellationToken) : Task<Result<PlayerStateDto, RepositoryError>> =
+    let loadSnapshot (dataSource: NpgsqlDataSource) (timeProvider: TimeProvider) (cancellationToken: CancellationToken) : Task<Result<PlayerStateDto, RepositoryError>> =
         task {
             try
                 use! connection = dataSource.OpenConnectionAsync(cancellationToken)
-                let serverTimeUtc = clock.UtcNow
+                let serverTimeUtc = timeProvider.GetUtcNow()
                 let! heartbeat = loadLatestHeartbeat connection cancellationToken
-                let! nowPlaying = loadNowPlayingFromConnection connection clock cancellationToken
-                let! queue = loadQueueFromConnection connection cancellationToken
+                let! nowPlaying = loadNowPlayingFromConnection connection timeProvider cancellationToken
                 let! donationGoal = loadDonationGoalFromConnection connection cancellationToken
                 let! superChat = loadSuperChatFromConnection connection cancellationToken
                 let! socials = loadSocialsFromConnection connection cancellationToken
+                let! queue = loadQueueFromConnection connection cancellationToken
 
                 return
                     Ok
                         { ServerTimeUtc = ApiTime.toIsoUtc serverTimeUtc
-                          Stream = streamStateFromHeartbeat clock heartbeat
+                          Stream = streamStateFromHeartbeat timeProvider heartbeat
                           NowPlaying = nowPlaying
                           Queue = queue
                           DonationGoal = donationGoal
@@ -511,12 +566,12 @@ LIMIT 1;"""
                 return Error(databaseError "PlayerStateReadModel.loadSnapshot" ex)
         }
 
-    let loadStreamHealth (dataSource: NpgsqlDataSource) (clock: IClock) (cancellationToken: CancellationToken) : Task<Result<StreamHealthDto, RepositoryError>> =
+    let loadStreamHealth (dataSource: NpgsqlDataSource) (timeProvider: TimeProvider) (cancellationToken: CancellationToken) : Task<Result<StreamHealthDto, RepositoryError>> =
         task {
             try
                 use! connection = dataSource.OpenConnectionAsync(cancellationToken)
                 let! heartbeat = loadLatestHeartbeat connection cancellationToken
-                let stream = streamStateFromHeartbeat clock heartbeat
+                let stream = streamStateFromHeartbeat timeProvider heartbeat
                 let lastHeartbeatUtc = heartbeat |> Option.map (fun row -> ApiTime.toIsoUtc row.HeartbeatAtUtc) |> Option.defaultValue null
 
                 return
@@ -529,11 +584,11 @@ LIMIT 1;"""
                 return Error(databaseError "PlayerStateReadModel.loadStreamHealth" ex)
         }
 
-    let loadCurrentSong (dataSource: NpgsqlDataSource) (clock: IClock) (cancellationToken: CancellationToken) : Task<Result<CurrentSongDto, RepositoryError>> =
+    let loadCurrentSong (dataSource: NpgsqlDataSource) (timeProvider: TimeProvider) (cancellationToken: CancellationToken) : Task<Result<CurrentSongDto, RepositoryError>> =
         task {
             try
                 use! connection = dataSource.OpenConnectionAsync(cancellationToken)
-                let! nowPlaying = loadNowPlayingFromConnection connection clock cancellationToken
+                let! nowPlaying = loadNowPlayingFromConnection connection timeProvider cancellationToken
                 let fallbackText =
                     if String.IsNullOrEmpty nowPlaying.Artist && String.IsNullOrEmpty nowPlaying.Title then
                         String.Empty
@@ -570,14 +625,14 @@ LIMIT 1;"""
                 return Error(databaseError "PlayerStateReadModel.loadSocialLinks" ex)
         }
 
-    let loadStreamFile (dataSource: NpgsqlDataSource) (clock: IClock) (cancellationToken: CancellationToken) : Task<Result<StreamFileDto option, RepositoryError>> =
+    let loadStreamFile (dataSource: NpgsqlDataSource) (timeProvider: TimeProvider) (cancellationToken: CancellationToken) : Task<Result<StreamFileDto option, RepositoryError>> =
         task {
             try
                 use! connection = dataSource.OpenConnectionAsync(cancellationToken)
                 let! heartbeat = loadLatestHeartbeat connection cancellationToken
 
                 match heartbeat with
-                | Some current when isStreamReadableHeartbeat clock current ->
+                | Some current when isStreamReadableHeartbeat timeProvider current ->
                     use command = new NpgsqlCommand(streamFileSql, connection)
                     let! reader = command.ExecuteReaderAsync(cancellationToken)
                     use reader = reader
@@ -601,17 +656,16 @@ LIMIT 1;"""
 module TelegramWebhookInbox =
     let tryRecordRaw
         (dataSource: NpgsqlDataSource)
-        (idGenerator: IIdGenerator)
-        (clock: IClock)
+        (timeProvider: TimeProvider)
         (telegramUpdateId: int64)
         (payloadJson: string)
         (cancellationToken: CancellationToken)
         : Task<Result<bool, RepositoryError>> =
         let record =
-            { Id = idGenerator.NewId()
+            { Id = Uuid.CreateVersion7().ToGuidBigEndian()
               TelegramUpdateId = telegramUpdateId
               EventType = "telegram.webhook"
-              ReceivedAtUtc = clock.UtcNow
+              ReceivedAtUtc = timeProvider.GetUtcNow()
               CorrelationId = None
               PayloadJson = payloadJson }
 

@@ -131,22 +131,16 @@ docker compose ps
 `IsCached = true` и `CachePath` = путь на диске (для Local-хранилища материализация не
 нужна — файл уже локальный).
 
-### 5.3 Активный плейлист
-Вкладка **Playlists**:
+### 5.3 Политика плейлистов
+Во вкладке **Playlists** создаются policy-driven плейлисты, а не единственный ручной список:
 
-1. Заполните **Playlist name** (напр. `Web10 Main Rotation`) и описание.
-2. Отметьте чекбокс **Active playlist** — это и есть «основной» плейлист, из которого
-   программный воркер набирает ротацию (активный плейлист в системе один).
-3. **Create playlist** → в шапке появится `… (active) — 0 items`, сообщение `Saved`.
-4. **Search tracks** (пустой запрос выведет всю библиотеку, до 100 треков).
-5. У нужных треков жмите **«Add … to playlist»** (не путать с **«Queue … now»** —
-   это разовая немедленная постановка трека в очередь мимо плейлиста).
-6. Порядок правится стрелками **Move up/down**, лишнее — **Remove**.
-7. **Save playlist items** — в шапке обновится счётчик (напр. `— 5 items`), сообщение
-   `Saved playlist items`.
+1. Заполните **Playlist name**, описание, `Type`, `Source`, `Order`, `Weight`, `Avoid duplicates` и, при необходимости, `Interrupt`/`Is jingle`.
+2. Для cadence выберите `Every N songs`, `Every N minutes` или `At minute`; для временных окон добавьте `daysOfWeek`, `startTime`, `endTime`, даты и `timeZoneId`.
+3. `Source = AllStorage` — системная политика всех закэшированных треков; `Source = Manual` использует сохранённый упорядоченный список.
+4. Для manual-плейлиста найдите треки, нажмите **Add … to playlist**, расставьте **Move up/down**, удалите лишнее и нажмите **Save playlist items**.
+5. Отметьте нужные политики **Active**. Несколько активных политик допускаются: scheduler выбирает их по cadence, schedule, interrupt, order, weight и selection credit.
 
-Как только плейлист активен и непуст, фоновый `PlaybackProgram` при простое очереди
-ставит следующий трек плейлиста в `PlaybackQueue`.
+При простое очереди фоновый `PlaybackProgram` атомарно подбирает следующую активную policy, обновляет её scheduler state и ставит кэшированный трек в `PlaybackQueue`. Вне schedule, без подходящего cached item или при нарушении duplicate-window политика пропускается без разрушения очереди.
 
 ### 5.4 Запуск эфира
 Вкладка **Stream-node**: показывает `Status`, `Desired state`, `Last heartbeat`,
@@ -211,18 +205,10 @@ docker compose logs stream-node --since 2m | grep -iE "Prepared|output-failed|RT
 
 ## 7. Траблшутинг
 
-- **`Status` застрял в `starting`, очередь пустая.** Нет активного непустого плейлиста —
-  вернитесь к §5.3 (галка *Active* + *Save playlist items*).
+- **`Status` застрял в `starting`, очередь пустая.** Проверьте, что есть хотя бы одна активная policy с подходящим schedule/cadence и доступным cached item; для `Manual` сохраните items, для `AllStorage` дождитесь завершения library scan.
 
-- **`Playback start callback timed out`, треки уходят в `Failed`, в логах
-  `Nonexistent file or ill-formed URI ".../01.%20Take%20On%20Me.mp3"`.** Это был баг:
-  `stream-node` строил RTMP-запрос через `Path.as_uri()`, который percent-энкодит
-  пробелы (` ` → `%20`), а резолвер Liquidsoap их не декодировал — падал любой файл с
-  пробелом в имени (вся папка `synthwave/`). **Исправлено** в
-  `src/stream-node/scripts/supervisor.py` (`_annotated_file_uri` теперь отдаёт обычный
-  абсолютный путь; метаданные `annotate:` заканчиваются на `:` перед путём, так что
-  пробелы в пути безопасны). После правки нужен пересбор ноды:
-  `docker compose build stream-node && docker compose up -d --no-deps --force-recreate stream-node`.
+- **`Playback start callback timed out`, треки уходят в `Failed`, в логах `Nonexistent file or ill-formed URI`.** Проверьте, что `TrackFile.IsCached = true` и `CachePath` указывает на существующий файл. F# runtime передаёт Liquidsoap обычный абсолютный путь, поэтому пробелы в имени не требуют ручного URI-экранирования.
+- После изменения stream-node пересоберите только ноду: `docker compose build stream-node && docker compose up -d --no-deps --force-recreate stream-node`.
 
 - **`Status` уходит в `degraded`/`failed`, `Failure reason: RTMP output failed`.**
   Telegram не принимает публикацию: Live Stream в канале не запущен/закрыт, либо неверный

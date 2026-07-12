@@ -1,23 +1,7 @@
-namespace Web10.Radio.API
+namespace Web10.Radio.Application
 
 open System
-open Dodo.Primitives
 open Microsoft.Extensions.DependencyInjection
-
-type IClock =
-    abstract member UtcNow: DateTimeOffset
-
-type SystemClock() =
-    interface IClock with
-        member _.UtcNow = DateTimeOffset.UtcNow
-
-type IIdGenerator =
-    abstract member NewId: unit -> Guid
-
-type UuidV7IdGenerator() =
-    interface IIdGenerator with
-        member _.NewId() =
-            Uuid.CreateVersion7().ToGuidBigEndian()
 
 type StreamNodeHeartbeatState() =
     let syncRoot = obj()
@@ -35,4 +19,5 @@ type StreamNodeHeartbeatState() =
 
 module ApplicationComposition =
     let addApplicationServices (services: IServiceCollection) : IServiceCollection =
-        services.AddSingleton<IClock, SystemClock>().AddSingleton<IIdGenerator, UuidV7IdGenerator>()
+        services.AddSingleton<TimeProvider>(TimeProvider.System) |> ignore
+        services

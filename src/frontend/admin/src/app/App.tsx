@@ -5,6 +5,8 @@ import { DashboardPage } from '../pages/dashboard/DashboardPage';
 import { DonationGoalPage } from '../pages/donation-goal/DonationGoalPage';
 import { LibraryScanPage } from '../pages/library-scan/LibraryScanPage';
 import { PlaylistsPage } from '../pages/playlists/PlaylistsPage';
+import { QueuePage } from '../pages/queue/QueuePage';
+import { TracksPage } from '../pages/tracks/TracksPage';
 import { SayModerationPage } from '../pages/say-moderation/SayModerationPage';
 import { SocialLinksPage } from '../pages/social-links/SocialLinksPage';
 import { StoragePage } from '../pages/storage/StoragePage';
@@ -16,6 +18,8 @@ function renderPage(page: AdminPageId): ReactElement {
   switch (page) {
     case 'dashboard':
       return <DashboardPage />;
+    case 'queue':
+      return <QueuePage />;
     case 'social-links':
       return <SocialLinksPage />;
     case 'donation-goal':
@@ -30,6 +34,8 @@ function renderPage(page: AdminPageId): ReactElement {
       return <StreamNodePage />;
     case 'library-scan':
       return <LibraryScanPage />;
+    case 'tracks':
+      return <TracksPage />;
   }
 }
 

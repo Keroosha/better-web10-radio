@@ -5,11 +5,11 @@ open System.Threading
 open Npgsql
 open NUnit.Framework
 open Web10.Radio.API
+open Dodo.Primitives
 open Web10.Radio.Database
 
 module DatabaseSessionResultTests =
-    let private newId () =
-        (UuidV7IdGenerator() :> IIdGenerator).NewId()
+    let private newId () = Uuid.CreateVersion7().ToGuidBigEndian()
 
     let private countTrack connection trackId =
         task {

@@ -8,6 +8,7 @@ open System.Threading.Tasks
 open Microsoft.Extensions.Diagnostics.HealthChecks
 open NUnit.Framework
 open Web10.Radio.API
+open Web10.Radio.Telegram
 
 module HealthOperabilityTests =
     type private IdentityProbe(result: Choice<bool, exn>) =
@@ -22,7 +23,7 @@ module HealthOperabilityTests =
                 }
 
     type private BucketProbe(result: Choice<unit, exn>) =
-        interface IS3ObjectEnumerator with
+        interface IS3ObjectStorage with
             member _.VisitPagesAsync(_, _, cancellationToken) =
                 cancellationToken.ThrowIfCancellationRequested()
                 Task.CompletedTask
@@ -35,11 +36,15 @@ module HealthOperabilityTests =
                     | Choice1Of2 () -> return ()
                     | Choice2Of2 error -> return raise error
                 }
-                :> Task
+
+            member _.DownloadToFileAsync(_, _, _, cancellationToken) =
+                cancellationToken.ThrowIfCancellationRequested()
+                Task.CompletedTask
 
     let private storageOptions storageType localRoot bucket =
         { Type = storageType
           LocalRoot = localRoot
+          CacheRoot = localRoot
           S3Bucket = bucket
           S3Region = "us-east-1"
           S3ServiceUrl = None
@@ -68,7 +73,7 @@ module HealthOperabilityTests =
 
             try
                 let localSuccess =
-                    StorageHealthCheck(storageOptions Local temporaryDirectory.FullName "", BucketProbe(Choice1Of2 ()) :> IS3ObjectEnumerator)
+                    StorageHealthCheck(storageOptions Local temporaryDirectory.FullName "", BucketProbe(Choice1Of2 ()) :> IS3ObjectStorage)
                     :> IHealthCheck
 
                 let! localSuccessResult = check localSuccess CancellationToken.None
@@ -76,28 +81,28 @@ module HealthOperabilityTests =
                 Assert.That(Directory.EnumerateFiles(temporaryDirectory.FullName, ".web10-readiness-*.tmp") |> Seq.isEmpty, Is.True, "The Local readiness probe must delete its write marker.")
 
                 let missingLocal =
-                    StorageHealthCheck(storageOptions Local (Path.Combine(temporaryDirectory.FullName, "missing")) "", BucketProbe(Choice1Of2 ()) :> IS3ObjectEnumerator)
+                    StorageHealthCheck(storageOptions Local (Path.Combine(temporaryDirectory.FullName, "missing")) "", BucketProbe(Choice1Of2 ()) :> IS3ObjectStorage)
                     :> IHealthCheck
 
                 let! missingResult = check missingLocal CancellationToken.None
                 Assert.That(missingResult.Status, Is.EqualTo(HealthStatus.Unhealthy))
 
                 let unwritableLocal =
-                    StorageHealthCheck(storageOptions Local "/proc" "", BucketProbe(Choice1Of2 ()) :> IS3ObjectEnumerator)
+                    StorageHealthCheck(storageOptions Local "/proc" "", BucketProbe(Choice1Of2 ()) :> IS3ObjectStorage)
                     :> IHealthCheck
 
                 let! unwritableResult = check unwritableLocal CancellationToken.None
                 Assert.That(unwritableResult.Status, Is.EqualTo(HealthStatus.Unhealthy))
 
                 let s3Success =
-                    StorageHealthCheck(storageOptions S3 "" "radio-test-bucket", BucketProbe(Choice1Of2 ()) :> IS3ObjectEnumerator)
+                    StorageHealthCheck(storageOptions S3 "" "radio-test-bucket", BucketProbe(Choice1Of2 ()) :> IS3ObjectStorage)
                     :> IHealthCheck
 
                 let! s3SuccessResult = check s3Success CancellationToken.None
                 Assert.That(s3SuccessResult.Status, Is.EqualTo(HealthStatus.Healthy))
 
                 let s3Failure =
-                    StorageHealthCheck(storageOptions S3 "" "radio-test-bucket", BucketProbe(Choice2Of2(InvalidOperationException("denied"))) :> IS3ObjectEnumerator)
+                    StorageHealthCheck(storageOptions S3 "" "radio-test-bucket", BucketProbe(Choice2Of2(InvalidOperationException("denied"))) :> IS3ObjectStorage)
                     :> IHealthCheck
 
                 let! s3FailureResult = check s3Failure CancellationToken.None
@@ -119,7 +124,7 @@ module HealthOperabilityTests =
             with :? OperationCanceledException -> ()
 
             let storage =
-                StorageHealthCheck(storageOptions S3 "" "radio-test-bucket", BucketProbe(Choice1Of2 ()) :> IS3ObjectEnumerator)
+                StorageHealthCheck(storageOptions S3 "" "radio-test-bucket", BucketProbe(Choice1Of2 ()) :> IS3ObjectStorage)
                 :> IHealthCheck
 
             try

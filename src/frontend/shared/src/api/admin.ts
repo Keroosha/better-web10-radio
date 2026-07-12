@@ -4,6 +4,8 @@ import { z } from 'zod';
 import {
   AdminSayMessageSchema,
   AdminSessionSchema,
+  AdminTrackPageSchema,
+  type AdminTrackPage,
   AdminTrackSchema,
   type AdminTrack,
   type AdminSayMessage,
@@ -26,9 +28,13 @@ import {
   type PlaylistItemsReplaceRequest,
   type PlaylistMutationRequest,
   PlaylistSchema,
-  type QueueTrackAccepted,
+  type QueueReorderRequest,
   QueueTrackAcceptedSchema,
+  type QueueTrackAccepted,
   type QueueTrackRequest,
+  PlaybackQueueAcceptedSchema,
+  type PlaybackQueueAccepted,
+  type TrackMetadataUpdateRequest,
   type SocialLinksReplaceRequest,
   type Storage,
   type StorageReplaceRequest,
@@ -42,6 +48,8 @@ import { type SuperChatStatus } from '../domain/enums';
 import {
   DonationGoalSchema,
   type DonationGoal,
+  QueueStateSchema,
+  type QueueState,
   SocialLinkSchema,
   type SocialLink,
 } from '../domain/player-state';
@@ -49,6 +57,7 @@ import {
   API_V0_PREFIX,
   apiFetch,
   apiSend,
+  apiUpload,
   clearAdminSession,
   setAdminSession,
   type RequestOptions,
@@ -56,7 +65,6 @@ import {
 
 const SocialLinkListSchema = z.array(SocialLinkSchema);
 const AdminSayMessageListSchema = z.array(AdminSayMessageSchema);
-const AdminTrackListSchema = z.array(AdminTrackSchema);
 const PlaylistListSchema = z.array(PlaylistSchema);
 const PlaylistItemListSchema = z.array(PlaylistItemSchema);
 const emptyAdminRequest = EmptyAdminRequestSchema.parse({});
@@ -127,16 +135,70 @@ export function getLibraryScan(scanJobId: string, opts: RequestOptions = {}): Pr
 export interface TracksQuery {
   readonly query?: string;
   readonly limit?: number;
+  readonly cursor?: string | null;
 }
 
-/** List active library tracks, defaulting to an empty query and 100 results. */
-export function getTracks(query: TracksQuery = {}, opts: RequestOptions = {}): Promise<AdminTrack[]> {
+/** List active library tracks using the cursor ordered by creation time and ID. */
+export function getTracksPage(
+  query: TracksQuery = {},
+  opts: RequestOptions = {},
+): Promise<AdminTrackPage> {
   const parameters = new URLSearchParams({
     query: query.query ?? '',
     limit: String(query.limit ?? 100),
   });
+  if (query.cursor !== undefined && query.cursor !== null) {
+    parameters.set('cursor', query.cursor);
+  }
   return apiFetch(`${API_V0_PREFIX}/admin/tracks?${parameters.toString()}`, {
-    schema: AdminTrackListSchema,
+    schema: AdminTrackPageSchema,
+    admin: true,
+    ...opts,
+  });
+}
+
+/** Replace canonical metadata without modifying source-media tags. */
+export function updateTrackMetadata(
+  trackId: string,
+  body: TrackMetadataUpdateRequest,
+  opts: RequestOptions = {},
+): Promise<AdminTrack> {
+  return apiFetch<AdminTrack, TrackMetadataUpdateRequest>(
+    `${API_V0_PREFIX}/admin/tracks/${encodeURIComponent(trackId)}`,
+    {
+      schema: AdminTrackSchema,
+      method: 'PUT',
+      body,
+      admin: true,
+      ...opts,
+    },
+  );
+}
+
+export type CoverUploadBody = Blob | FormData;
+
+/** Upload a managed cover image as raw bytes or multipart form data. */
+export function replaceTrackCover(
+  trackId: string,
+  body: CoverUploadBody,
+  opts: RequestOptions = {},
+): Promise<AdminTrack> {
+  const contentType = body instanceof Blob && body.type.length > 0 ? body.type : undefined;
+  return apiUpload<AdminTrack>(`${API_V0_PREFIX}/admin/tracks/${encodeURIComponent(trackId)}/cover`, {
+    schema: AdminTrackSchema,
+    method: 'PUT',
+    body,
+    ...(contentType === undefined ? {} : { contentType }),
+    admin: true,
+    ...opts,
+  });
+}
+
+/** Soft-delete the managed cover and return the updated track projection. */
+export function removeTrackCover(trackId: string, opts: RequestOptions = {}): Promise<AdminTrack> {
+  return apiFetch(`${API_V0_PREFIX}/admin/tracks/${encodeURIComponent(trackId)}/cover`, {
+    schema: AdminTrackSchema,
+    method: 'DELETE',
     admin: true,
     ...opts,
   });
@@ -149,6 +211,54 @@ export function queueTrack(
 ): Promise<QueueTrackAccepted> {
   return apiFetch<QueueTrackAccepted, QueueTrackRequest>(`${API_V0_PREFIX}/admin/playback/queue`, {
     schema: QueueTrackAcceptedSchema,
+    method: 'POST',
+    body,
+    admin: true,
+    ...opts,
+  });
+}
+
+/** Replace the complete active queued-ID order atomically. */
+export function reorderQueue(
+  body: QueueReorderRequest,
+  opts: RequestOptions = {},
+): Promise<QueueState> {
+  return apiFetch<QueueState, QueueReorderRequest>(`${API_V0_PREFIX}/admin/playback/queue/order`, {
+    schema: QueueStateSchema,
+    method: 'PUT',
+    body,
+    admin: true,
+    ...opts,
+  });
+}
+
+/** Skip the currently playing or claimed item. */
+export function skipCurrent(opts: RequestOptions = {}): Promise<void> {
+  return apiSend(`${API_V0_PREFIX}/admin/playback/skip`, {
+    method: 'POST',
+    body: emptyAdminRequest,
+    admin: true,
+    ...opts,
+  });
+}
+
+/** Insert a durable restart command for the currently playing item. */
+export function restartCurrent(opts: RequestOptions = {}): Promise<void> {
+  return apiSend(`${API_V0_PREFIX}/admin/playback/restart-current`, {
+    method: 'POST',
+    body: emptyAdminRequest,
+    admin: true,
+    ...opts,
+  });
+}
+
+/** Queue a track immediately, interrupting the current assignment when present. */
+export function playNow(
+  body: QueueTrackRequest,
+  opts: RequestOptions = {},
+): Promise<PlaybackQueueAccepted> {
+  return apiFetch<PlaybackQueueAccepted, QueueTrackRequest>(`${API_V0_PREFIX}/admin/playback/play-now`, {
+    schema: PlaybackQueueAcceptedSchema,
     method: 'POST',
     body,
     admin: true,

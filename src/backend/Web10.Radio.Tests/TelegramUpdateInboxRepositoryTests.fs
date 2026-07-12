@@ -5,11 +5,11 @@ open System.Threading
 open Npgsql
 open NUnit.Framework
 open Web10.Radio.API
+open Dodo.Primitives
 open Web10.Radio.Database.Repositories
 
 module TelegramUpdateInboxRepositoryTests =
-    let private newId () =
-        (UuidV7IdGenerator() :> IIdGenerator).NewId()
+    let private newId () = Uuid.CreateVersion7().ToGuidBigEndian()
 
     let private record telegramUpdateId eventType receivedAtUtc =
         { Id = newId ()

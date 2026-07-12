@@ -5,15 +5,16 @@ open System.Threading
 open Npgsql
 open NUnit.Framework
 open Web10.Radio.API
+open Dodo.Primitives
 open Web10.Radio.Database.Repositories
 
 module OutboxEventRepositoryTests =
-    let private newId () =
-        (UuidV7IdGenerator() :> IIdGenerator).NewId()
+    let private newId () = Uuid.CreateVersion7().ToGuidBigEndian()
 
     let private eventToAppend eventId occurredAtUtc =
         { Id = eventId
           EventType = "PlaybackStarted"
+          Audience = OutboxAudience.Api
           OccurredAtUtc = occurredAtUtc
           Producer = "web10.radio.tests"
           CorrelationId = Some(newId ())
@@ -53,14 +54,14 @@ module OutboxEventRepositoryTests =
                     | actual -> Assert.Fail(sprintf "Expected append to succeed, but got %A." actual)
 
                 let! firstLeaseResult =
-                    OutboxEventRepository.tryClaimDueOrdered dataSource firstOwner occurredAtUtc 1 CancellationToken.None
+                    OutboxEventRepository.tryClaimDueOrdered dataSource OutboxAudience.Api firstOwner occurredAtUtc 1 CancellationToken.None
 
                 let firstLease = claim "the first relay" firstLeaseResult
                 Assert.That(firstLease.Records |> List.length, Is.EqualTo(1))
                 Assert.That((firstLease.Records |> List.exactlyOne).Id, Is.EqualTo(firstEventId))
 
                 let! overlappingClaim =
-                    OutboxEventRepository.tryClaimDueOrdered dataSource secondOwner occurredAtUtc 1 CancellationToken.None
+                    OutboxEventRepository.tryClaimDueOrdered dataSource OutboxAudience.Api secondOwner occurredAtUtc 1 CancellationToken.None
 
                 match overlappingClaim with
                 | Ok None -> ()
@@ -68,7 +69,7 @@ module OutboxEventRepositoryTests =
                 (firstLease :> IDisposable).Dispose()
 
                 let! blockedByEarlierProcessing =
-                    OutboxEventRepository.tryClaimDueOrdered dataSource secondOwner (occurredAtUtc.AddSeconds(1.0)) 1 CancellationToken.None
+                    OutboxEventRepository.tryClaimDueOrdered dataSource OutboxAudience.Api secondOwner (occurredAtUtc.AddSeconds(1.0)) 1 CancellationToken.None
 
                 let emptyLease = claim "the relay after the first lease released" blockedByEarlierProcessing
                 Assert.That(emptyLease.Records, Is.Empty, "The second event must not overtake the earlier Processing event.")
@@ -80,7 +81,7 @@ module OutboxEventRepositoryTests =
                 assertOkTrue "the first owner terminal update" firstProcessed
 
                 let! nextLeaseResult =
-                    OutboxEventRepository.tryClaimDueOrdered dataSource secondOwner (occurredAtUtc.AddSeconds(3.0)) 1 CancellationToken.None
+                    OutboxEventRepository.tryClaimDueOrdered dataSource OutboxAudience.Api secondOwner (occurredAtUtc.AddSeconds(3.0)) 1 CancellationToken.None
 
                 let nextLease = claim "the second event after the first completed" nextLeaseResult
                 Assert.That(nextLease.Records |> List.length, Is.EqualTo(1))
@@ -103,14 +104,14 @@ module OutboxEventRepositoryTests =
                 | actual -> Assert.Fail(sprintf "Expected append to succeed, but got %A." actual)
 
                 let! firstLeaseResult =
-                    OutboxEventRepository.tryClaimDueOrdered dataSource firstOwner occurredAtUtc 1 CancellationToken.None
+                    OutboxEventRepository.tryClaimDueOrdered dataSource OutboxAudience.Api firstOwner occurredAtUtc 1 CancellationToken.None
 
                 let firstLease = claim "the original attempt" firstLeaseResult
                 let firstRecord = firstLease.Records |> List.exactlyOne
                 (firstLease :> IDisposable).Dispose()
 
                 let! replacementLeaseResult =
-                    OutboxEventRepository.tryClaimDueOrdered dataSource replacementOwner (occurredAtUtc.AddSeconds(31.0)) 1 CancellationToken.None
+                    OutboxEventRepository.tryClaimDueOrdered dataSource OutboxAudience.Api replacementOwner (occurredAtUtc.AddSeconds(31.0)) 1 CancellationToken.None
 
                 let replacementLease = claim "the lease-expired replacement attempt" replacementLeaseResult
                 let replacementRecord = replacementLease.Records |> List.exactlyOne

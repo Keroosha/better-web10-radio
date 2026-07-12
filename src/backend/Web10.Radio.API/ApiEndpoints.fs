@@ -1,11 +1,15 @@
 namespace Web10.Radio.API
 
 open System
+open System.Globalization
+open Dodo.Primitives
+open Web10.Radio.Application
 open System.Buffers
 open System.Security.Claims
 open System.Text.Encodings.Web
 open System.Collections.Generic
 open System.Diagnostics
+open FsToolkit.ErrorHandling
 open System.IO
 open System.Net.ServerSentEvents
 open System.Security.Cryptography
@@ -13,7 +17,6 @@ open System.Text
 open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
-open Funogram.Telegram.Types
 open Microsoft.AspNetCore.Authentication
 open Microsoft.AspNetCore.Authorization
 open Microsoft.AspNetCore.Builder
@@ -27,7 +30,6 @@ open Microsoft.Extensions.Hosting
 open Npgsql
 open Web10.Radio.Database
 open Web10.Radio.Database.Repositories
-open Web10.Radio.Telegram
 
 [<RequireQualifiedAccess>]
 module ApiSecurity =
@@ -141,7 +143,7 @@ type PlayerEventsDelay() =
         member _.WaitForNextSnapshotAsync(cancellationToken) =
             Task.Delay(TimeSpan.FromSeconds(5.0), cancellationToken)
 
-type private PlayerEventsEnumerator(dataSource: NpgsqlDataSource, clock: IClock, delay: IPlayerEventsDelay, cancellationToken: CancellationToken) =
+type private PlayerEventsEnumerator(dataSource: NpgsqlDataSource, clock: TimeProvider, delay: IPlayerEventsDelay, cancellationToken: CancellationToken) =
     let mutable eventIndex = 0
     let mutable currentSnapshot: PlayerStateDto option = None
     let mutable current = Unchecked.defaultof<SseItem<JsonElement>>
@@ -214,7 +216,7 @@ type private PlayerEventsEnumerator(dataSource: NpgsqlDataSource, clock: IClock,
         member _.DisposeAsync() : ValueTask =
             ValueTask()
 
-type private PlayerEvents(dataSource: NpgsqlDataSource, clock: IClock, delay: IPlayerEventsDelay, requestAborted: CancellationToken) =
+type private PlayerEvents(dataSource: NpgsqlDataSource, clock: TimeProvider, delay: IPlayerEventsDelay, requestAborted: CancellationToken) =
     interface IAsyncEnumerable<SseItem<JsonElement>> with
         member _.GetAsyncEnumerator(enumeratorCancellationToken: CancellationToken) =
             let cancellationToken =
@@ -225,14 +227,6 @@ type private PlayerEvents(dataSource: NpgsqlDataSource, clock: IClock, delay: IP
 
             PlayerEventsEnumerator(dataSource, clock, delay, cancellationToken) :> IAsyncEnumerator<SseItem<JsonElement>>
 
-/// Result of routing a single parsed Telegram update through the shared ingestion path.
-/// Both the webhook endpoint and the long-polling worker consume this: the webhook maps
-/// it to an HTTP status, the worker maps it to logging + offset-advance decisions.
-type TelegramUpdateProcessingOutcome =
-    | TelegramUpdateAccepted
-    | TelegramUpdateRejected of message: string
-    | TelegramPreCheckoutUnavailable of error: BackgroundWorkerError
-    | TelegramIngestFailed of error: BackgroundWorkerError
 
 [<RequireQualifiedAccess>]
 module ApiEndpoints =
@@ -332,7 +326,7 @@ module ApiEndpoints =
     let private playerState (context: HttpContext) =
         task {
             let dataSource = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
-            let clock = context.RequestServices.GetRequiredService<IClock>()
+            let clock = context.RequestServices.GetRequiredService<TimeProvider>()
             let! result = PlayerStateReadModel.loadSnapshot dataSource clock context.RequestAborted
 
             match result with
@@ -347,7 +341,7 @@ module ApiEndpoints =
     let private playerEvents (context: HttpContext) =
         task {
             let dataSource = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
-            let clock = context.RequestServices.GetRequiredService<IClock>()
+            let clock = context.RequestServices.GetRequiredService<TimeProvider>()
             let delay = context.RequestServices.GetRequiredService<IPlayerEventsDelay>()
             let events = PlayerEvents(dataSource, clock, delay, context.RequestAborted) :> IAsyncEnumerable<SseItem<JsonElement>>
             let result = TypedResults.ServerSentEvents<JsonElement>(events) :> IResult
@@ -358,7 +352,7 @@ module ApiEndpoints =
     let private playerStream (context: HttpContext) =
         task {
             let dataSource = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
-            let clock = context.RequestServices.GetRequiredService<IClock>()
+            let clock = context.RequestServices.GetRequiredService<TimeProvider>()
             let! healthResult = PlayerStateReadModel.loadStreamHealth dataSource clock context.RequestAborted
 
             match healthResult with
@@ -402,7 +396,7 @@ module ApiEndpoints =
     let private playerSong (context: HttpContext) =
         task {
             let dataSource = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
-            let clock = context.RequestServices.GetRequiredService<IClock>()
+            let clock = context.RequestServices.GetRequiredService<TimeProvider>()
             let! result = PlayerStateReadModel.loadCurrentSong dataSource clock context.RequestAborted
 
             match result with
@@ -417,7 +411,7 @@ module ApiEndpoints =
     let private playerHealth (context: HttpContext) =
         task {
             let dataSource = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
-            let clock = context.RequestServices.GetRequiredService<IClock>()
+            let clock = context.RequestServices.GetRequiredService<TimeProvider>()
             let! result = PlayerStateReadModel.loadStreamHealth dataSource clock context.RequestAborted
 
             match result with
@@ -429,243 +423,6 @@ module ApiEndpoints =
                 return StatusCodes.Status500InternalServerError
         }
 
-    [<Literal>]
-    let TelegramWebhookMaxBodyBytes = 1_048_576
-
-    type private TelegramMappedEvent =
-        { EventType: DomainEventType
-          PayloadJson: string }
-
-    type private TelegramMappedUpdate =
-        | Ignored
-        | DurableEvent of TelegramMappedEvent
-        | PreCheckout of TelegramPreCheckoutInput
-
-    type private TelegramUserContext =
-        { TelegramUserId: int64
-          DisplayName: string option
-          LanguageCode: string option }
-
-    type private CallbackMessageContext =
-        { ChatId: int64
-          MessageId: int64 }
-
-    let private webhookSecretHeader (context: HttpContext) =
-        let mutable values = StringValues()
-
-        if context.Request.Headers.TryGetValue("X-Telegram-Bot-Api-Secret-Token", &values) && values.Count = 1 then
-            Some values[0]
-        else
-            None
-
-    let private tryCommandArgument (expectedCommand: string) (text: string) =
-        if String.IsNullOrWhiteSpace text then
-            None
-        else
-            let separatorIndex = text.IndexOfAny([| ' '; '\t'; '\r'; '\n' |])
-
-            let commandToken, argument =
-                if separatorIndex < 0 then
-                    text, String.Empty
-                else
-                    text.Substring(0, separatorIndex), text.Substring(separatorIndex + 1).Trim()
-
-            let commandWithoutBot =
-                let botSeparatorIndex = commandToken.IndexOf('@')
-
-                if botSeparatorIndex > 0
-                   && botSeparatorIndex < commandToken.Length - 1
-                   && commandToken.IndexOf('@', botSeparatorIndex + 1) < 0 then
-                    commandToken.Substring(0, botSeparatorIndex)
-                else
-                    commandToken
-
-            if String.Equals(commandWithoutBot, expectedCommand, StringComparison.OrdinalIgnoreCase) then Some argument else None
-
-    let private telegramUserContext (user: User) =
-        let displayName =
-            match user.Username with
-            | Some username when not (String.IsNullOrWhiteSpace username) -> Some username
-            | _ ->
-                [ Some user.FirstName; user.LastName ]
-                |> List.choose id
-                |> String.concat " "
-                |> fun value -> if String.IsNullOrWhiteSpace value then None else Some value
-
-        { TelegramUserId = user.Id
-          DisplayName = displayName
-          LanguageCode = user.LanguageCode }
-
-    let private telegramActor (message: Message) =
-        message.From |> Option.map telegramUserContext
-
-    let private callbackMessageContext (callbackQuery: CallbackQuery) =
-        callbackQuery.Message
-        |> Option.map (function
-            | MaybeInaccessibleMessage.Message message ->
-                { ChatId = message.Chat.Id
-                  MessageId = message.MessageId }
-            | MaybeInaccessibleMessage.InaccessibleMessage message ->
-                { ChatId = message.Chat.Id
-                  MessageId = message.MessageId })
-
-    let private isPositiveInt32 (value: int64) =
-        value > 0L && value <= int64 Int32.MaxValue
-
-    let private mapTelegramUpdate (update: Update) : Result<TelegramMappedUpdate, string> =
-        match update.PreCheckoutQuery with
-        | Some preCheckoutQuery when String.IsNullOrWhiteSpace preCheckoutQuery.Id ->
-            Error "Telegram pre-checkout query id is required."
-        | Some preCheckoutQuery when String.IsNullOrWhiteSpace preCheckoutQuery.InvoicePayload ->
-            Error "Telegram pre-checkout invoice payload is required."
-        | Some preCheckoutQuery when not (isPositiveInt32 preCheckoutQuery.TotalAmount) ->
-            Error "Telegram pre-checkout amount must be a positive supported integer."
-        | Some preCheckoutQuery ->
-            let user = telegramUserContext preCheckoutQuery.From
-
-            Ok(
-                PreCheckout
-                    { TelegramUpdateId = update.UpdateId
-                      QueryId = preCheckoutQuery.Id
-                      TelegramUserId = user.TelegramUserId
-                      LanguageCode = user.LanguageCode
-                      Currency = preCheckoutQuery.Currency
-                      TotalAmount = int preCheckoutQuery.TotalAmount
-                      InvoicePayload = preCheckoutQuery.InvoicePayload }
-            )
-        | None ->
-            match update.Message |> Option.bind (fun message -> message.SuccessfulPayment |> Option.map (fun payment -> message, payment)) with
-            | Some(message, payment) when String.IsNullOrWhiteSpace payment.InvoicePayload ->
-                Error "Telegram payment invoice payload is required."
-            | Some(message, payment) when String.IsNullOrWhiteSpace payment.TelegramPaymentChargeId ->
-                Error "Telegram payment charge id is required."
-            | Some(message, payment) when not (isPositiveInt32 payment.TotalAmount) ->
-                Error "Telegram payment amount must be a positive supported integer."
-            | Some(message, payment) ->
-                let actor = telegramActor message
-
-                let payload =
-                    JsonSerializer.Serialize(
-                        {| paymentId = payment.InvoicePayload
-                           telegramPaymentChargeId = payment.TelegramPaymentChargeId
-                           amountStars = int payment.TotalAmount
-                           currency = payment.Currency
-                           telegramUpdateId = update.UpdateId
-                           telegramMessageId = message.MessageId
-                           chatId = message.Chat.Id
-                           telegramUserId = actor |> Option.map (fun value -> value.TelegramUserId)
-                           displayName = actor |> Option.bind (fun value -> value.DisplayName)
-                           languageCode = actor |> Option.bind (fun value -> value.LanguageCode) |},
-                        ApiJson.options
-                    )
-
-                Ok(DurableEvent { EventType = DomainEventType.DonationPaid; PayloadJson = payload })
-            | None ->
-                match update.CallbackQuery with
-                | Some callbackQuery when String.IsNullOrWhiteSpace callbackQuery.Id ->
-                    Error "Telegram callback query id is required."
-                | Some callbackQuery ->
-                    let actor = telegramUserContext callbackQuery.From
-                    let message = callbackMessageContext callbackQuery
-                    let chatId = message |> Option.map (fun value -> value.ChatId)
-                    let isPrivateChat = chatId = Some actor.TelegramUserId
-
-                    let payload =
-                        JsonSerializer.Serialize(
-                            {| telegramUpdateId = update.UpdateId
-                               telegramMessageId = message |> Option.map (fun value -> value.MessageId)
-                               chatId = chatId
-                               telegramUserId = actor.TelegramUserId
-                               displayName = actor.DisplayName
-                               languageCode = actor.LanguageCode
-                               callbackQueryId = callbackQuery.Id
-                               rawCallbackData = callbackQuery.Data
-                               isPrivateChat = isPrivateChat |},
-                            ApiJson.options
-                        )
-
-                    Ok(DurableEvent { EventType = DomainEventType.TelegramCallbackReceived; PayloadJson = payload })
-                | None ->
-                    match update.Message with
-                    | Some message ->
-                        match message.Text, telegramActor message with
-                        | Some text, Some actor ->
-                            let chatId = message.Chat.Id
-                            let isPrivateChat = chatId = actor.TelegramUserId
-
-                            let commandEvent eventType command argument =
-                                let payload =
-                                    JsonSerializer.Serialize(
-                                        {| telegramUpdateId = update.UpdateId
-                                           telegramMessageId = message.MessageId
-                                           chatId = chatId
-                                           telegramUserId = actor.TelegramUserId
-                                           displayName = actor.DisplayName
-                                           languageCode = actor.LanguageCode
-                                           command = command
-                                           argument = argument
-                                           isPrivateChat = isPrivateChat |},
-                                        ApiJson.options
-                                    )
-
-                                DurableEvent { EventType = eventType; PayloadJson = payload }
-
-                            match
-                                tryCommandArgument "/request" text,
-                                tryCommandArgument "/say" text,
-                                tryCommandArgument "/start" text,
-                                tryCommandArgument "/help" text,
-                                tryCommandArgument "/song" text,
-                                tryCommandArgument "/terms" text,
-                                tryCommandArgument "/paysupport" text
-                            with
-                            | Some query, _, _, _, _, _, _ ->
-                                let payload =
-                                    JsonSerializer.Serialize(
-                                        {| telegramUpdateId = update.UpdateId
-                                           telegramMessageId = message.MessageId
-                                           chatId = chatId
-                                           telegramUserId = actor.TelegramUserId
-                                           displayName = actor.DisplayName
-                                           languageCode = actor.LanguageCode
-                                           command = "/request"
-                                           argument = query
-                                           query = query
-                                           isPrivateChat = isPrivateChat |},
-                                        ApiJson.options
-                                    )
-
-                                Ok(DurableEvent { EventType = DomainEventType.TrackRequested; PayloadJson = payload })
-                            | _, Some submittedText, _, _, _, _, _ ->
-                                let payload =
-                                    JsonSerializer.Serialize(
-                                        {| telegramUpdateId = update.UpdateId
-                                           telegramMessageId = message.MessageId
-                                           chatId = chatId
-                                           telegramUserId = actor.TelegramUserId
-                                           displayName = actor.DisplayName
-                                           languageCode = actor.LanguageCode
-                                           command = "/say"
-                                           argument = submittedText
-                                           text = submittedText
-                                           isPrivateChat = isPrivateChat |},
-                                        ApiJson.options
-                                    )
-
-                                Ok(DurableEvent { EventType = DomainEventType.SayMessageSubmitted; PayloadJson = payload })
-                            | _, _, Some argument, _, _, _, _ ->
-                                commandEvent DomainEventType.TelegramCommandReceived "/start" argument |> Ok
-                            | _, _, _, Some argument, _, _, _ ->
-                                commandEvent DomainEventType.TelegramCommandReceived "/help" argument |> Ok
-                            | _, _, _, _, Some argument, _, _ ->
-                                commandEvent DomainEventType.TelegramCommandReceived "/song" argument |> Ok
-                            | _, _, _, _, _, Some argument, _ ->
-                                commandEvent DomainEventType.TelegramCommandReceived "/terms" argument |> Ok
-                            | _, _, _, _, _, _, Some argument ->
-                                commandEvent DomainEventType.TelegramCommandReceived "/paysupport" argument |> Ok
-                            | _ -> Ok Ignored
-                        | _ -> Ok Ignored
-                    | None -> Ok Ignored
 
     let private readBoundedBody (maximumBytes: int) (context: HttpContext) (buffer: byte array) =
         task {
@@ -689,6 +446,38 @@ module ApiEndpoints =
         | BodyInvalid
         | BodyParsed of JsonElement
 
+    type private CoverBody =
+        | CoverTooLarge
+        | CoverInvalid
+        | CoverParsed of byte array * string * string * string
+
+    let private readCoverBody (context: HttpContext) =
+        task {
+            let contentType = context.Request.ContentType
+            if isNull contentType || (contentType <> "image/jpeg" && contentType <> "image/png" && contentType <> "image/webp") then
+                return CoverInvalid
+            elif context.Request.ContentLength.HasValue && context.Request.ContentLength.Value > 10L * 1024L * 1024L then
+                return CoverTooLarge
+            else
+                let buffer = ArrayPool<byte>.Shared.Rent(10 * 1024 * 1024 + 1)
+                use _lease = { new IDisposable with member _.Dispose() = ArrayPool<byte>.Shared.Return(buffer, clearArray = true) }
+                let! length = readBoundedBody (10 * 1024 * 1024) context buffer
+                match length with
+                | None -> return CoverTooLarge
+                | Some bodyLength when bodyLength > 0 ->
+                    let bytes = buffer.AsSpan(0, bodyLength).ToArray()
+                    let detected =
+                        if bytes.Length >= 3 && bytes[0] = 0xFFuy && bytes[1] = 0xD8uy && bytes[2] = 0xFFuy then Some("image/jpeg", ".jpg")
+                        elif bytes.Length >= 8 && bytes[0] = 0x89uy && bytes[1] = 0x50uy && bytes[2] = 0x4Euy && bytes[3] = 0x47uy && bytes[4] = 0x0Duy && bytes[5] = 0x0Auy && bytes[6] = 0x1Auy && bytes[7] = 0x0Auy then Some("image/png", ".png")
+                        elif bytes.Length >= 12 && bytes[0] = 0x52uy && bytes[1] = 0x49uy && bytes[2] = 0x46uy && bytes[3] = 0x46uy && bytes[8] = 0x57uy && bytes[9] = 0x45uy && bytes[10] = 0x42uy && bytes[11] = 0x50uy then Some("image/webp", ".webp")
+                        else None
+                    match detected with
+                    | Some(detectedType, extension) when detectedType = contentType ->
+                        let sha = Convert.ToHexString(SHA256.HashData bytes).ToLowerInvariant()
+                        return CoverParsed(bytes, detectedType, extension, sha)
+                    | _ -> return CoverInvalid
+                | _ -> return CoverInvalid
+        }
     let private readJsonBody maximumBytes (context: HttpContext) =
         task {
             if context.Request.ContentLength.HasValue && context.Request.ContentLength.Value > int64 maximumBytes then
@@ -768,14 +557,56 @@ module ApiEndpoints =
           Artist = track.Artist
           Album = track.Album
           DurationMs = max 0 track.DurationMs
-          HasCachedFile = track.HasCachedFile }
+          HasCachedFile = track.HasCachedFile
+          CoverImageUrl = track.CoverImageUrl
+          MetadataSource =
+            match track.MetadataSource with
+            | "Embedded" -> "embedded"
+            | "Manual" -> "manual"
+            | _ -> "filename" }
+
+    let private playlistTypeDto = function
+        | PlaylistType.General -> "general"
+        | PlaylistType.OncePerSongs -> "oncePerSongs"
+        | PlaylistType.OncePerMinutes -> "oncePerMinutes"
+        | PlaylistType.OncePerHour -> "oncePerHour"
+
+    let private playlistSourceDto = function
+        | PlaylistSource.Manual -> "manual"
+        | PlaylistSource.AllStorage -> "allStorage"
+
+    let private playlistOrderDto = function
+        | PlaylistOrder.Sequential -> "sequential"
+        | PlaylistOrder.Shuffle -> "shuffle"
+        | PlaylistOrder.Random -> "random"
+
+    let private toPlaylistScheduleDto (schedule: PlaylistSchedule) : PlaylistScheduleDto =
+        { Id = schedule.Id |> Option.map (fun value -> value.ToString("D")) |> Option.defaultValue null
+          DaysOfWeek = schedule.DaysOfWeek
+          StartTime = schedule.StartTime.ToString("hh\\:mm", CultureInfo.InvariantCulture)
+          EndTime = schedule.EndTime.ToString("hh\\:mm", CultureInfo.InvariantCulture)
+          StartDate = schedule.StartDate |> Option.map (fun value -> value.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)) |> Option.defaultValue null
+          EndDate = schedule.EndDate |> Option.map (fun value -> value.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)) |> Option.defaultValue null
+          TimeZoneId = schedule.TimeZoneId }
 
     let private toPlaylistDto (playlist: PlaylistSummary) : PlaylistSummaryDto =
         { Id = playlist.Id.ToString("D")
           Name = playlist.Name
           Description = playlist.Description |> Option.defaultValue null
           IsActive = playlist.IsActive
-          ItemCount = max 0 playlist.ItemCount }
+          Type = playlist.Type |> playlistTypeDto
+          Source = playlist.Source |> playlistSourceDto
+          Order = playlist.Order |> playlistOrderDto
+          Weight = playlist.Weight
+          IsJingle = playlist.IsJingle
+          Interrupt = playlist.Interrupt
+          AvoidDuplicates = playlist.AvoidDuplicates
+          PlayEverySongs = playlist.PlayEverySongs
+          PlayEveryMinutes = playlist.PlayEveryMinutes
+          PlayAtMinute = playlist.PlayAtMinute
+          IsSystem = playlist.IsSystem
+          ItemCount = max 0 playlist.ItemCount
+          Schedules = playlist.Schedules |> List.map toPlaylistScheduleDto }
 
     let private toPlaylistItemDto (item: PlaylistItem) : PlaylistItemDto =
         { Id = item.Id.ToString("D")
@@ -784,199 +615,15 @@ module ApiEndpoints =
           Artist = item.Artist
           Position = max 0 item.Position }
 
-    let private toControlDto (state: StreamNodeControlState) : StreamNodeControlDto =
+    let private toControlDto (state: StreamNodeControlState) (commands: StreamNodePlaybackCommandDto list) (nextPlaybackGeneration: int64) : StreamNodeControlDto =
         { DesiredState = match state.DesiredState with | Running -> "running" | Stopped -> "stopped"
-          RestartGeneration = max 0 state.RestartGeneration }
+          RestartGeneration = max 0 state.RestartGeneration
+          PlaybackCommands = commands
+          NextPlaybackGeneration = nextPlaybackGeneration }
 
-    /// Classify a parsed Telegram update and route it through the shared ingestion path
-    /// (synchronous pre-checkout workflow, or durable-event inbox deduped by (updateId, eventType)).
-    /// Reused verbatim by the webhook endpoint and the long-polling worker so payment/command
-    /// handling never forks. Records adapter-state progress/errors as a side effect.
-    let processTelegramUpdate (services: IServiceProvider) (update: Update) (cancellationToken: CancellationToken) : Task<TelegramUpdateProcessingOutcome> =
-        task {
-            use attempt = FlowTelemetry.start FlowTelemetry.TelegramUpdate
-            FlowTelemetry.addTag "telegram.update_id" (box update.UpdateId) attempt
-
-            let finish outcome =
-                FlowTelemetry.finish outcome [] attempt |> ignore
-
-            try
-                let state = services.GetRequiredService<ITelegramAdapterState>()
-
-                match mapTelegramUpdate update with
-                | Error message ->
-                    state.RecordError("request.invalid")
-                    finish "rejected"
-                    return TelegramUpdateRejected message
-                | Ok Ignored ->
-                    FlowTelemetry.addTag "event.type" (box "ignored") attempt
-                    state.RecordUpdate(update.UpdateId)
-                    finish "ignored"
-                    return TelegramUpdateAccepted
-                | Ok(PreCheckout preCheckout) ->
-                    FlowTelemetry.addTag "event.type" (box "pre_checkout") attempt
-                    let workflow = services.GetRequiredService<ITelegramPreCheckoutWorkflow>()
-                    let! result = workflow.HandleAsync preCheckout cancellationToken
-
-                    match result with
-                    | Ok() ->
-                        state.RecordUpdate(update.UpdateId)
-                        finish "accepted"
-                        return TelegramUpdateAccepted
-                    | Error error ->
-                        state.RecordError("telegram.pre_checkout_unavailable")
-                        finish "error"
-                        return TelegramPreCheckoutUnavailable error
-                | Ok(DurableEvent event) ->
-                    FlowTelemetry.addTag "event.type" (box (DomainEventType.toString event.EventType)) attempt
-                    let ingestor = services.GetRequiredService<ITelegramUpdateEventIngestor>()
-
-                    let! ingestResult =
-                        ingestor.TryIngestAsync update.UpdateId event.EventType "Web10.Radio.Telegram" event.PayloadJson cancellationToken
-
-                    match ingestResult with
-                    | Ok true ->
-                        state.RecordUpdate(update.UpdateId)
-                        finish "accepted"
-                        return TelegramUpdateAccepted
-                    | Ok false ->
-                        state.RecordUpdate(update.UpdateId)
-                        finish "duplicate"
-                        return TelegramUpdateAccepted
-                    | Error error ->
-                        state.RecordError("telegram.webhook.ingest_failed")
-                        finish "error"
-                        return TelegramIngestFailed error
-            with error ->
-                FlowTelemetry.finishError "error" [] error attempt |> ignore
-                return raise error
-        }
-
-    let private telegramWebhook (context: HttpContext) =
-        task {
-            let telegramOptions = context.RequestServices.GetRequiredService<TelegramOptions>()
-            let state = context.RequestServices.GetRequiredService<ITelegramAdapterState>()
-
-            match webhookSecretHeader context with
-            | None ->
-                state.RecordError("telegram.webhook.secret_invalid")
-                do!
-                    ApiProblems.write
-                        context
-                        StatusCodes.Status401Unauthorized
-                        "telegram.webhook.secret_invalid"
-                        "Telegram webhook unauthorized"
-                        "Exactly one Telegram webhook secret token header is required."
-
-                return StatusCodes.Status401Unauthorized
-            | Some suppliedSecret when not (ApiSecurity.fixedTimeEqualsUtf8 telegramOptions.WebhookSecret suppliedSecret) ->
-                state.RecordError("telegram.webhook.secret_invalid")
-                do!
-                    ApiProblems.write
-                        context
-                        StatusCodes.Status401Unauthorized
-                        "telegram.webhook.secret_invalid"
-                        "Telegram webhook unauthorized"
-                        "Telegram webhook secret token is invalid."
-
-                return StatusCodes.Status401Unauthorized
-            | Some _ ->
-                if context.Request.ContentLength.HasValue
-                   && context.Request.ContentLength.Value > int64 TelegramWebhookMaxBodyBytes then
-                    state.RecordError("request.too_large")
-
-                    do!
-                        ApiProblems.write
-                            context
-                            StatusCodes.Status413PayloadTooLarge
-                            "request.too_large"
-                            "Request body too large"
-                            "Telegram webhook body exceeds the maximum allowed size."
-
-                    return StatusCodes.Status413PayloadTooLarge
-                else
-                    let buffer = ArrayPool<byte>.Shared.Rent(TelegramWebhookMaxBodyBytes + 1)
-                    use _bufferLease =
-                        { new IDisposable with
-                            member _.Dispose() = ArrayPool<byte>.Shared.Return(buffer, clearArray = true) }
-
-
-                    try
-                        let! bodyLength = readBoundedBody TelegramWebhookMaxBodyBytes context buffer
-
-                        match bodyLength with
-                        | None ->
-                            state.RecordError("request.too_large")
-
-                            do!
-                                ApiProblems.write
-                                    context
-                                    StatusCodes.Status413PayloadTooLarge
-                                    "request.too_large"
-                                    "Request body too large"
-                                    "Telegram webhook body exceeds the maximum allowed size."
-
-                            return StatusCodes.Status413PayloadTooLarge
-                        | Some length ->
-                            match TelegramUpdateJson.tryParse buffer length with
-                            | Error message ->
-                                state.RecordError("request.invalid")
-                                do! ApiProblems.write context StatusCodes.Status400BadRequest "request.invalid" "Invalid request" message
-                                return StatusCodes.Status400BadRequest
-                            | Ok update ->
-                                let! outcome = processTelegramUpdate context.RequestServices update context.RequestAborted
-
-                                match outcome with
-                                | TelegramUpdateAccepted ->
-                                    context.Response.StatusCode <- StatusCodes.Status204NoContent
-                                    return StatusCodes.Status204NoContent
-                                | TelegramUpdateRejected message ->
-                                    do! ApiProblems.write context StatusCodes.Status400BadRequest "request.invalid" "Invalid request" message
-                                    return StatusCodes.Status400BadRequest
-                                | TelegramPreCheckoutUnavailable error ->
-                                    do!
-                                        ApiProblems.write
-                                            context
-                                            StatusCodes.Status503ServiceUnavailable
-                                            "telegram.pre_checkout_unavailable"
-                                            "Telegram pre-checkout unavailable"
-                                            (BackgroundWorkerError.toMessage error)
-
-                                    return StatusCodes.Status503ServiceUnavailable
-                                | TelegramIngestFailed error ->
-                                    do!
-                                        ApiProblems.write
-                                            context
-                                            StatusCodes.Status500InternalServerError
-                                            "telegram.webhook.ingest_failed"
-                                            "Telegram webhook failed"
-                                            (BackgroundWorkerError.toMessage error)
-
-                                    return StatusCodes.Status500InternalServerError
-                    with error ->
-                        state.RecordError("telegram.webhook.unhandled")
-                        return raise error
-        }
-
-    let private telegramHealth (context: HttpContext) =
-        task {
-            let state = context.RequestServices.GetRequiredService<ITelegramAdapterState>()
-            let snapshot = state.Snapshot()
-            let lastUpdateId =
-                match snapshot.LastUpdateId with
-                | Some value -> Nullable<int64>(value)
-                | None -> Nullable<int64>()
-
-            let dto: TelegramHealthDto =
-                { IsConfigured = snapshot.IsConfigured
-                  ChannelIdOrUsername = snapshot.ChannelIdOrUsername
-                  LastUpdateId = lastUpdateId
-                  LastError = snapshot.LastError |> Option.defaultValue null }
-
-            do! writeOk context dto
-            return StatusCodes.Status200OK
-        }
-
+    let private isExactEmptyJsonObject (root: JsonElement) =
+        root.ValueKind = JsonValueKind.Object
+        && (root.EnumerateObject() |> Seq.isEmpty)
     [<Literal>]
     let PlaybackCallbackMaxBodyBytes = 4096
 
@@ -1013,7 +660,7 @@ module ApiEndpoints =
                 else
                     match statusElement.GetString() with
                     | "played" ->
-                        Ok(claimOwner, claimAttempt, Some Web10.Radio.API.PlaybackCompletion.Succeeded)
+                        Ok(claimOwner, claimAttempt, Some PlaybackCompletion.Succeeded)
                     | "failed" ->
                         if root.TryGetProperty("failureReason", &reasonElement)
                            && reasonElement.ValueKind = JsonValueKind.String
@@ -1021,7 +668,7 @@ module ApiEndpoints =
                             Ok(
                                 claimOwner,
                                 claimAttempt,
-                                Some(Web10.Radio.API.PlaybackCompletion.Failed(reasonElement.GetString().Trim()))
+                                Some(PlaybackCompletion.Failed(reasonElement.GetString().Trim()))
                             )
                         else
                             Error "failureReason is required when status is failed."
@@ -1179,269 +826,6 @@ module ApiEndpoints =
                 return StatusCodes.Status500InternalServerError
         }
 
-    [<Literal>]
-    let private SayModerationMaxBodyBytes = 2 * 1024
-
-    let private sayStatusText = function
-        | SayMessageModerationFilter.Pending -> "pending"
-        | SayMessageModerationFilter.Approved -> "approved"
-        | SayMessageModerationFilter.Rejected -> "rejected"
-
-    let private sayTargetText = function
-        | SayMessageModerationTarget.Approved -> "Approved"
-        | SayMessageModerationTarget.Rejected -> "Rejected"
-
-    let private trySayModerationFilter (context: HttpContext) =
-        let mutable values = StringValues()
-
-        if not (context.Request.Query.TryGetValue("status", &values)) || values.Count <> 1 then
-            None
-        else
-            match values[0] with
-            | "pending" -> Some SayMessageModerationFilter.Pending
-            | "approved" -> Some SayMessageModerationFilter.Approved
-            | "rejected" -> Some SayMessageModerationFilter.Rejected
-            | _ -> None
-
-    let private toAdminSayMessageDto (message: SayMessageForModeration) : AdminSayMessageDto =
-        { Id = message.Id.ToString("D")
-          TelegramUserId =
-              match message.TelegramUserId with
-              | Some telegramUserId -> Nullable<int64>(telegramUserId)
-              | None -> Nullable<int64>()
-          DisplayName = message.DisplayName
-          Text = message.Text
-          AmountStars = message.AmountStars
-          Color = message.Color |> Option.defaultValue null
-          Status = sayStatusText message.Status
-          SubmittedAtUtc = ApiTime.toIsoUtc message.SubmittedAtUtc
-          PaidAtUtc = message.PaidAtUtc |> Option.map ApiTime.toIsoUtc |> Option.defaultValue null
-          ModeratedAtUtc = message.ModeratedAtUtc |> Option.map ApiTime.toIsoUtc |> Option.defaultValue null
-          ModerationReason = message.ModerationReason |> Option.defaultValue null }
-
-    let private sayStatusInvalid context =
-        ApiProblems.write
-            context
-            StatusCodes.Status400BadRequest
-            "say.status.invalid"
-            "Invalid say message status"
-            "Query parameter status must be exactly one of pending, approved, or rejected."
-
-    let private sayRequestInvalid context =
-        ApiProblems.write
-            context
-            StatusCodes.Status400BadRequest
-            "say.request.invalid"
-            "Invalid say message request"
-            "The say message identifier or request body is invalid."
-
-    let private trySayMessageId (context: HttpContext) =
-        let value = context.Request.RouteValues["messageId"]
-        let mutable messageId = Guid.Empty
-
-        if isNull value || not (Guid.TryParse(string value, &messageId)) || messageId = Guid.Empty then
-            None
-        else
-            Some messageId
-
-    let private tryReadSayModerationBody (context: HttpContext) =
-        task {
-            if context.Request.ContentLength.HasValue
-               && context.Request.ContentLength.Value > int64 SayModerationMaxBodyBytes then
-                return None
-            else
-                let buffer = ArrayPool<byte>.Shared.Rent(SayModerationMaxBodyBytes + 1)
-
-                use _bufferLease =
-                    { new IDisposable with
-                        member _.Dispose() = ArrayPool<byte>.Shared.Return(buffer, clearArray = true) }
-
-                let! length = readBoundedBody SayModerationMaxBodyBytes context buffer
-
-                match length with
-                | None -> return None
-                | Some bodyLength ->
-                    try
-                        use document = JsonDocument.Parse(buffer.AsMemory(0, bodyLength))
-                        return Some(document.RootElement.Clone())
-                    with
-                    | :? JsonException -> return None
-        }
-
-    let private isExactEmptyJsonObject (root: JsonElement) =
-        root.ValueKind = JsonValueKind.Object
-        && (root.EnumerateObject() |> Seq.isEmpty)
-
-    let private tryRejectReason (root: JsonElement) =
-        if root.ValueKind <> JsonValueKind.Object then
-            None
-        else
-            let properties = root.EnumerateObject() |> Seq.toList
-
-            match properties with
-            | [ property ] when property.Name = "reason" && property.Value.ValueKind = JsonValueKind.String ->
-                let reason = property.Value.GetString()
-
-                if isNull reason then
-                    None
-                else
-                    let trimmedReason = reason.Trim()
-
-                    if trimmedReason.Length >= 1 && trimmedReason.Length <= 500 then
-                        Some trimmedReason
-                    else
-                        None
-            | _ -> None
-
-    let private adminSayMessages (context: HttpContext) =
-        task {
-            match trySayModerationFilter context with
-            | None ->
-                do! sayStatusInvalid context
-                return StatusCodes.Status400BadRequest
-            | Some filter ->
-                let dataSource = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
-                let! result = SayMessageRepository.listForModeration dataSource filter context.RequestAborted
-
-                match result with
-                | Ok messages ->
-                    do! writeOk context (messages |> List.map toAdminSayMessageDto)
-                    return StatusCodes.Status200OK
-                | Error _ ->
-                    do! repositoryReadFailed context
-                    return StatusCodes.Status500InternalServerError
-        }
-
-    let private moderateSayMessage
-        (context: HttpContext)
-        (messageId: Guid)
-        (target: SayMessageModerationTarget)
-        (reason: string option) =
-        task {
-            let dataSource = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
-            let idGenerator = context.RequestServices.GetRequiredService<IIdGenerator>()
-            let clock = context.RequestServices.GetRequiredService<IClock>()
-            let moderatedAtUtc = clock.UtcNow
-
-            let! result =
-                DatabaseSession.withTransactionResult
-                    dataSource
-                    (fun connection transaction cancellationToken ->
-                        task {
-                            let! moderation =
-                                SayMessageRepository.moderateInTransaction
-                                    connection
-                                    transaction
-                                    messageId
-                                    target
-                                    reason
-                                    moderatedAtUtc
-                                    cancellationToken
-
-                            match moderation with
-                            | Error repositoryError -> return Error repositoryError
-                            | Ok SayMessageModerationOutcome.Applied ->
-                                let payload =
-                                    JsonSerializer.Serialize(
-                                        {| sayMessageId = messageId.ToString("D")
-                                           status = sayTargetText target
-                                           moderationReason =
-                                               match target with
-                                               | SayMessageModerationTarget.Approved -> null
-                                               | SayMessageModerationTarget.Rejected -> reason |> Option.defaultValue null |},
-                                        ApiJson.options
-                                    )
-
-                                match
-                                    DomainEventEnvelope.create
-                                        idGenerator
-                                        clock
-                                        DomainEventType.SayMessageModerated
-                                        "Web10.Radio.API.Admin"
-                                        None
-                                        None
-                                        payload
-                                with
-                                | Error domainError ->
-                                    return Error(DatabaseError("ApiEndpoints.moderateSayMessage", DomainEventError.toMessage domainError))
-                                | Ok envelope ->
-                                    let! appended =
-                                        OutboxEventRepository.appendInTransaction
-                                            connection
-                                            transaction
-                                            (OutboxMapping.toOutboxEvent envelope)
-                                            cancellationToken
-
-                                    match appended with
-                                    | Ok () -> return Ok SayMessageModerationOutcome.Applied
-                                    | Error repositoryError -> return Error repositoryError
-                            | Ok outcome -> return Ok outcome
-                        })
-                    context.RequestAborted
-
-            match result with
-            | Error _ ->
-                do! repositoryReadFailed context
-                return StatusCodes.Status500InternalServerError
-            | Ok SayMessageModerationOutcome.Applied
-            | Ok SayMessageModerationOutcome.AlreadyApplied ->
-                context.Response.StatusCode <- StatusCodes.Status204NoContent
-                return StatusCodes.Status204NoContent
-            | Ok SayMessageModerationOutcome.NotFound ->
-                do!
-                    ApiProblems.write
-                        context
-                        StatusCodes.Status404NotFound
-                        "say.not_found"
-                        "Say message not found"
-                        "The say message does not exist."
-
-                return StatusCodes.Status404NotFound
-            | Ok SayMessageModerationOutcome.Conflict ->
-                do!
-                    ApiProblems.write
-                        context
-                        StatusCodes.Status409Conflict
-                        "say.state_conflict"
-                        "Say message state conflict"
-                        "The say message cannot be moderated in its current state."
-
-                return StatusCodes.Status409Conflict
-        }
-
-    let private approveSayMessage (context: HttpContext) =
-        task {
-            match trySayMessageId context with
-            | None ->
-                do! sayRequestInvalid context
-                return StatusCodes.Status400BadRequest
-            | Some messageId ->
-                let! body = tryReadSayModerationBody context
-
-                match body with
-                | Some root when isExactEmptyJsonObject root ->
-                    return! moderateSayMessage context messageId SayMessageModerationTarget.Approved None
-                | _ ->
-                    do! sayRequestInvalid context
-                    return StatusCodes.Status400BadRequest
-        }
-
-    let private rejectSayMessage (context: HttpContext) =
-        task {
-            match trySayMessageId context with
-            | None ->
-                do! sayRequestInvalid context
-                return StatusCodes.Status400BadRequest
-            | Some messageId ->
-                let! body = tryReadSayModerationBody context
-
-                match body |> Option.bind tryRejectReason with
-                | Some reason ->
-                    return! moderateSayMessage context messageId SayMessageModerationTarget.Rejected (Some reason)
-                | None ->
-                    do! sayRequestInvalid context
-                    return StatusCodes.Status400BadRequest
-        }
     let private adminAuthInvalid context =
         writeDomainProblem context StatusCodes.Status400BadRequest "admin.auth.request_invalid" "Invalid admin authentication request" "The login request body is invalid."
 
@@ -1572,9 +956,8 @@ module ApiEndpoints =
 
     let private publishEvent (context: HttpContext) (eventType: DomainEventType) (producer: string) (payload: string) : Task<bool> =
         task {
-            let idGenerator = context.RequestServices.GetRequiredService<IIdGenerator>()
-            let clock = context.RequestServices.GetRequiredService<IClock>()
-            match DomainEventEnvelope.create idGenerator clock eventType producer None None payload with
+            let clock = context.RequestServices.GetRequiredService<TimeProvider>()
+            match DomainEventEnvelope.create clock eventType producer None None payload with
             | Error _ -> return false
             | Ok envelope ->
                 let publisher = context.RequestServices.GetRequiredService<IDomainEventPublisher>()
@@ -1601,9 +984,8 @@ module ApiEndpoints =
                     return StatusCodes.Status400BadRequest
                 | Some storageBackendId ->
                     let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
-                    let clock = context.RequestServices.GetRequiredService<IClock>()
-                    let ids = context.RequestServices.GetRequiredService<IIdGenerator>()
-                    let! result = LibraryScanRepository.createOrGetActiveJob source (ids.NewId()) storageBackendId clock.UtcNow context.RequestAborted
+                    let clock = context.RequestServices.GetRequiredService<TimeProvider>()
+                    let! result = LibraryScanRepository.createOrGetActiveJob source (Uuid.CreateVersion7().ToGuidBigEndian()) storageBackendId (clock.GetUtcNow()) context.RequestAborted
                     match result with
                     | Error _ ->
                         do! writeRepositoryFailure context
@@ -1615,7 +997,7 @@ module ApiEndpoints =
                         do! ApiJson.write context StatusCodes.Status202Accepted ApiJson.JsonContentType { ScanJobId = job.Id.ToString("D") }
                         return StatusCodes.Status202Accepted
                     | Ok(Created job) ->
-                        let payload = JsonSerializer.Serialize({| libraryScanJobId = job.Id.ToString("D") |}, ApiJson.options)
+                        let payload = JsonSerializer.Serialize({| libraryScanJobId = job.Id.ToString("D") |}, DomainJson.options)
                         let! published = publishEvent context DomainEventType.LibraryScanRequested "Web10.Radio.API.Admin" payload
                         if published then
                             do! ApiJson.write context StatusCodes.Status202Accepted ApiJson.JsonContentType { ScanJobId = job.Id.ToString("D") }
@@ -1650,20 +1032,272 @@ module ApiEndpoints =
         task {
             let query = if context.Request.Query.ContainsKey("query") then context.Request.Query["query"].ToString() else String.Empty
             let limitText = if context.Request.Query.ContainsKey("limit") then context.Request.Query["limit"].ToString() else "100"
+            let cursor = if context.Request.Query.ContainsKey("cursor") then context.Request.Query["cursor"].ToString() else null
             let mutable limit = 0
-            if query.Length > 200 || not (Int32.TryParse(limitText, &limit)) || limit < 1 || limit > 100 then
-                do! writeDomainProblem context StatusCodes.Status400BadRequest "track.request_invalid" "Invalid track request" "The track query or limit is invalid."
+
+            let validCursor =
+                if isNull cursor then
+                    true
+                elif cursor.Length > 512 || cursor.Length = 0 then
+                    false
+                else
+                    try
+                        let normalized = cursor.Replace('-', '+').Replace('_', '/')
+                        let padded = normalized + String('=', (4 - normalized.Length % 4) % 4)
+                        use document = JsonDocument.Parse(Convert.FromBase64String padded)
+                        let root = document.RootElement
+                        let mutable created = Unchecked.defaultof<JsonElement>
+                        let mutable id = Unchecked.defaultof<JsonElement>
+                        let mutable parsedId = Guid.Empty
+                        let mutable parsedCreated = DateTimeOffset.MinValue
+                        root.ValueKind = JsonValueKind.Object
+                        && root.TryGetProperty("createdAtUtc", &created)
+                        && root.TryGetProperty("id", &id)
+                        && created.ValueKind = JsonValueKind.String
+                        && id.ValueKind = JsonValueKind.String
+                        && DateTimeOffset.TryParse(created.GetString(), &parsedCreated)
+                        && Guid.TryParse(id.GetString(), &parsedId)
+                    with _ -> false
+
+            if query.Length > 200 || not (Int32.TryParse(limitText, &limit)) || limit < 1 || limit > 100 || not validCursor then
+                do! writeDomainProblem context StatusCodes.Status400BadRequest "track.request_invalid" "Invalid track request" "The track query, limit, or cursor is invalid."
                 return StatusCodes.Status400BadRequest
             else
                 let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
-                let! result = AdminContentRepository.listActiveTracks source query limit context.RequestAborted
+                let cursorOption = if isNull cursor then None else Some cursor
+                let! result = AdminContentRepository.listActiveTracksPage source query limit cursorOption context.RequestAborted
                 match result with
                 | Error _ ->
-                    do! repositoryReadFailed context
-                    return StatusCodes.Status500InternalServerError
-                | Ok tracks ->
-                    do! writeOk context (tracks |> List.map toTrackDto)
+                    do! writeDomainProblem context StatusCodes.Status400BadRequest "track.request_invalid" "Invalid track request" "The track query, limit, or cursor is invalid."
+                    return StatusCodes.Status400BadRequest
+                | Ok page ->
+                    let dto : AdminTrackPageDto = { Items = page.Items |> List.map toTrackDto; NextCursor = page.NextCursor |> Option.defaultValue null }
+                    do! writeOk context dto
                     return StatusCodes.Status200OK
+        }
+
+    let private appendTrackMetadataChanged (connection: NpgsqlConnection) (transaction: NpgsqlTransaction) (clock: TimeProvider) (trackId: Guid) (changedFields: string list) cancellationToken : Task<Result<unit, RepositoryError>> =
+        task {
+            let payload = JsonSerializer.Serialize({| trackId = trackId.ToString("D"); changedFields = changedFields |}, DomainJson.options)
+            match DomainEventEnvelope.create clock DomainEventType.TrackMetadataChanged "Web10.Radio.API.Admin" None None payload with
+            | Error error -> return Error(DatabaseError("TrackMetadataChanged", error.ToString()))
+            | Ok envelope -> return! OutboxEventRepository.appendInTransaction connection transaction (OutboxMapping.toOutboxEvent envelope) cancellationToken |> TaskResult.mapError id
+        }
+
+    let private adminUpdateTrackMetadata (context: HttpContext) =
+        task {
+            match parseGuidRoute "trackId" context with
+            | None ->
+                do! writeDomainProblem context StatusCodes.Status400BadRequest "track.request_invalid" "Invalid track request" "The track identifier is invalid."
+                return StatusCodes.Status400BadRequest
+            | Some trackId ->
+                match! readJsonBody (16 * 1024) context with
+                | BodyTooLarge ->
+                    do! writeRequestTooLarge context
+                    return StatusCodes.Status413PayloadTooLarge
+                | BodyParsed root when hasExactProperties (Set.ofList [ "title"; "artist"; "album" ]) root ->
+                    let title = tryString "title" root |> Option.map (fun value -> value.Trim())
+                    let artist = tryString "artist" root |> Option.map (fun value -> value.Trim())
+                    let album = tryNullableString "album" root |> Option.map (Option.map (fun value -> value.Trim()))
+                    if title |> Option.exists (fun value -> value.Length < 1 || value.Length > 200) |> not
+                       || artist |> Option.exists (fun value -> value.Length < 1 || value.Length > 200) |> not
+                       || album.IsNone then
+                        do! writeDomainProblem context StatusCodes.Status400BadRequest "track.request_invalid" "Invalid track request" "Title and artist must be 1 to 200 characters and album must be null or 1 to 200 characters."
+                        return StatusCodes.Status400BadRequest
+                    else
+                        let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+                        let clock = context.RequestServices.GetRequiredService<TimeProvider>()
+                        let! result =
+                            DatabaseSession.withTransactionResult source (fun connection transaction token ->
+                                taskResult {
+                                    let! mutation = AdminContentRepository.updateTrackMetadataInTransaction connection transaction trackId title.Value artist.Value album.Value (clock.GetUtcNow()) token
+                                    match mutation with
+                                    | AdminContentMutation.Applied track ->
+                                        do! appendTrackMetadataChanged connection transaction clock trackId [ "title"; "artist"; "album" ] token
+                                        return AdminContentMutation.Applied track
+                                    | AdminContentMutation.NotFound -> return AdminContentMutation.NotFound
+                                    | AdminContentMutation.Conflict -> return AdminContentMutation.Conflict
+                                }) context.RequestAborted
+                        match result with
+                        | Error _ ->
+                            do! writeRepositoryFailure context
+                            return StatusCodes.Status500InternalServerError
+                        | Ok AdminContentMutation.NotFound ->
+                            do! writeDomainProblem context StatusCodes.Status404NotFound "track.not_found" "Track not found" "The requested track does not exist."
+                            return StatusCodes.Status404NotFound
+                        | Ok AdminContentMutation.Conflict ->
+                            do! writeDomainProblem context StatusCodes.Status409Conflict "track.conflict" "Track conflict" "The track could not be updated."
+                            return StatusCodes.Status409Conflict
+                        | Ok(AdminContentMutation.Applied track) ->
+                            do! writeOk context (toTrackDto track)
+                            return StatusCodes.Status200OK
+                | _ ->
+                    do! writeDomainProblem context StatusCodes.Status400BadRequest "track.request_invalid" "Invalid track request" "The metadata body is invalid."
+                    return StatusCodes.Status400BadRequest
+        }
+
+    let private writeManagedCover (cacheRoot: string) (trackId: Guid) (bytes: byte array) (sha256: string) (extension: string) =
+        let directory = Path.Combine(cacheRoot, "covers", trackId.ToString("D"))
+        let temporaryDirectory = Path.Combine(cacheRoot, "tmp")
+        Directory.CreateDirectory(directory) |> ignore
+        Directory.CreateDirectory(temporaryDirectory) |> ignore
+        let finalPath = Path.Combine(directory, sha256 + extension)
+        let existed = File.Exists finalPath
+        let temporary = Path.Combine(temporaryDirectory, sprintf "%s.tmp" (Uuid.CreateVersion7().ToGuidBigEndian().ToString("N")))
+        File.WriteAllBytes(temporary, bytes)
+        File.Move(temporary, finalPath, true)
+        finalPath, existed
+
+    let private deleteManagedCoverFile (path: string) (existedBeforeWrite: bool) =
+        if not existedBeforeWrite then
+            try File.Delete(path) with _ -> ()
+
+    let private cleanupManagedCovers (cacheRoot: string) (trackId: Guid) (keepPath: string) =
+        let directory = Path.Combine(cacheRoot, "covers", trackId.ToString("D"))
+        if Directory.Exists directory then
+            for path in Directory.EnumerateFiles(directory) do
+                if not (String.Equals(Path.GetFullPath(path), Path.GetFullPath(keepPath), StringComparison.Ordinal)) then
+                    try File.Delete(path) with _ -> ()
+
+
+    let private adminReplaceTrackCover (context: HttpContext) =
+        task {
+            match parseGuidRoute "trackId" context with
+            | None ->
+                do! writeDomainProblem context StatusCodes.Status400BadRequest "track.request_invalid" "Invalid track request" "The track identifier is invalid."
+                return StatusCodes.Status400BadRequest
+            | Some trackId ->
+                match! readCoverBody context with
+                | CoverTooLarge ->
+                    do! writeDomainProblem context StatusCodes.Status413PayloadTooLarge "track.cover_invalid" "Cover too large" "The cover exceeds 10 MiB."
+                    return StatusCodes.Status413PayloadTooLarge
+                | CoverInvalid ->
+                    do! writeDomainProblem context StatusCodes.Status400BadRequest "track.cover_invalid" "Invalid cover" "The cover MIME type or magic bytes are invalid."
+                    return StatusCodes.Status400BadRequest
+                | CoverParsed(bytes, contentType, extension, sha256) ->
+                    let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+                    let options = context.RequestServices.GetRequiredService<StorageOptions>()
+                    let clock = context.RequestServices.GetRequiredService<TimeProvider>()
+                    let finalPath =
+                        try Some(writeManagedCover options.CacheRoot trackId bytes sha256 extension)
+                        with _ -> None
+                    match finalPath with
+                    | None ->
+                        do! writeDomainProblem context StatusCodes.Status503ServiceUnavailable "track.cover_unavailable" "Cover unavailable" "The cover could not be stored."
+                        return StatusCodes.Status503ServiceUnavailable
+                    | Some(cachePath, existedBeforeWrite) ->
+                        let! result =
+                            DatabaseSession.withTransactionResult source (fun connection transaction token ->
+                                taskResult {
+                                    let! mutation = AdminContentRepository.replaceTrackCoverInTransaction connection transaction trackId cachePath contentType (int64 bytes.LongLength) sha256 (clock.GetUtcNow()) token
+                                    match mutation with
+                                    | AdminContentMutation.Applied track ->
+                                        do! appendTrackMetadataChanged connection transaction clock trackId [ "cover" ] token
+                                        return AdminContentMutation.Applied track
+                                    | AdminContentMutation.NotFound -> return AdminContentMutation.NotFound
+                                    | AdminContentMutation.Conflict -> return AdminContentMutation.Conflict
+                                }) context.RequestAborted
+                        match result with
+                        | Error _ ->
+                            deleteManagedCoverFile cachePath existedBeforeWrite
+                            do! writeDomainProblem context StatusCodes.Status503ServiceUnavailable "track.cover_unavailable" "Cover unavailable" "The cover could not be persisted."
+                            return StatusCodes.Status503ServiceUnavailable
+                        | Ok AdminContentMutation.NotFound ->
+                            deleteManagedCoverFile cachePath existedBeforeWrite
+                            do! writeDomainProblem context StatusCodes.Status404NotFound "track.not_found" "Track not found" "The requested track does not exist."
+                            return StatusCodes.Status404NotFound
+                        | Ok AdminContentMutation.Conflict ->
+                            deleteManagedCoverFile cachePath existedBeforeWrite
+                            do! writeDomainProblem context StatusCodes.Status409Conflict "track.conflict" "Track conflict" "The cover could not be updated."
+                            return StatusCodes.Status409Conflict
+                        | Ok(AdminContentMutation.Applied track) ->
+                            cleanupManagedCovers options.CacheRoot trackId cachePath
+                            do! writeOk context (toTrackDto track)
+                            return StatusCodes.Status200OK
+        }
+
+    let private adminRemoveTrackCover (context: HttpContext) =
+        task {
+            match parseGuidRoute "trackId" context with
+            | None ->
+                do! writeDomainProblem context StatusCodes.Status400BadRequest "track.request_invalid" "Invalid track request" "The track identifier is invalid."
+                return StatusCodes.Status400BadRequest
+            | Some trackId ->
+                let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+                let clock = context.RequestServices.GetRequiredService<TimeProvider>()
+                let options = context.RequestServices.GetRequiredService<StorageOptions>()
+                let! result =
+                    DatabaseSession.withTransactionResult source (fun connection transaction token ->
+                        taskResult {
+                            let! mutation = AdminContentRepository.removeTrackCoverInTransaction connection transaction trackId (clock.GetUtcNow()) token
+                            match mutation with
+                            | AdminContentMutation.Applied track ->
+                                do! appendTrackMetadataChanged connection transaction clock trackId [ "cover" ] token
+                                return AdminContentMutation.Applied track
+                            | AdminContentMutation.NotFound -> return AdminContentMutation.NotFound
+                            | AdminContentMutation.Conflict -> return AdminContentMutation.Conflict
+                        }) context.RequestAborted
+                match result with
+                | Error _ ->
+                    do! writeRepositoryFailure context
+                    return StatusCodes.Status500InternalServerError
+                | Ok AdminContentMutation.NotFound ->
+                    do! writeDomainProblem context StatusCodes.Status404NotFound "track.not_found" "Track not found" "The requested track does not exist."
+                    return StatusCodes.Status404NotFound
+                | Ok AdminContentMutation.Conflict ->
+                    do! writeDomainProblem context StatusCodes.Status409Conflict "track.conflict" "Track conflict" "The cover could not be removed."
+                    return StatusCodes.Status409Conflict
+                | Ok(AdminContentMutation.Applied track) ->
+                    cleanupManagedCovers options.CacheRoot trackId String.Empty
+                    do! writeOk context (toTrackDto track)
+                    return StatusCodes.Status200OK
+        }
+    let private playerCover (context: HttpContext) =
+        task {
+            match parseGuidRoute "trackId" context with
+            | None ->
+                do! writeDomainProblem context StatusCodes.Status404NotFound "track.cover_not_found" "Cover not found" "The requested cover does not exist."
+                return StatusCodes.Status404NotFound
+            | Some trackId ->
+                let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+                let options = context.RequestServices.GetRequiredService<StorageOptions>()
+                let! result = TrackAssetReadModel.tryGetManagedCover source trackId context.RequestAborted
+                match result with
+                | Error _ ->
+                    do! ApiProblems.write context StatusCodes.Status503ServiceUnavailable "track.cover_unavailable" "Cover unavailable" "The cover could not be read."
+                    return StatusCodes.Status503ServiceUnavailable
+                | Ok None ->
+                    do! ApiProblems.write context StatusCodes.Status404NotFound "track.cover_not_found" "Cover not found" "The requested cover does not exist."
+                    return StatusCodes.Status404NotFound
+                | Ok(Some cover) ->
+                    match TrackAssetReadModel.tryCanonicalCachePath options.CacheRoot cover.CachePath with
+                    | None ->
+                        do! ApiProblems.write context StatusCodes.Status503ServiceUnavailable "track.cover_unavailable" "Cover unavailable" "The cover path is invalid."
+                        return StatusCodes.Status503ServiceUnavailable
+                    | Some path ->
+                        try
+                            use stream = File.OpenRead(path)
+                            let etag = sprintf "\"%s\"" cover.Sha256
+                            context.Response.Headers.ETag <- etag
+                            context.Response.Headers.CacheControl <- "public,max-age=3600"
+                            context.Response.ContentType <- cover.ContentType
+                            let mutable ifNoneMatch = StringValues()
+                            let matched = context.Request.Headers.TryGetValue("If-None-Match", &ifNoneMatch) && (ifNoneMatch |> Seq.exists (fun value -> value.Split(',') |> Array.exists (fun candidate -> candidate.Trim() = "*" || candidate.Trim() = etag)))
+                            if matched then
+                                context.Response.StatusCode <- StatusCodes.Status304NotModified
+                                return StatusCodes.Status304NotModified
+                            else
+                                do! stream.CopyToAsync(context.Response.Body, context.RequestAborted)
+                                return StatusCodes.Status200OK
+                        with
+                        | :? FileNotFoundException
+                        | :? DirectoryNotFoundException ->
+                            do! ApiProblems.write context StatusCodes.Status404NotFound "track.cover_not_found" "Cover not found" "The requested cover does not exist."
+                            return StatusCodes.Status404NotFound
+                        | :? UnauthorizedAccessException
+                        | :? IOException ->
+                            do! ApiProblems.write context StatusCodes.Status503ServiceUnavailable "track.cover_unavailable" "Cover unavailable" "The cover could not be read."
+                            return StatusCodes.Status503ServiceUnavailable
         }
 
     let private adminQueueTrack (context: HttpContext) =
@@ -1679,26 +1313,196 @@ module ApiEndpoints =
                     return StatusCodes.Status400BadRequest
                 | Some trackId ->
                     let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
-                    let clock = context.RequestServices.GetRequiredService<IClock>()
-                    let ids = context.RequestServices.GetRequiredService<IIdGenerator>()
-                    let! result = AdminContentRepository.enqueueAdminTrack source { Id = ids.NewId(); TrackId = trackId; RequestedAtUtc = clock.UtcNow } context.RequestAborted
-                    match result with
+                    let clock = context.RequestServices.GetRequiredService<TimeProvider>()
+                    let queueItemId = Uuid.CreateVersion7().ToGuidBigEndian()
+                    let requestedAtUtc = clock.GetUtcNow()
+                    let payload = JsonSerializer.Serialize({| queueItemId = queueItemId.ToString("D"); trackId = trackId.ToString("D") |}, DomainJson.options)
+                    match DomainEventEnvelope.create clock DomainEventType.AdminTrackQueued "Web10.Radio.API.Admin" None None payload with
                     | Error _ ->
                         do! writeRepositoryFailure context
                         return StatusCodes.Status500InternalServerError
-                    | Ok AdminContentMutation.NotFound ->
-                        do! writeDomainProblem context StatusCodes.Status404NotFound "playback.not_found" "Track not found" "The requested track is unavailable."
-                        return StatusCodes.Status404NotFound
-                    | Ok AdminContentMutation.Conflict ->
-                        do! writeDomainProblem context StatusCodes.Status409Conflict "playback.conflict" "Playback conflict" "The track could not be queued."
-                        return StatusCodes.Status409Conflict
-                    | Ok(AdminContentMutation.Applied item) ->
-                        do! ApiJson.write context StatusCodes.Status202Accepted ApiJson.JsonContentType { QueueItemId = item.Id.ToString("D") }
-                        return StatusCodes.Status202Accepted
+                    | Ok envelope ->
+                        let! result =
+                            AdminContentRepository.enqueueAdminTrackWithEvent
+                                source
+                                { Id = queueItemId; TrackId = trackId; RequestedAtUtc = requestedAtUtc }
+                                (OutboxMapping.toOutboxEvent envelope)
+                                context.RequestAborted
+                        match result with
+                        | Error _ ->
+                            do! writeRepositoryFailure context
+                            return StatusCodes.Status500InternalServerError
+                        | Ok AdminContentMutation.NotFound ->
+                            do! writeDomainProblem context StatusCodes.Status404NotFound "playback.not_found" "Track not found" "The requested track is unavailable."
+                            return StatusCodes.Status404NotFound
+                        | Ok AdminContentMutation.Conflict ->
+                            do! writeDomainProblem context StatusCodes.Status409Conflict "playback.conflict" "Playback conflict" "The track could not be queued."
+                            return StatusCodes.Status409Conflict
+                        | Ok(AdminContentMutation.Applied item) ->
+                            do! ApiJson.write context StatusCodes.Status202Accepted ApiJson.JsonContentType ({ QueueItemId = item.Id.ToString("D") } : PlaybackQueueAcceptedDto)
+                            return StatusCodes.Status202Accepted
             | _ ->
                 do! writeDomainProblem context StatusCodes.Status400BadRequest "playback.request_invalid" "Invalid playback request" "The playback request body is invalid."
                 return StatusCodes.Status400BadRequest
         }
+    let private adminReorderQueue (context: HttpContext) =
+        task {
+            match! readJsonBody (64 * 1024) context with
+            | BodyParsed root when hasExactProperties (Set.ofList [ "queueItemIds" ]) root ->
+                match tryProperty "queueItemIds" root with
+                | Some values when values.ValueKind = JsonValueKind.Array ->
+                    let parsed =
+                        values.EnumerateArray()
+                        |> Seq.map (fun value -> if value.ValueKind = JsonValueKind.String then tryPositiveGuid (value.GetString()) else None)
+                        |> Seq.toList
+                    if parsed |> List.exists Option.isNone then
+                        do! writeDomainProblem context StatusCodes.Status400BadRequest "playback.request_invalid" "Invalid playback request" "Every queue item identifier must be a UUID."
+                        return StatusCodes.Status400BadRequest
+                    else
+                        let queueItemIds = parsed |> List.choose id
+                        let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+                        let clock = context.RequestServices.GetRequiredService<TimeProvider>()
+                        let! result = PlaybackQueueRepository.reorderQueued source queueItemIds (clock.GetUtcNow()) context.RequestAborted
+                        match result with
+                        | Error _ ->
+                            do! writeRepositoryFailure context
+                            return StatusCodes.Status500InternalServerError
+                        | Ok PlaybackControlOutcome.NotFound ->
+                            do! writeDomainProblem context StatusCodes.Status409Conflict "playback.conflict" "Playback conflict" "The queue changed while it was being reordered."
+                            return StatusCodes.Status409Conflict
+                        | Ok PlaybackControlOutcome.Conflict ->
+                            do! writeDomainProblem context StatusCodes.Status409Conflict "playback.conflict" "Playback conflict" "The queue changed while it was being reordered."
+                            return StatusCodes.Status409Conflict
+                        | Ok(PlaybackControlOutcome.Applied _) ->
+                            let payload = JsonSerializer.Serialize({| queueItemIds = queueItemIds |> List.map (fun id -> id.ToString("D")) |}, DomainJson.options)
+                            let! published = publishEvent context DomainEventType.PlaybackReordered "Web10.Radio.API.Admin" payload
+                            if not published then
+                                do! writeRepositoryFailure context
+                                return StatusCodes.Status500InternalServerError
+                            else
+                                do! writeOk context {| queueItemIds = queueItemIds |> List.map (fun id -> id.ToString("D")) |}
+                                return StatusCodes.Status200OK
+                | _ ->
+                    do! writeDomainProblem context StatusCodes.Status400BadRequest "playback.request_invalid" "Invalid playback request" "queueItemIds must be an array."
+                    return StatusCodes.Status400BadRequest
+            | BodyTooLarge ->
+                do! writeRequestTooLarge context
+                return StatusCodes.Status413PayloadTooLarge
+            | _ ->
+                do! writeDomainProblem context StatusCodes.Status400BadRequest "playback.request_invalid" "Invalid playback request" "The queue reorder request body is invalid."
+                return StatusCodes.Status400BadRequest
+        }
+
+    let private adminSkipCurrent (context: HttpContext) =
+        task {
+            match! readJsonBody (16 * 1024) context with
+            | BodyParsed root when isExactEmptyJsonObject root ->
+                let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+                let clock = context.RequestServices.GetRequiredService<TimeProvider>()
+                let! result = PlaybackQueueRepository.skipCurrent source (clock.GetUtcNow()) context.RequestAborted
+                match result with
+                | Error _ ->
+                    do! writeRepositoryFailure context
+                    return StatusCodes.Status500InternalServerError
+                | Ok PlaybackControlOutcome.Conflict
+                | Ok PlaybackControlOutcome.NotFound ->
+                    do! writeDomainProblem context StatusCodes.Status409Conflict "playback.conflict" "Playback conflict" "There is no current track to skip."
+                    return StatusCodes.Status409Conflict
+                | Ok(PlaybackControlOutcome.Applied command) ->
+                    let payload = JsonSerializer.Serialize({| queueItemId = command.Fence.QueueItemId.ToString("D"); claimOwner = command.Fence.ClaimOwner.ToString("D"); claimAttempt = command.Fence.ClaimAttempt; commandGeneration = command.Generation |}, DomainJson.options)
+                    let! published = publishEvent context DomainEventType.PlaybackSkipped "Web10.Radio.API.Admin" payload
+                    if not published then
+                        do! writeRepositoryFailure context
+                        return StatusCodes.Status500InternalServerError
+                    else
+                        do! ApiJson.write context StatusCodes.Status202Accepted ApiJson.JsonContentType {| generation = command.Generation |}
+                        return StatusCodes.Status202Accepted
+            | BodyTooLarge ->
+                do! writeRequestTooLarge context
+                return StatusCodes.Status413PayloadTooLarge
+            | _ ->
+                do! writeDomainProblem context StatusCodes.Status400BadRequest "playback.request_invalid" "Invalid playback request" "The request body must be an empty object."
+                return StatusCodes.Status400BadRequest
+        }
+
+    let private adminRestartCurrent (context: HttpContext) =
+        task {
+            match! readJsonBody (16 * 1024) context with
+            | BodyParsed root when isExactEmptyJsonObject root ->
+                let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+                let clock = context.RequestServices.GetRequiredService<TimeProvider>()
+                let! result = PlaybackQueueRepository.restartCurrent source (clock.GetUtcNow()) context.RequestAborted
+                match result with
+                | Error _ ->
+                    do! writeRepositoryFailure context
+                    return StatusCodes.Status500InternalServerError
+                | Ok PlaybackControlOutcome.Conflict
+                | Ok PlaybackControlOutcome.NotFound ->
+                    do! writeDomainProblem context StatusCodes.Status409Conflict "playback.conflict" "Playback conflict" "There is no currently playing track to restart."
+                    return StatusCodes.Status409Conflict
+                | Ok(PlaybackControlOutcome.Applied command) ->
+                    let payload = JsonSerializer.Serialize({| queueItemId = command.Fence.QueueItemId.ToString("D"); claimOwner = command.Fence.ClaimOwner.ToString("D"); claimAttempt = command.Fence.ClaimAttempt; commandGeneration = command.Generation |}, DomainJson.options)
+                    let! published = publishEvent context DomainEventType.PlaybackRestarted "Web10.Radio.API.Admin" payload
+                    if not published then
+                        do! writeRepositoryFailure context
+                        return StatusCodes.Status500InternalServerError
+                    else
+                        do! ApiJson.write context StatusCodes.Status202Accepted ApiJson.JsonContentType {| generation = command.Generation |}
+                        return StatusCodes.Status202Accepted
+            | BodyTooLarge ->
+                do! writeRequestTooLarge context
+                return StatusCodes.Status413PayloadTooLarge
+            | _ ->
+                do! writeDomainProblem context StatusCodes.Status400BadRequest "playback.request_invalid" "Invalid playback request" "The request body must be an empty object."
+                return StatusCodes.Status400BadRequest
+        }
+
+    let private adminPlayNow (context: HttpContext) =
+        task {
+            match! readJsonBody (16 * 1024) context with
+            | BodyParsed root when hasExactProperties (Set.ofList [ "trackId" ]) root ->
+                match tryString "trackId" root |> Option.bind tryPositiveGuid with
+                | None ->
+                    do! writeDomainProblem context StatusCodes.Status400BadRequest "playback.request_invalid" "Invalid playback request" "The track identifier is invalid."
+                    return StatusCodes.Status400BadRequest
+                | Some trackId ->
+                    let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+                    let clock = context.RequestServices.GetRequiredService<TimeProvider>()
+                    let queueItemId = Uuid.CreateVersion7().ToGuidBigEndian()
+                    let! result = PlaybackQueueRepository.forcePlayNow source queueItemId trackId (clock.GetUtcNow()) context.RequestAborted
+                    match result with
+                    | Error _ ->
+                        do! writeRepositoryFailure context
+                        return StatusCodes.Status500InternalServerError
+                    | Ok PlaybackControlOutcome.NotFound ->
+                        do! writeDomainProblem context StatusCodes.Status404NotFound "playback.not_found" "Track not found" "The requested track is not playable."
+                        return StatusCodes.Status404NotFound
+                    | Ok PlaybackControlOutcome.Conflict ->
+                        do! writeDomainProblem context StatusCodes.Status409Conflict "playback.conflict" "Playback conflict" "The queue changed while the track was being forced."
+                        return StatusCodes.Status409Conflict
+                    | Ok(PlaybackControlOutcome.Applied applied) ->
+                        let payload =
+                            JsonSerializer.Serialize(
+                                {| queueItemId = applied.QueueItemId.ToString("D")
+                                   trackId = applied.TrackId.ToString("D")
+                                   interruptedQueueItemId = applied.Interrupted |> Option.map (fun fence -> fence.QueueItemId.ToString("D")) |},
+                                DomainJson.options
+                            )
+                        let! published = publishEvent context DomainEventType.TrackForcePlayed "Web10.Radio.API.Admin" payload
+                        if not published then
+                            do! writeRepositoryFailure context
+                            return StatusCodes.Status500InternalServerError
+                        else
+                            do! ApiJson.write context StatusCodes.Status202Accepted ApiJson.JsonContentType ({ QueueItemId = applied.QueueItemId.ToString("D") } : PlaybackQueueAcceptedDto)
+                            return StatusCodes.Status202Accepted
+            | BodyTooLarge ->
+                do! writeRequestTooLarge context
+                return StatusCodes.Status413PayloadTooLarge
+            | _ ->
+                do! writeDomainProblem context StatusCodes.Status400BadRequest "playback.request_invalid" "Invalid playback request" "The play-now request body is invalid."
+                return StatusCodes.Status400BadRequest
+        }
+
     let private streamHeartbeat (context: HttpContext) =
         task {
             use attempt = FlowTelemetry.start FlowTelemetry.StreamNodeHeartbeat
@@ -1744,7 +1548,7 @@ module ApiEndpoints =
                     | Some(persistedStatus, telemetryStatus), Some failureReason, Some metadata when hasExactProperties (Set.ofList [ "bitrateKbps"; "restartAttempt"; "activeQueueItemId" ]) metadata && validNullableNonNegativeInteger "bitrateKbps" metadata && validNullableNonNegativeInteger "restartAttempt" metadata && validNullableGuid metadata ->
                         FlowTelemetry.addTag "status" (box telemetryStatus) attempt
                         let metricTags = [ FlowTelemetry.status telemetryStatus ]
-                        let payload = JsonSerializer.Serialize({| status = persistedStatus; failureReason = failureReason |> Option.defaultValue null; metadata = metadata |}, ApiJson.options)
+                        let payload = JsonSerializer.Serialize({| status = persistedStatus; failureReason = failureReason |> Option.defaultValue null; metadata = metadata |}, DomainJson.options)
                         let! published = publishEvent context DomainEventType.StreamNodeHeartbeatReceived "Web10.Radio.StreamNode" payload
 
                         if published then
@@ -1786,16 +1590,46 @@ module ApiEndpoints =
     let private streamNodeControl (context: HttpContext) =
         task {
             let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
-            let ids = context.RequestServices.GetRequiredService<IIdGenerator>()
-            let clock = context.RequestServices.GetRequiredService<IClock>()
-            let! result = StreamNodeControlRepository.getOrCreate source (ids.NewId()) clock.UtcNow context.RequestAborted
-            match result with
-            | Error _ ->
-                do! repositoryReadFailed context
-                return StatusCodes.Status500InternalServerError
-            | Ok state ->
-                do! writeOk context (toControlDto state)
-                return StatusCodes.Status200OK
+            let clock = context.RequestServices.GetRequiredService<TimeProvider>()
+            let parseNonNegative name defaultValue maxValue =
+                match context.Request.Query.TryGetValue(name) with
+                | false, _ -> Ok defaultValue
+                | true, values when values.Count = 1 ->
+                    let mutable parsed = 0L
+                    if Int64.TryParse(values[0], &parsed) && parsed >= 0L && parsed <= maxValue then Ok parsed
+                    else Error ()
+                | _ -> Error ()
+            let parseLimit () =
+                match context.Request.Query.TryGetValue("limit") with
+                | false, _ -> Ok 100
+                | true, values when values.Count = 1 ->
+                    let mutable parsed = 0
+                    if Int32.TryParse(values[0], &parsed) && parsed >= 1 && parsed <= 100 then Ok parsed else Error ()
+                | _ -> Error ()
+            match parseNonNegative "afterPlaybackGeneration" 0L Int64.MaxValue, parseLimit () with
+            | Error (), _
+            | _, Error () ->
+                do! writeDomainProblem context StatusCodes.Status400BadRequest "stream-node.control.request_invalid" "Invalid stream-node control request" "afterPlaybackGeneration must be a non-negative integer and limit must be between 1 and 100."
+                return StatusCodes.Status400BadRequest
+            | Ok afterGeneration, Ok limit ->
+                let! result = StreamNodeControlRepository.getOrCreate source (Uuid.CreateVersion7().ToGuidBigEndian()) (clock.GetUtcNow()) context.RequestAborted
+                let! commands = StreamNodeControlRepository.getPlaybackCommands source afterGeneration limit context.RequestAborted
+                match result, commands with
+                | Error _, _
+                | _, Error _ ->
+                    do! repositoryReadFailed context
+                    return StatusCodes.Status500InternalServerError
+                | Ok state, Ok(commandRows, nextGeneration) ->
+                    let dtos : StreamNodePlaybackCommandDto list =
+                        commandRows
+                        |> List.map (fun command ->
+                            { Generation = command.Generation
+                              Action = command.Action
+                              QueueItemId = command.QueueItemId.ToString("D")
+                              ClaimOwner = command.ClaimOwner.ToString("D")
+                              ClaimAttempt = command.ClaimAttempt })
+                    do! writeOk context (toControlDto state dtos nextGeneration)
+                    return StatusCodes.Status200OK
         }
 
     let private adminStreamControl operation (context: HttpContext) =
@@ -1803,21 +1637,20 @@ module ApiEndpoints =
             match! readJsonBody (16 * 1024) context with
             | BodyParsed root when isExactEmptyJsonObject root ->
                 let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
-                let ids = context.RequestServices.GetRequiredService<IIdGenerator>()
-                let clock = context.RequestServices.GetRequiredService<IClock>()
-                let! initialized = StreamNodeControlRepository.getOrCreate source (ids.NewId()) clock.UtcNow context.RequestAborted
+                let clock = context.RequestServices.GetRequiredService<TimeProvider>()
+                let! initialized = StreamNodeControlRepository.getOrCreate source (Uuid.CreateVersion7().ToGuidBigEndian()) (clock.GetUtcNow()) context.RequestAborted
                 let! result =
                     match initialized, operation with
                     | Error error, _ -> Task.FromResult(Error error)
-                    | Ok _, "start" -> StreamNodeControlRepository.setDesiredState source Running clock.UtcNow context.RequestAborted
-                    | Ok _, "stop" -> StreamNodeControlRepository.setDesiredState source Stopped clock.UtcNow context.RequestAborted
-                    | Ok _, _ -> StreamNodeControlRepository.restart source clock.UtcNow context.RequestAborted
+                    | Ok _, "start" -> StreamNodeControlRepository.setDesiredState source Running (clock.GetUtcNow()) context.RequestAborted
+                    | Ok _, "stop" -> StreamNodeControlRepository.setDesiredState source Stopped (clock.GetUtcNow()) context.RequestAborted
+                    | Ok _, _ -> StreamNodeControlRepository.restart source (clock.GetUtcNow()) context.RequestAborted
                 match result with
                 | Error _ ->
                     do! writeRepositoryFailure context
                     return StatusCodes.Status500InternalServerError
                 | Ok state ->
-                    do! ApiJson.write context StatusCodes.Status202Accepted ApiJson.JsonContentType (toControlDto state)
+                    do! ApiJson.write context StatusCodes.Status202Accepted ApiJson.JsonContentType (toControlDto state [] 0L)
                     return StatusCodes.Status202Accepted
             | BodyTooLarge ->
                 do! writeRequestTooLarge context
@@ -1830,14 +1663,13 @@ module ApiEndpoints =
     let private adminStreamStatus (context: HttpContext) =
         task {
             let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
-            let ids = context.RequestServices.GetRequiredService<IIdGenerator>()
-            let clock = context.RequestServices.GetRequiredService<IClock>()
-            let! control = StreamNodeControlRepository.getOrCreate source (ids.NewId()) clock.UtcNow context.RequestAborted
+            let clock = context.RequestServices.GetRequiredService<TimeProvider>()
+            let! control = StreamNodeControlRepository.getOrCreate source (Uuid.CreateVersion7().ToGuidBigEndian()) (clock.GetUtcNow()) context.RequestAborted
             let! snapshot = PlayerStateReadModel.loadSnapshot source clock context.RequestAborted
             match control, snapshot with
             | Ok state, Ok player ->
                 let fresh = player.Stream.Status <> "offline"
-                let controlDto = toControlDto state
+                let controlDto = toControlDto state [] 0L
                 let dto: StreamNodeStatusDto =
                     { Status = player.Stream.Status
                       DesiredState = controlDto.DesiredState
@@ -1867,15 +1699,14 @@ module ApiEndpoints =
                         return StatusCodes.Status400BadRequest
                     else
                         let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
-                        let ids = context.RequestServices.GetRequiredService<IIdGenerator>()
-                        let clock = context.RequestServices.GetRequiredService<IClock>()
-                        let! result = AdminContentRepository.upsertDonationGoal source { Id = ids.NewId(); Title = trimmed; GoalStars = stars; UpdatedAtUtc = clock.UtcNow } context.RequestAborted
+                        let clock = context.RequestServices.GetRequiredService<TimeProvider>()
+                        let! result = AdminContentRepository.upsertDonationGoal source { Id = Uuid.CreateVersion7().ToGuidBigEndian(); Title = trimmed; GoalStars = stars; UpdatedAtUtc = (clock.GetUtcNow()) } context.RequestAborted
                         match result with
                         | Error _ ->
                             do! writeRepositoryFailure context
                             return StatusCodes.Status500InternalServerError
                         | Ok _ ->
-                            let payload = JsonSerializer.Serialize({| title = trimmed; goalStars = stars |}, ApiJson.options)
+                            let payload = JsonSerializer.Serialize({| title = trimmed; goalStars = stars |}, DomainJson.options)
                             let! published = publishEvent context DomainEventType.AdminGoalChanged "Web10.Radio.API.Admin" payload
                             if not published then
                                 do! writeRepositoryFailure context
@@ -1899,12 +1730,12 @@ module ApiEndpoints =
 
     let private socialKinds = Set.ofList [ "telegram"; "youtube"; "instagram"; "discord"; "external" ]
 
-    let private parseSocialReplacement (ids: IIdGenerator) (element: JsonElement) =
+    let private parseSocialReplacement (element: JsonElement) =
         if not (hasExactProperties (Set.ofList [ "id"; "kind"; "name"; "handle"; "url"; "glyph"; "color"; "qrImageUrl"; "isFeatured" ]) element) then None
         else
             match tryProperty "id" element, tryString "kind" element, tryString "name" element, tryNullableString "handle" element, tryString "url" element, tryNullableString "glyph" element, tryNullableString "color" element, tryNullableString "qrImageUrl" element, tryProperty "isFeatured" element with
             | Some idElement, Some kind, Some name, Some handle, Some url, Some glyph, Some color, Some qrImageUrl, Some featured when idElement.ValueKind = JsonValueKind.Null || idElement.ValueKind = JsonValueKind.String ->
-                let id = if idElement.ValueKind = JsonValueKind.Null then Some(ids.NewId()) else idElement.GetString() |> tryPositiveGuid
+                let id = if idElement.ValueKind = JsonValueKind.Null then Some(Uuid.CreateVersion7().ToGuidBigEndian()) else idElement.GetString() |> tryPositiveGuid
                 let parsedUrl = match Uri.TryCreate(url, UriKind.Absolute) with | true, uri when uri.Scheme = Uri.UriSchemeHttp || uri.Scheme = Uri.UriSchemeHttps -> Some uri | _ -> None
                 let colorValid = color |> Option.forall (fun value -> value.Length = 7 && value.[0] = '#' && value |> Seq.skip 1 |> Seq.forall Uri.IsHexDigit)
                 if id.IsNone || not (socialKinds.Contains kind) || name.Trim().Length < 1 || not colorValid || parsedUrl.IsNone || featured.ValueKind <> JsonValueKind.True && featured.ValueKind <> JsonValueKind.False then None
@@ -1918,15 +1749,14 @@ module ApiEndpoints =
                 do! writeRequestTooLarge context
                 return StatusCodes.Status413PayloadTooLarge
             | BodyParsed root when root.ValueKind = JsonValueKind.Array && root.GetArrayLength() <= 50 ->
-                let ids = context.RequestServices.GetRequiredService<IIdGenerator>()
-                let parsed = root.EnumerateArray() |> Seq.map (parseSocialReplacement ids) |> Seq.toList
+                let parsed = root.EnumerateArray() |> Seq.map parseSocialReplacement |> Seq.toList
                 if parsed |> List.exists Option.isNone then
                     do! writeDomainProblem context StatusCodes.Status400BadRequest "social-links.request_invalid" "Invalid social links request" "The social links body is invalid."
                     return StatusCodes.Status400BadRequest
                 else
                     let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
-                    let clock = context.RequestServices.GetRequiredService<IClock>()
-                    let! result = AdminContentRepository.replaceSocialLinks source (parsed |> List.choose id) clock.UtcNow context.RequestAborted
+                    let clock = context.RequestServices.GetRequiredService<TimeProvider>()
+                    let! result = AdminContentRepository.replaceSocialLinks source (parsed |> List.choose id) (clock.GetUtcNow()) context.RequestAborted
                     match result with
                     | Error _ ->
                         do! writeRepositoryFailure context
@@ -1938,7 +1768,7 @@ module ApiEndpoints =
                         do! writeDomainProblem context StatusCodes.Status409Conflict "social-links.conflict" "Social links conflict" "The social links replacement conflicts with current state."
                         return StatusCodes.Status409Conflict
                     | Ok(AdminContentMutation.Applied links) ->
-                        let! published = publishEvent context DomainEventType.SocialLinkChanged "Web10.Radio.API.Admin" (JsonSerializer.Serialize({| count = List.length links |}, ApiJson.options))
+                        let! published = publishEvent context DomainEventType.SocialLinkChanged "Web10.Radio.API.Admin" (JsonSerializer.Serialize({| count = List.length links |}, DomainJson.options))
                         if not published then
                             do! writeRepositoryFailure context
                             return StatusCodes.Status500InternalServerError
@@ -1949,16 +1779,120 @@ module ApiEndpoints =
                 do! writeDomainProblem context StatusCodes.Status400BadRequest "social-links.request_invalid" "Invalid social links request" "The social links body is invalid."
                 return StatusCodes.Status400BadRequest
         }
-    let private parsePlaylistBody root =
-        if not (hasExactProperties (Set.ofList [ "name"; "description"; "isActive" ]) root) then None
+    type private PlaylistBody =
+        { Name: string
+          Description: string option
+          IsActive: bool
+          Type: PlaylistType
+          Source: PlaylistSource
+          Order: PlaylistOrder
+          Weight: int
+          IsJingle: bool
+          Interrupt: bool
+          AvoidDuplicates: bool
+          PlayEverySongs: int option
+          PlayEveryMinutes: int option
+          PlayAtMinute: int option
+          Schedules: PlaylistSchedule list }
+
+    let private tryInt (name: string) (root: JsonElement) =
+        match tryProperty name root with
+        | Some value when value.ValueKind = JsonValueKind.Number ->
+            let mutable parsed = 0
+            if value.TryGetInt32(&parsed) then Some parsed else None
+        | _ -> None
+
+    let private tryNullableInt (name: string) (root: JsonElement) =
+        match tryProperty name root with
+        | Some value when value.ValueKind = JsonValueKind.Null -> Some None
+        | Some value when value.ValueKind = JsonValueKind.Number ->
+            let mutable parsed = 0
+            if value.TryGetInt32(&parsed) then Some(Some parsed) else None
+        | _ -> None
+
+    let private tryBool (name: string) (root: JsonElement) =
+        match tryProperty name root with
+        | Some value when value.ValueKind = JsonValueKind.True -> Some true
+        | Some value when value.ValueKind = JsonValueKind.False -> Some false
+        | _ -> None
+
+    let private parsePlaylistType = function
+        | "general" -> Some PlaylistType.General
+        | "oncePerSongs" -> Some PlaylistType.OncePerSongs
+        | "oncePerMinutes" -> Some PlaylistType.OncePerMinutes
+        | "oncePerHour" -> Some PlaylistType.OncePerHour
+        | _ -> None
+
+    let private parsePlaylistSource = function
+        | "manual" -> Some PlaylistSource.Manual
+        | "allStorage" -> Some PlaylistSource.AllStorage
+        | _ -> None
+
+    let private parsePlaylistOrder = function
+        | "sequential" -> Some PlaylistOrder.Sequential
+        | "shuffle" -> Some PlaylistOrder.Shuffle
+        | "random" -> Some PlaylistOrder.Random
+        | _ -> None
+
+    let private parseDate value =
+        try Some(DateOnly.ParseExact(value, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None)) with _ -> None
+
+    let private parseTime value =
+        try Some(TimeSpan.ParseExact(value, "hh\\:mm", CultureInfo.InvariantCulture)) with _ -> None
+
+    let private parsePlaylistSchedule (element: JsonElement) =
+        if not (hasExactProperties (Set.ofList [ "id"; "daysOfWeek"; "startTime"; "endTime"; "startDate"; "endDate"; "timeZoneId" ]) element) then None
         else
-            match tryString "name" root, tryNullableString "description" root, tryProperty "isActive" root with
-            | Some name, Some description, Some active when active.ValueKind = JsonValueKind.True || active.ValueKind = JsonValueKind.False ->
-                let trimmed = name.Trim()
-                let normalizedDescription = description |> Option.map _.Trim()
-                if trimmed.Length < 1 || trimmed.Length > 120 || normalizedDescription |> Option.exists (fun text -> text.Length > 1000) then None
-                else Some(trimmed, normalizedDescription, active.GetBoolean())
+            match tryProperty "id" element, tryProperty "daysOfWeek" element, tryString "startTime" element, tryString "endTime" element, tryNullableString "startDate" element, tryNullableString "endDate" element, tryString "timeZoneId" element with
+            | Some idElement, Some days, Some startTime, Some endTime, Some startDate, Some endDate, Some timeZoneId
+                when (idElement.ValueKind = JsonValueKind.Null || idElement.ValueKind = JsonValueKind.String) && days.ValueKind = JsonValueKind.Array && not (String.IsNullOrWhiteSpace timeZoneId) ->
+                let scheduleId = if idElement.ValueKind = JsonValueKind.Null then Some(Uuid.CreateVersion7().ToGuidBigEndian()) else idElement.GetString() |> tryPositiveGuid
+                let dayValues =
+                    days.EnumerateArray()
+                    |> Seq.map (fun day -> let mutable parsed = 0 in if day.ValueKind = JsonValueKind.Number && day.TryGetInt32(&parsed) then Some parsed else None)
+                    |> Seq.toList
+                let startDateValue = startDate |> Option.bind parseDate
+                let endDateValue = endDate |> Option.bind parseDate
+                let values = dayValues |> List.choose (fun value -> value)
+                let validDays = dayValues.Length = values.Length && Set.ofList values |> Set.count = values.Length && values |> List.forall (fun value -> value >= 1 && value <= 7)
+                let validTimeZone = try TimeZoneInfo.FindSystemTimeZoneById(timeZoneId) |> ignore; true with _ -> false
+                match scheduleId, parseTime startTime, parseTime endTime, startDateValue, endDateValue with
+                | Some scheduleId, Some start, Some finish, Some parsedStartDate, Some parsedEndDate when validDays && validTimeZone && parsedStartDate <= parsedEndDate ->
+                    Some { Id = Some scheduleId; DaysOfWeek = values; StartTime = start; EndTime = finish; StartDate = Some parsedStartDate; EndDate = Some parsedEndDate; TimeZoneId = timeZoneId }
+                | Some scheduleId, Some start, Some finish, None, None when validDays && validTimeZone ->
+                    Some { Id = Some scheduleId; DaysOfWeek = values; StartTime = start; EndTime = finish; StartDate = None; EndDate = None; TimeZoneId = timeZoneId }
+                | _ -> None
             | _ -> None
+
+    let private parsePlaylistBody root : PlaylistBody option =
+        let expected = Set.ofList [ "name"; "description"; "isActive"; "type"; "source"; "order"; "weight"; "isJingle"; "interrupt"; "avoidDuplicates"; "playEverySongs"; "playEveryMinutes"; "playAtMinute"; "schedules" ]
+        if not (hasExactProperties expected root) then None
+        else
+            match tryString "name" root, tryNullableString "description" root, tryBool "isActive" root, tryString "type" root, tryString "source" root, tryString "order" root, tryInt "weight" root, tryBool "isJingle" root, tryBool "interrupt" root, tryBool "avoidDuplicates" root, tryNullableInt "playEverySongs" root, tryNullableInt "playEveryMinutes" root, tryNullableInt "playAtMinute" root, tryProperty "schedules" root with
+            | Some name, Some description, Some isActive, Some typeValue, Some sourceValue, Some orderValue, Some weight, Some isJingle, Some interrupt, Some avoidDuplicates, Some everySongs, Some everyMinutes, Some atMinute, Some schedules when schedules.ValueKind = JsonValueKind.Array ->
+                match parsePlaylistType typeValue, parsePlaylistSource sourceValue, parsePlaylistOrder orderValue with
+                | Some playlistType, Some playlistSource, Some playlistOrder ->
+                    let cadenceValid =
+                        match playlistType, everySongs, everyMinutes, atMinute with
+                        | PlaylistType.General, None, None, None -> true
+                        | PlaylistType.OncePerSongs, Some value, None, None -> value >= 1 && value <= 1000
+                        | PlaylistType.OncePerMinutes, None, Some value, None -> value >= 1 && value <= 10080
+                        | PlaylistType.OncePerHour, None, None, Some value -> value >= 0 && value <= 59
+                        | _ -> false
+                    let parsedSchedules = schedules.EnumerateArray() |> Seq.map parsePlaylistSchedule |> Seq.toList
+                    let normalizedName = name.Trim()
+                    let normalizedDescription = description |> Option.map _.Trim()
+                    if cadenceValid && normalizedName.Length >= 1 && normalizedName.Length <= 120 && normalizedDescription |> Option.exists (fun value -> value.Length > 1000) |> not && weight >= 1 && weight <= 25 && parsedSchedules.Length <= 32 && parsedSchedules |> List.forall Option.isSome then
+                        Some { Name = normalizedName; Description = normalizedDescription; IsActive = isActive; Type = playlistType; Source = playlistSource; Order = playlistOrder; Weight = weight; IsJingle = isJingle; Interrupt = interrupt; AvoidDuplicates = avoidDuplicates; PlayEverySongs = everySongs; PlayEveryMinutes = everyMinutes; PlayAtMinute = atMinute; Schedules = parsedSchedules |> List.choose (fun value -> value) }
+                    else None
+                | _ -> None
+            | _ -> None
+
+    let private playlistChangedOutbox (clock: TimeProvider) (playlistId: Guid) =
+        let payload = JsonSerializer.Serialize({| playlistId = playlistId.ToString("D") |}, DomainJson.options)
+        DomainEventEnvelope.create clock PlaylistChanged "Web10.Radio.API.Admin" None None payload
+        |> Result.map OutboxMapping.toOutboxEvent
+        |> Result.defaultWith (fun error -> failwithf "Unable to create PlaylistChanged event: %s" (error.ToString()))
 
     let private adminPlaylists (context: HttpContext) =
         task {
@@ -1984,12 +1918,34 @@ module ApiEndpoints =
                 | None ->
                     do! writeDomainProblem context StatusCodes.Status400BadRequest "playlist.request_invalid" "Invalid playlist request" "The playlist body is invalid."
                     return StatusCodes.Status400BadRequest
-                | Some(name, description, active) ->
+                | Some body ->
                     let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
-                    let ids = context.RequestServices.GetRequiredService<IIdGenerator>()
-                    let clock = context.RequestServices.GetRequiredService<IClock>()
-                    let now = clock.UtcNow
-                    let! result = AdminContentRepository.createPlaylist source { Id = ids.NewId(); Name = name; Description = description; IsActive = active; CreatedAtUtc = now; UpdatedAtUtc = now } context.RequestAborted
+                    let clock = context.RequestServices.GetRequiredService<TimeProvider>()
+                    let now = clock.GetUtcNow()
+                    let playlistId = Uuid.CreateVersion7().ToGuidBigEndian()
+                    let! result =
+                        AdminContentRepository.createPlaylistWithEvent
+                            source
+                            { Id = playlistId
+                              Name = body.Name
+                              Description = body.Description
+                              IsActive = body.IsActive
+                              Type = body.Type
+                              Source = body.Source
+                              Order = body.Order
+                              Weight = body.Weight
+                              IsJingle = body.IsJingle
+                              Interrupt = body.Interrupt
+                              AvoidDuplicates = body.AvoidDuplicates
+                              PlayEverySongs = body.PlayEverySongs
+                              PlayEveryMinutes = body.PlayEveryMinutes
+                              PlayAtMinute = body.PlayAtMinute
+                              IsSystem = false
+                              Schedules = body.Schedules
+                              CreatedAtUtc = now
+                              UpdatedAtUtc = now }
+                            (Some(playlistChangedOutbox clock playlistId))
+                            context.RequestAborted
                     match result with
                     | Error _ ->
                         do! writeRepositoryFailure context
@@ -2024,10 +1980,30 @@ module ApiEndpoints =
                     | None ->
                         do! writeDomainProblem context StatusCodes.Status400BadRequest "playlist.request_invalid" "Invalid playlist request" "The playlist body is invalid."
                         return StatusCodes.Status400BadRequest
-                    | Some(name, description, active) ->
+                    | Some body ->
                         let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
-                        let clock = context.RequestServices.GetRequiredService<IClock>()
-                        let! result = AdminContentRepository.updatePlaylist source playlistId { Name = name; Description = description; IsActive = active; UpdatedAtUtc = clock.UtcNow } context.RequestAborted
+                        let clock = context.RequestServices.GetRequiredService<TimeProvider>()
+                        let! result =
+                            AdminContentRepository.updatePlaylistWithEvent
+                                source
+                                playlistId
+                                { Name = body.Name
+                                  Description = body.Description
+                                  IsActive = body.IsActive
+                                  Type = body.Type
+                                  Source = body.Source
+                                  Order = body.Order
+                                  Weight = body.Weight
+                                  IsJingle = body.IsJingle
+                                  Interrupt = body.Interrupt
+                                  AvoidDuplicates = body.AvoidDuplicates
+                                  PlayEverySongs = body.PlayEverySongs
+                                  PlayEveryMinutes = body.PlayEveryMinutes
+                                  PlayAtMinute = body.PlayAtMinute
+                                  Schedules = body.Schedules
+                                  UpdatedAtUtc = clock.GetUtcNow() }
+                                (Some(playlistChangedOutbox clock playlistId))
+                                context.RequestAborted
                         match result with
                         | Error _ ->
                             do! writeRepositoryFailure context
@@ -2082,9 +2058,8 @@ module ApiEndpoints =
                         return StatusCodes.Status400BadRequest
                     | Some trackId ->
                         let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
-                        let ids = context.RequestServices.GetRequiredService<IIdGenerator>()
-                        let clock = context.RequestServices.GetRequiredService<IClock>()
-                        let! result = AdminContentRepository.createPlaylistItem source playlistId { Id = ids.NewId(); TrackId = trackId; CreatedAtUtc = clock.UtcNow } context.RequestAborted
+                        let clock = context.RequestServices.GetRequiredService<TimeProvider>()
+                        let! result = AdminContentRepository.createPlaylistItem source playlistId { Id = Uuid.CreateVersion7().ToGuidBigEndian(); TrackId = trackId; CreatedAtUtc = (clock.GetUtcNow()) } context.RequestAborted
                         match result with
                         | Error _ ->
                             do! writeRepositoryFailure context
@@ -2116,13 +2091,12 @@ module ApiEndpoints =
                 | BodyParsed root when hasExactProperties (Set.ofList [ "items" ]) root ->
                     match tryProperty "items" root with
                     | Some items when items.ValueKind = JsonValueKind.Array ->
-                        let ids = context.RequestServices.GetRequiredService<IIdGenerator>()
                         let parsed =
                             items.EnumerateArray()
                             |> Seq.map (fun item ->
                                 if hasExactProperties (Set.ofList [ "id"; "trackId" ]) item then
                                     match tryProperty "id" item, tryString "trackId" item |> Option.bind tryPositiveGuid with
-                                    | Some id, Some trackId when id.ValueKind = JsonValueKind.Null -> Some { Id = ids.NewId(); TrackId = trackId }
+                                    | Some id, Some trackId when id.ValueKind = JsonValueKind.Null -> Some { Id = Uuid.CreateVersion7().ToGuidBigEndian(); TrackId = trackId }
                                     | Some id, Some trackId when id.ValueKind = JsonValueKind.String -> id.GetString() |> tryPositiveGuid |> Option.map (fun itemId -> { Id = itemId; TrackId = trackId })
                                     | _ -> None
                                 else None)
@@ -2132,8 +2106,8 @@ module ApiEndpoints =
                             return StatusCodes.Status400BadRequest
                         else
                             let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
-                            let clock = context.RequestServices.GetRequiredService<IClock>()
-                            let! result = AdminContentRepository.replacePlaylistItems source playlistId (parsed |> List.choose id) clock.UtcNow context.RequestAborted
+                            let clock = context.RequestServices.GetRequiredService<TimeProvider>()
+                            let! result = AdminContentRepository.replacePlaylistItems source playlistId (parsed |> List.choose id) (clock.GetUtcNow()) context.RequestAborted
                             match result with
                             | Error _ ->
                                 do! writeRepositoryFailure context
@@ -2186,7 +2160,6 @@ module ApiEndpoints =
             | BodyParsed root when hasExactProperties (Set.ofList [ "additionalBackends" ]) root ->
                 match tryProperty "additionalBackends" root with
                 | Some array when array.ValueKind = JsonValueKind.Array && array.GetArrayLength() <= 20 ->
-                    let ids = context.RequestServices.GetRequiredService<IIdGenerator>()
                     let parsed =
                         array.EnumerateArray()
                         |> Seq.map (fun item ->
@@ -2194,7 +2167,7 @@ module ApiEndpoints =
                             else
                                 match tryProperty "id" item, tryString "name" item, tryString "type" item, tryNullableString "localRoot" item, tryNullableString "s3Bucket" item, tryProperty "isEnabled" item with
                                 | Some id, Some name, Some storageType, Some localRoot, Some bucket, Some enabled when (id.ValueKind = JsonValueKind.Null || id.ValueKind = JsonValueKind.String) && (enabled.ValueKind = JsonValueKind.True || enabled.ValueKind = JsonValueKind.False) ->
-                                    let backendId = if id.ValueKind = JsonValueKind.Null then Some(ids.NewId()) else id.GetString() |> tryPositiveGuid
+                                    let backendId = if id.ValueKind = JsonValueKind.Null then Some(Uuid.CreateVersion7().ToGuidBigEndian()) else id.GetString() |> tryPositiveGuid
                                     let valid = name.Trim().Length >= 1 && ((storageType = "local" && localRoot |> Option.exists Path.IsPathFullyQualified && bucket.IsNone) || (storageType = "s3" && bucket |> Option.exists (fun text -> text.Trim().Length > 0) && localRoot.IsNone))
                                     if backendId.IsSome && valid then
                                         let replacement: AdditionalStorageBackendReplacement =
@@ -2214,8 +2187,8 @@ module ApiEndpoints =
                     else
                         let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
                         let options = context.RequestServices.GetRequiredService<StorageOptions>()
-                        let clock = context.RequestServices.GetRequiredService<IClock>()
-                        let! result = AdminContentRepository.replaceAdditionalStorageBackends source (parsed |> List.choose id) clock.UtcNow context.RequestAborted
+                        let clock = context.RequestServices.GetRequiredService<TimeProvider>()
+                        let! result = AdminContentRepository.replaceAdditionalStorageBackends source (parsed |> List.choose id) (clock.GetUtcNow()) context.RequestAborted
                         match result with
                         | Error _ ->
                             do! writeRepositoryFailure context
@@ -2250,17 +2223,14 @@ module ApiEndpoints =
             | BodyParsed root when hasExactProperties (Set.ofList [ "fixtureKey" ]) root ->
                 match tryString "fixtureKey" root with
                 | Some fixtureKey when fixtureKey.Trim().Length >= 1 && fixtureKey.Trim().Length <= 64 ->
-                    let options = context.RequestServices.GetRequiredService<Web10Options>()
                     let dataSource = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
-                    let idGenerator = context.RequestServices.GetRequiredService<IIdGenerator>()
-                    let clock = context.RequestServices.GetRequiredService<IClock>()
+                    let clock = context.RequestServices.GetRequiredService<TimeProvider>()
 
                     let! result =
                         DevelopmentFixtures.createPaidVerticalSlice
                             dataSource
-                            idGenerator
                             clock
-                            options.Telegram.SayPriceStars
+                            50
                             (fixtureKey.Trim())
                             context.RequestAborted
 
@@ -2286,8 +2256,6 @@ module ApiEndpoints =
         map app logger "GET" "/api/v0/player/stream" "/api/v0/player/stream" playerStream
         map app logger "GET" "/api/v0/player/song" "/api/v0/player/song" playerSong
         map app logger "GET" "/api/v0/player/health" "/api/v0/player/health" playerHealth
-        map app logger "POST" "/api/v0/telegram/webhook" "/api/v0/telegram/webhook" telegramWebhook
-        map app logger "GET" "/api/v0/telegram/health" "/api/v0/telegram/health" telegramHealth
 
         let streamNode = app.MapGroup("/api/v0/stream-node")
         streamNode.RequireAuthorization(StreamNodeAuthentication.PolicyName) |> ignore
@@ -2311,6 +2279,10 @@ module ApiEndpoints =
                 "/dev/fixtures/paid-vertical-slice"
                 "/api/v0/admin/dev/fixtures/paid-vertical-slice"
                 (csrfProtected createPaidVerticalSliceFixture)
+        map app logger "GET" "/api/v0/player/assets/cover/{trackId}" "/api/v0/player/assets/cover/{trackId}" playerCover
+        map admin logger "PUT" "/tracks/{trackId}" "/api/v0/admin/tracks/{trackId}" (csrfProtected adminUpdateTrackMetadata)
+        map admin logger "PUT" "/tracks/{trackId}/cover" "/api/v0/admin/tracks/{trackId}/cover" (csrfProtected adminReplaceTrackCover)
+        map admin logger "DELETE" "/tracks/{trackId}/cover" "/api/v0/admin/tracks/{trackId}/cover" (csrfProtected adminRemoveTrackCover)
         map admin logger "GET" "/social-links" "/api/v0/admin/social-links" adminSocialLinks
         map admin logger "PUT" "/social-links" "/api/v0/admin/social-links" (csrfProtected adminSocialLinksUpdate)
         map admin logger "GET" "/donation-goal" "/api/v0/admin/donation-goal" adminDonationGoal
@@ -2319,15 +2291,16 @@ module ApiEndpoints =
         map admin logger "GET" "/library/scan/{scanJobId}" "/api/v0/admin/library/scan/{scanJobId}" libraryScanStatus
         map admin logger "GET" "/tracks" "/api/v0/admin/tracks" adminTracks
         map admin logger "POST" "/playback/queue" "/api/v0/admin/playback/queue" (csrfProtected adminQueueTrack)
+        map admin logger "PUT" "/playback/queue/order" "/api/v0/admin/playback/queue/order" (csrfProtected adminReorderQueue)
+        map admin logger "POST" "/playback/skip" "/api/v0/admin/playback/skip" (csrfProtected adminSkipCurrent)
+        map admin logger "POST" "/playback/restart-current" "/api/v0/admin/playback/restart-current" (csrfProtected adminRestartCurrent)
+        map admin logger "POST" "/playback/play-now" "/api/v0/admin/playback/play-now" (csrfProtected adminPlayNow)
         map admin logger "GET" "/playlists" "/api/v0/admin/playlists" adminPlaylists
         map admin logger "POST" "/playlists" "/api/v0/admin/playlists" (csrfProtected createPlaylist)
         map admin logger "PUT" "/playlists/{playlistId}" "/api/v0/admin/playlists/{playlistId}" (csrfProtected updatePlaylist)
         map admin logger "GET" "/playlists/{playlistId}/items" "/api/v0/admin/playlists/{playlistId}/items" playlistItems
         map admin logger "POST" "/playlists/{playlistId}/items" "/api/v0/admin/playlists/{playlistId}/items" (csrfProtected createPlaylistItem)
         map admin logger "PUT" "/playlists/{playlistId}/items" "/api/v0/admin/playlists/{playlistId}/items" (csrfProtected replacePlaylistItems)
-        map admin logger "GET" "/say-messages" "/api/v0/admin/say-messages" adminSayMessages
-        map admin logger "POST" "/say-messages/{messageId}/approve" "/api/v0/admin/say-messages/{messageId}/approve" (csrfProtected approveSayMessage)
-        map admin logger "POST" "/say-messages/{messageId}/reject" "/api/v0/admin/say-messages/{messageId}/reject" (csrfProtected rejectSayMessage)
         map admin logger "GET" "/storage" "/api/v0/admin/storage" adminStorage
         map admin logger "PUT" "/storage" "/api/v0/admin/storage" (csrfProtected adminStorageUpdate)
         map admin logger "GET" "/stream-node/status" "/api/v0/admin/stream-node/status" adminStreamStatus

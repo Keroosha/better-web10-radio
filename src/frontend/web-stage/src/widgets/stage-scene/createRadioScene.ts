@@ -57,8 +57,10 @@ export function createRadioScene(
   let onReadyFired = false;
   let disposed = false;
   let graphics: Graphics | null = null;
+  let buildGeneration = 0;
 
   function buildGraphics(): Graphics {
+    const generation = ++buildGeneration;
     const geometries = new Set<THREE.BufferGeometry>();
     const materials = new Set<THREE.Material>();
     const textures = new Set<THREE.Texture>();
@@ -288,6 +290,32 @@ export function createRadioScene(
     drawAlbumArt(album, track);
 
     const artMat = regMat(new THREE.MeshBasicMaterial({ map: album.texture }));
+    let active = true;
+    const coverUrl = track.coverImageUrl.trim();
+    if (coverUrl !== '') {
+      new THREE.TextureLoader().load(
+        coverUrl,
+        (coverTexture) => {
+          // ImageLoader cannot be cancelled portably. Dispose a late result instead of
+          // attaching it to a disposed/context-replaced material.
+          if (!active || disposed || generation !== buildGeneration) {
+            coverTexture.dispose();
+            return;
+          }
+          coverTexture.colorSpace = THREE.SRGBColorSpace;
+          artMat.map = coverTexture;
+          artMat.needsUpdate = true;
+          textures.add(coverTexture);
+          textures.delete(album.texture);
+          album.texture.dispose();
+        },
+        undefined,
+        (): void => {
+          // Keep the generated album texture when an external/managed cover fails.
+        },
+      );
+    }
+
     const trayMat = regMat(
       new THREE.MeshStandardMaterial({ map: regTex(createTrayTexture()), roughness: 0.5, metalness: 0.15 }),
     );
@@ -346,7 +374,6 @@ export function createRadioScene(
     scene.add(cd);
 
     // ---- frame loop ----
-    let active = true;
     let rafId = 0;
     const timer = new THREE.Timer();
     const animate = (): void => {

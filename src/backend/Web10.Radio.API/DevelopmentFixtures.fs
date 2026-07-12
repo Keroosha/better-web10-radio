@@ -1,5 +1,7 @@
 namespace Web10.Radio.API
 
+open Dodo.Primitives
+open Web10.Radio.Application
 open System
 open System.Numerics
 open System.Security.Cryptography
@@ -149,13 +151,12 @@ DO UPDATE SET "Title" = EXCLUDED."Title", "GoalStars" = EXCLUDED."GoalStars", "U
     let private createDonationPayment
         (connection: NpgsqlConnection)
         (transaction: NpgsqlTransaction)
-        (idGenerator: IIdGenerator)
         nowUtc
         invoicePayload
         (cancellationToken: CancellationToken) =
         task {
             let order: PaymentOrderToCreate =
-                { Id = idGenerator.NewId()
+                { Id = Uuid.CreateVersion7().ToGuidBigEndian()
                   TelegramUserId = FixtureTelegramUserId
                   Purpose = PaymentPurpose.Donation
                   PurposeEntityId = None
@@ -193,13 +194,12 @@ DO UPDATE SET "Title" = EXCLUDED."Title", "GoalStars" = EXCLUDED."GoalStars", "U
     let private createSayPayment
         (connection: NpgsqlConnection)
         (transaction: NpgsqlTransaction)
-        (idGenerator: IIdGenerator)
         nowUtc
         sayPriceStars
         invoicePayload
         (cancellationToken: CancellationToken) =
         task {
-            let sayMessageId = idGenerator.NewId()
+            let sayMessageId = Uuid.CreateVersion7().ToGuidBigEndian()
 
             let sayMessage: SayMessageToCreate =
                 { Id = sayMessageId
@@ -209,7 +209,7 @@ DO UPDATE SET "Title" = EXCLUDED."Title", "GoalStars" = EXCLUDED."GoalStars", "U
                   SubmittedAtUtc = nowUtc }
 
             let order: PaymentOrderToCreate =
-                { Id = idGenerator.NewId()
+                { Id = Uuid.CreateVersion7().ToGuidBigEndian()
                   TelegramUserId = FixtureTelegramUserId
                   Purpose = PaymentPurpose.Say
                   PurposeEntityId = Some sayMessageId
@@ -257,8 +257,7 @@ DO UPDATE SET "Title" = EXCLUDED."Title", "GoalStars" = EXCLUDED."GoalStars", "U
     let private appendDonationPaid
         (connection: NpgsqlConnection)
         (transaction: NpgsqlTransaction)
-        (idGenerator: IIdGenerator)
-        (clock: IClock)
+        (timeProvider: TimeProvider)
         (paymentId: Guid)
         invoicePayload
         amountStars
@@ -273,13 +272,12 @@ DO UPDATE SET "Title" = EXCLUDED."Title", "GoalStars" = EXCLUDED."GoalStars", "U
                        telegramUserId = FixtureTelegramUserId
                        amountStars = amountStars
                        currency = "XTR" |},
-                    ApiJson.options
+                    DomainJson.options
                 )
 
             match
                 DomainEventEnvelope.create
-                    idGenerator
-                    clock
+                    timeProvider
                     DomainEventType.DonationPaid
                     "Web10.Radio.API.Admin"
                     None
@@ -321,8 +319,7 @@ DO UPDATE SET "Title" = EXCLUDED."Title", "GoalStars" = EXCLUDED."GoalStars", "U
 
     let createPaidVerticalSlice
         (dataSource: NpgsqlDataSource)
-        (idGenerator: IIdGenerator)
-        (clock: IClock)
+        (timeProvider: TimeProvider)
         sayPriceStars
         fixtureKey
         (cancellationToken: CancellationToken)
@@ -333,7 +330,7 @@ DO UPDATE SET "Title" = EXCLUDED."Title", "GoalStars" = EXCLUDED."GoalStars", "U
                 task {
                     let donationInvoicePayload = fixtureInvoicePayload fixtureKey "donation"
                     let sayInvoicePayload = fixtureInvoicePayload fixtureKey "say"
-                    let nowUtc = clock.UtcNow
+                    let nowUtc = timeProvider.GetUtcNow()
 
                     let! lockResult = acquireFixtureLock connection transaction fixtureKey token
 
@@ -341,7 +338,7 @@ DO UPDATE SET "Title" = EXCLUDED."Title", "GoalStars" = EXCLUDED."GoalStars", "U
                     | Error error ->
                         return Error error
                     | Ok () ->
-                        let! goalResult = ensureActiveGoal connection transaction (idGenerator.NewId()) nowUtc token
+                        let! goalResult = ensureActiveGoal connection transaction (Uuid.CreateVersion7().ToGuidBigEndian()) nowUtc token
 
                         match goalResult with
                         | Error error ->
@@ -361,7 +358,6 @@ DO UPDATE SET "Title" = EXCLUDED."Title", "GoalStars" = EXCLUDED."GoalStars", "U
                                         createDonationPayment
                                             connection
                                             transaction
-                                            idGenerator
                                             nowUtc
                                             donationInvoicePayload
                                             token
@@ -384,7 +380,6 @@ DO UPDATE SET "Title" = EXCLUDED."Title", "GoalStars" = EXCLUDED."GoalStars", "U
                                                 createSayPayment
                                                     connection
                                                     transaction
-                                                    idGenerator
                                                     nowUtc
                                                     sayPriceStars
                                                     sayInvoicePayload
@@ -399,8 +394,7 @@ DO UPDATE SET "Title" = EXCLUDED."Title", "GoalStars" = EXCLUDED."GoalStars", "U
                                                     appendDonationPaid
                                                         connection
                                                         transaction
-                                                        idGenerator
-                                                        clock
+                                                        timeProvider
                                                         donation.Payment.Id
                                                         donationInvoicePayload
                                                         FixtureDonationAmountStars
@@ -418,8 +412,7 @@ DO UPDATE SET "Title" = EXCLUDED."Title", "GoalStars" = EXCLUDED."GoalStars", "U
                                                         appendDonationPaid
                                                             connection
                                                             transaction
-                                                            idGenerator
-                                                            clock
+                                                            timeProvider
                                                             say.Payment.Id
                                                             sayInvoicePayload
                                                             sayPriceStars

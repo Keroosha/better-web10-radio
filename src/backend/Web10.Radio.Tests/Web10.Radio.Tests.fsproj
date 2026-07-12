@@ -28,6 +28,7 @@
     <Compile Include="BackgroundWorkerTests.fs" />
     <Compile Include="ApiContractTests.fs" />
     <Compile Include="AdminRepositoryTests.fs" />
+    <Compile Include="StreamNodeContractTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
@@ -42,10 +43,12 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\Web10.Radio.Application\Web10.Radio.Application.fsproj" />
     <ProjectReference Include="..\Web10.Radio.API\Web10.Radio.API.fsproj" />
     <ProjectReference Include="..\Web10.Radio.Database\Web10.Radio.Database.fsproj" />
     <ProjectReference Include="..\Web10.Radio.Telegram\Web10.Radio.Telegram.fsproj" />
     <ProjectReference Include="..\Web10.Radio.Migrator\Web10.Radio.Migrator.fsproj" />
+    <ProjectReference Include="../../stream-node/Web10.Radio.StreamNode/Web10.Radio.StreamNode.fsproj" />
   </ItemGroup>
 
 </Project>

@@ -16,6 +16,7 @@ open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Options
 open Npgsql
 open Web10.Radio.Database
+open Dodo.Primitives
 open Web10.Radio.Database.Repositories
 
 
@@ -86,8 +87,7 @@ module private AdminIdentity =
 type AdminIdentityService
     (
         dataSource: NpgsqlDataSource,
-        idGenerator: IIdGenerator,
-        clock: IClock,
+        timeProvider: TimeProvider,
         passwordHasher: IPasswordHasher<AdminUser>,
         adminOptions: AdminOptions,
         developmentFixturesEnabled: bool
@@ -105,7 +105,7 @@ type AdminIdentityService
         |> SHA256.HashData
 
     let configuredUser nowUtc =
-        { Id = idGenerator.NewId()
+        { Id = Uuid.CreateVersion7().ToGuidBigEndian()
           Username = adminOptions.Username
           NormalizedUsername = normalizeUsername adminOptions.Username
           PasswordHash = String.Empty
@@ -115,7 +115,7 @@ type AdminIdentityService
     let rec createSession (user: AdminUser) sessionToken csrfToken (nowUtc: DateTimeOffset) remaining cancellationToken =
         task {
             let session =
-                { Id = idGenerator.NewId()
+                { Id = Uuid.CreateVersion7().ToGuidBigEndian()
                   UserId = user.Id
                   TokenHash = activeSessionTokenHash sessionToken
                   CsrfToken = csrfToken
@@ -139,7 +139,7 @@ type AdminIdentityService
         task {
             let sessionToken = randomBase64Url 32
             let csrfToken = randomBase64Url 32
-            let nowUtc = clock.UtcNow
+            let nowUtc = timeProvider.GetUtcNow()
             let! sessionResult = createSession user sessionToken csrfToken nowUtc 3 cancellationToken
 
             return
@@ -170,7 +170,7 @@ type AdminIdentityService
                 | PasswordVerificationResult.SuccessRehashNeeded ->
                     let updatedHash = passwordHasher.HashPassword(user, suppliedPassword)
                     let! updatedUserResult =
-                        AdminIdentityRepository.updatePasswordHash dataSource user.Id updatedHash clock.UtcNow cancellationToken
+                        AdminIdentityRepository.updatePasswordHash dataSource user.Id updatedHash (timeProvider.GetUtcNow()) cancellationToken
 
                     match updatedUserResult with
                     | Error error -> return Error error
@@ -187,7 +187,7 @@ type AdminIdentityService
                     AdminIdentityRepository.lookupActiveSessionByTokenHash
                         dataSource
                         (activeSessionTokenHash sessionToken)
-                        clock.UtcNow
+                        (timeProvider.GetUtcNow())
                         cancellationToken
 
                 return
@@ -199,7 +199,7 @@ type AdminIdentityService
         }
 
     member _.RevokeSessionAsync (sessionId: Guid) (cancellationToken: CancellationToken) =
-        AdminIdentityRepository.revokeSession dataSource sessionId clock.UtcNow cancellationToken
+        AdminIdentityRepository.revokeSession dataSource sessionId (timeProvider.GetUtcNow()) cancellationToken
 
     member _.CsrfMatches (session: AdminSession) (suppliedToken: string) =
         AdminSessionAuthentication.fixedTimeEqualsUtf8 session.CsrfToken suppliedToken
@@ -207,7 +207,7 @@ type AdminIdentityService
     member _.BootstrapConfiguredAdminAsync (cancellationToken: CancellationToken) : Task<Result<unit, RepositoryError>> =
         task {
             let normalizedUsername = normalizeUsername adminOptions.Username
-            let nowUtc = clock.UtcNow
+            let nowUtc = timeProvider.GetUtcNow()
             let! existingResult =
                 AdminIdentityRepository.lookupActiveUserByNormalizedUsername dataSource normalizedUsername cancellationToken
 
@@ -313,8 +313,7 @@ module AdminIdentityComposition =
         services.AddSingleton<AdminIdentityService>(fun provider ->
             new AdminIdentityService(
                 provider.GetRequiredService<NpgsqlDataSource>(),
-                provider.GetRequiredService<IIdGenerator>(),
-                provider.GetRequiredService<IClock>(),
+                provider.GetRequiredService<TimeProvider>(),
                 provider.GetRequiredService<IPasswordHasher<AdminUser>>(),
                 adminOptions,
                 developmentFixturesEnabled

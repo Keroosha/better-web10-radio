@@ -24,12 +24,7 @@
 
 ### Phase F1 — Shared frontend domain and API client
 
-> **Admin scope note:** SPEC §5 defines player DTOs fully but does not define admin
-> request/response bodies. Per the locked decision, F1 ships the player layer complete
-> and admin limited to the GETs that reuse known DTOs (`getDonationGoal`,
-> `getSocialLinks`); remaining admin DTOs (playlists, storage, `/say` moderation,
-> stream-node control, all PUT/POST) land in F4 once the backend pins those shapes.
-> Payload validation uses Zod (`4.4.3`); domain types are inferred from the schemas.
+> **Admin scope note:** all admin DTOs and write contracts used by the current cabinet are now pinned in `docs/SPEC.md` and implemented by the backend. Payload validation uses Zod (`4.4.3`); domain types are inferred from the schemas.
 
 - [x] Define domain types for `PlayerState`, `StreamState`, `NowPlaying`, `QueueState`, `DonationGoal`, `SuperChatMessage`, `SocialLink`, and `OverlaySettings` using exact fields from `SPEC.md`.
 - [x] Define enum/domain literal types for stream status, queue status, social kind, overlay style, and layout.
@@ -68,31 +63,24 @@
 - [x] Play audio from `/api/v0/player/stream`; when stream is `offline|degraded`, show the stream status and keep the visual stage alive.
       Capture mode (`?capture=1` / `captureEnabled` prop) mutes/hides browser audio for the stream-node kiosk; viewer mode uses muted-autoplay + an unmute pill.
 
-### Phase F4 — Admin app (say-moderation landed 2026-07-10; remaining write pages still blocked on unpinned admin DTOs)
+### Phase F4 — Admin app (playback, metadata, policies, storage, and moderation landed 2026-07-11)
 
-> The FSD shell + auth guard + the pages backed by already-pinned routes are done. The one
-> pinned admin *write* contract — `/say` moderation (SPEC §5) — is now fully implemented and
-> backed by the real backend routes (`GET say-messages`, `POST approve`, `POST reject`). The
-> routes still served as `501 admin.contract_unpinned` (playlists, storage, library-scan,
-> stream-node control, and the social-links/donation-goal PUTs) keep an explicit placeholder
-> (no invented DTO shapes). The shared client attaches `Authorization: Bearer <WEB10_ADMIN__TOKEN>`
-> on admin requests (`setAdminToken`) and now also carries JSON bodies + `204 No Content` via
-> `apiSend`.
+> The FSD shell, auth guard, playback controls, metadata/artwork controls, playlist policy editor, storage settings, library scan, and `/say` moderation are backed by the real API routes. The shared client carries cookie/CSRF auth, JSON bodies, and `204 No Content` responses via `apiSend`.
 
 - [x] Scaffold Feature-Sliced Design (FSD) layers for `src/frontend/admin`: `app`, `pages`, `widgets`, `features`, `entities`, `shared` imports only from `src/frontend/shared`.
-- [x] Implement dashboard page with stream status, current track, queue summary, and stream-node heartbeat. (Heartbeat shown as "unavailable — contract unpinned": its admin route is `501`.)
-- [x] Implement social links management page backed by `/api/v0/admin/social-links`. (Read-only view; PUT is `501`, editing deferred.)
-- [x] Implement donation goal management page backed by `/api/v0/admin/donation-goal`. (Read-only view; PUT is `501`, editing deferred.)
-- [ ] Implement playlists page backed by `/api/v0/admin/playlists` and playlist item routes. (Blocked — `501 admin.contract_unpinned`; placeholder page in place.)
-- [ ] Implement storage settings page for `Local` and `S3` values. (Blocked — placeholder page in place.)
+- [x] Implement dashboard page with stream status, current track, queue summary, and stream-node heartbeat.
+- [x] Implement social links management page backed by `/api/v0/admin/social-links`, including replacement writes.
+- [x] Implement donation goal management page backed by `/api/v0/admin/donation-goal`, including update writes.
+- [x] Implement playlists page backed by `/api/v0/admin/playlists` and playlist item routes, including policy/schedule editing and system All tracks handling.
+- [x] Implement storage settings page for `Local` and `S3` values.
 - [x] Implement `/say` moderation queue with approve/reject actions. ✅ (2026-07-10) — `SayModerationPage` (status tabs + approve `{}` / reject `{reason}` 1–500 chars), backed by the pinned SPEC §5 contract and the real backend routes; `AdminSayMessageDto` + `getSayMessages`/`approveSayMessage`/`rejectSayMessage` in `shared`.
-- [ ] Implement library scan trigger backed by `/api/v0/admin/library/scan`. (Blocked — placeholder page in place.)
+- [x] Implement library scan trigger backed by `/api/v0/admin/library/scan`.
 - [x] Add auth guard placeholder that consumes backend admin auth result; do not invent OAuth/provider UX in this milestone.
 
 ### Phase F5 — Frontend verification and handoff (2026-07-10)
 
 - [x] Run strict TypeScript check for all frontend workspaces. — `bun run typecheck` → all three workspaces exit 0.
-- [x] Run frontend tests for API client fallback, SSE event handling, empty states, and formatter edge cases. — `bun run test` → 103 passing (shared 42, web-stage 53, admin 8), incl. the new say-moderation + `apiSend` suites.
+- [x] Run frontend tests for API client fallback, SSE event handling, empty states, and formatter edge cases. — `bun run test` → 175 passing (shared 80, web-stage 57, admin 38), including playback controls, tracks metadata, playlist policies, and API clients.
 - [ ] Run a visual/manual checklist for both themes and all three layouts. — **manual step remaining:** `bun run --filter web-stage dev`, then open `?overlayStyle=aero|win9x` × `?overlayLayout=corners|sidebar|bottombar` (dev QA params on `StagePage`).
 - [x] Verify authored source contains no `.js`, no `any`, and no `unknown`. — `bun run lint` clean (ESLint bans `TSAnyKeyword`/`TSUnknownKeyword`/`no-explicit-any`) + no `.js`/`.jsx` authored sources found.
 - [x] Verify scene unmount cleanup by mounting/unmounting the stage in a test harness or development page. — covered by `StageScene.test.tsx` ("unmounting disposes the scene exactly once" + StrictMode build/dispose parity).

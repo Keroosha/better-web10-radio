@@ -4,7 +4,7 @@
 
 Web10.Radio is intended to be a 24/7 Telegram-channel radio station for `@netscapedidnothingwrong` with a Web 1.0 / Aero visual identity: fullscreen 3D stage, retro overlay widgets, music playback, Telegram bot interactions, paid screen messages, donation goals, and admin moderation.
 
-Current state: the backend and frontend are implemented and building. `src/backend/` has the F# solution (`Web10.Radio.sln`: API, Telegram, Database, Migrator, Tests) with the `/api/v0/*` routes, durable Telegram workflows, Stars payments, NUnit + Testcontainers tests, and Dockerfiles + `compose.yaml`. `src/frontend/` is the Bun monorepo (`shared`, `web-stage`, `admin`) with a build image. Telegram updates can be ingested by webhook or by long polling (`WEB10_TELEGRAM__UPDATE_MODE`). The remaining gap is the real `src/stream-node/` runtime (phase B5) — still only a stub Dockerfile + a binary-presence `check-runtime.sh`; `scripts/fake-stream-node.py` simulates a LIVE node locally in the meantime.
+Current state: backend, frontend, and the F# stream-node runtime are implemented and building. `src/backend/` contains the API, standalone Telegram service, shared Application kernel, Database, Migrator, and NUnit/Testcontainers tests. `src/frontend/` is the Bun monorepo (`shared`, `web-stage`, `admin`); `src/stream-node/` contains the F# runtime and Tools projects. Telegram supports webhook and long polling (`WEB10_TELEGRAM__UPDATE_MODE`) and owns `/api/v0/telegram/*`; nginx proxies those routes to the Telegram container.
 
 ## Architecture & Data Flow
 
@@ -15,8 +15,8 @@ flowchart LR
   TG[Telegram users/channel] --> Bot[Web10.Radio.Telegram / Funogram]
   Admin[React admin app] --> API[Web10.Radio.API]
   Stage[React + Three.js web-stage] --> API
-  Bot --> API
-  API --> DB[(PostgreSQL)]
+  Bot --> DB[(PostgreSQL)]
+  API --> DB
   API --> Storage[(S3 or local filesystem)]
   API --> StreamNode[src/stream-node]
   StreamNode --> Stage
@@ -28,13 +28,12 @@ flowchart LR
 
 Key architectural rules:
 
-- Backend is a modular monolith, not microservices: one ASP.NET/F# host `Web10.Radio.API` owns HTTP routes, background workers, DI, config validation, OTEL, and health checks.
-- `Web10.Radio.Telegram` is an in-process Funogram adapter/hosted service in v0, not a separate deployed service.
-- `Web10.Radio.Database` owns migrations, ADO.NET repositories, transaction helpers, and DB invariants.
-- `src/stream-node/` is a separate container/process group for Xvfb + kiosk Chromium + LiquidSoap + FFmpeg/x11grab, then RTMP to Telegram.
-- Frontend is planned as a Bun workspace under `src/frontend/` with `web-stage`, `admin`, and `shared` workspaces.
-- Frontend consumes only the contract routes in `docs/SPEC.md`: `/api/v0/player/*` and `/api/v0/admin/*`. Do not invent route names.
-- Side effects are modeled as domain events. In-process handling uses F# `MailboxProcessor`; durable side effects use `OutboxEvents`.
+- Backend is split by deployable boundary: `Web10.Radio.API` owns player/admin/library/playback/stream-node routes and API workers; `Web10.Radio.Telegram` is a standalone Funogram executable owning Telegram ingress, Stars workflows, and its Telegram outbox relay.
+- `Web10.Radio.Application` owns shared event envelopes, audience mapping, relay contracts, and health primitives; `Web10.Radio.Database` owns migrations, ADO.NET repositories, transaction helpers, and DB invariants.
+- `src/stream-node/` is a separate F# container/process group for Xvfb + kiosk Chromium + LiquidSoap + FFmpeg/x11grab, then RTMP to Telegram; it is not a Python supervisor.
+- Frontend is a Bun workspace under `src/frontend/` with `web-stage`, `admin`, and `shared` workspaces.
+- Frontend consumes only the contract routes in `docs/SPEC.md`: `/api/v0/player/*` and `/api/v0/admin/*`; Telegram paths are reverse-proxy deployment routes, not API-owned handlers.
+- Durable side effects use audience-partitioned `OutboxEvents`; API and Telegram relays claim only their own audience.
 - Public stage data flow: `GET /api/v0/player/state` snapshot + `GET /api/v0/player/events` SSE deltas. After two SSE disconnects within 30 seconds, poll `/api/v0/player/state` every 5 seconds.
 
 ## Key Directories
@@ -47,47 +46,46 @@ Key architectural rules:
   - `project/Web 1.0 Radio Scene.dc.html` is the visual/behavioral reference.
   - `project/support.js` and `project/image-slot.js` are prototype runtime files; do not port them into production.
   - `project/uploads/` and `project/screenshots/` contain mock assets/reference images.
-- `README.md` — currently a placeholder only.
+- `README.md` — current runtime, configuration, Compose smoke, and verification guide.
 - `CLAUDE.md` — existing agent guidance and current-state guardrails; useful but keep `AGENTS.md` and `docs/SPEC.md` aligned when conventions change.
 - `Web 1.0-radio-scene.zip` — duplicate wrapper around the mock assets, not a separate source of requirements.
 
-Planned but not yet present:
+Implemented source layout:
 
-- `src/frontend/package.json`, `src/frontend/tsconfig.base.json`
-- `src/frontend/shared/`, `src/frontend/web-stage/`, `src/frontend/admin/`
-- `src/backend/Web10.Radio.sln`, `Web10.Radio.API`, `Web10.Radio.Telegram`, `Web10.Radio.Database`
-- `src/stream-node/`
-- Docker/Docker Compose and CI files
+- `src/frontend/package.json`, `src/frontend/tsconfig.base.json`, and workspaces `shared`, `web-stage`, `admin`.
+- `src/backend/Web10.Radio.sln` with API, Application, Database, Migrator, Telegram, and Tests projects.
+- `src/stream-node/` with F# runtime, Tools project, Liquidsoap script, and Debian container.
+- `compose.yaml` and Dockerfiles for PostgreSQL, migrator, API, Telegram, frontend, RTMP sink, and stream-node.
 
 ## Development Commands
 
-No concrete repo commands exist yet because the project is not scaffolded. Do not claim that build/test/lint commands work until the relevant config files are created.
-
-When scaffolding, add scripts that make these commands real:
+Commands are real and run from repository root unless noted:
 
 ```sh
-# Frontend, after src/frontend/package.json exists
+# Frontend
 cd src/frontend
 bun install
 bun run typecheck
 bun run build
-bun test
+bun run test
 
-# Backend, after src/backend/Web10.Radio.sln exists
+# Backend
 cd src/backend
-dotnet build
-dotnet test
+dotnet build Web10.Radio.sln
+dotnet test Web10.Radio.sln --no-restore
 
-# Deployment/smoke, after compose files exist
-docker compose up --build
+# Compose smoke (use local RTMP overrides when .env points at Telegram)
+cd ../..
+WEB10_STREAM__RTMP_URL=rtmp://rtmp-sink:1935/s/ WEB10_STREAM__RTMP_KEY=compose-smoke-rtmp-key docker compose up --build --wait --wait-timeout 180
 ```
 
-Expected command categories from the plans:
+Expected command categories:
 
 - Frontend: Bun workspace-level and per-app `typecheck`, `build`, and `test` scripts.
-- Backend: `dotnet` CLI, F# projects, NUnit integration tests.
-- Stream-node: smoke checks for Xvfb, Chromium, LiquidSoap, FFmpeg, and backend heartbeat.
-- Docker: container smoke path for PostgreSQL + API + frontend + stream-node.
+- Backend: `dotnet` CLI, F# projects, NUnit/Testcontainers integration tests.
+- Stream-node: F# Tools smoke checks for Xvfb, Chromium, LiquidSoap, FFmpeg, playback controls, and backend heartbeat.
+- Docker: container smoke path for PostgreSQL + migrator + API + Telegram + frontend + stream-node.
+
 
 ## Code Conventions & Common Patterns
 
@@ -135,9 +133,9 @@ Expected command categories from the plans:
 ## Important Files
 
 - `docs/SPEC.md` — canonical contract. Start here for product behavior, routes, DTOs, events, DB rules, config, and QA expectations.
-- `docs/PLAN-FRONTEND.md` — frontend scaffold and implementation checklist.
+- `docs/PLAN-FRONTEND.md` — frontend implementation and verification checklist.
 - `docs/PLAN-BACKEND.md` — backend, Telegram, persistence, observability, Docker, and stream-node checklist.
-- `CLAUDE.md` — current-state warning: most runtime/build artifacts do not exist yet.
+- `CLAUDE.md` — current-state architecture and development guidance; runtime/build artifacts are present.
 - `src/frontend/web-stage/mocks/README.md` — design-handoff instructions.
 - `src/frontend/web-stage/mocks/project/Web 1.0 Radio Scene.dc.html` — pixel/behavior reference: Three.js r128 scene, gradient sky, water shader, checker floor, temple, rotating CD jewel case, `web1radio.exe` loading window, overlay widgets, donation toast, `aero`/`win9x` themes, and `corners`/`sidebar`/`bottombar` layouts.
 - `src/frontend/web-stage/mocks/project/support.js` — generated Design Canvas runtime, prototype-only.
@@ -145,7 +143,7 @@ Expected command categories from the plans:
 
 ## Runtime/Tooling Preferences
 
-- Frontend runtime/package manager: Bun, not npm/yarn/pnpm, once scaffolding begins.
+- Frontend runtime/package manager: Bun, not npm/yarn/pnpm.
 - Frontend stack: React + Three.js + strict TypeScript.
 - Backend runtime: .NET / ASP.NET with F# projects.
 - Database: PostgreSQL.
@@ -158,7 +156,7 @@ Expected command categories from the plans:
 
 ## Testing & QA
 
-No test files, test directories, or configured test runners exist yet. Add tests as part of scaffolding and feature work; prefer integration tests over isolated unit tests because v0 risk is in contracts, DB concurrency, Telegram payment state, and process boundaries.
+- Test runners and fixtures are configured. Prefer integration tests over isolated unit tests because v0 risk sits in contracts, DB concurrency, Telegram payment state, and process boundaries.
 
 Required QA areas from `docs/SPEC.md`:
 

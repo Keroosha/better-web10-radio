@@ -12,12 +12,15 @@ import * as THREE from 'three';
 export interface SceneTrack {
   readonly title: string;
   readonly artist: string;
+  /** Optional managed/legacy cover URL. Empty means keep the generated fallback art. */
+  readonly coverImageUrl: string;
 }
 
 /** The neutral placeholder shown before live `nowPlaying` data exists (Phase F2). */
 export const PLACEHOLDER_TRACK: SceneTrack = {
   title: 'Web10.Radio',
   artist: '24/7 · @netscapedidnothingwrong',
+  coverImageUrl: '',
 };
 
 function create2dCanvas(width: number, height: number): {

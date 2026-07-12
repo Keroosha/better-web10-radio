@@ -9,6 +9,8 @@ interface NowPlayingWidgetProps {
   readonly theme: StageTheme;
   /** `{...theme.win, ...layout.now}`. */
   readonly windowStyle: CSSProperties;
+  /** Overhead label; defaults to the mock's `NOW PLAYING · 24/7` when the banner omits it. */
+  readonly label?: string;
 }
 
 const STATUS_LABEL: Record<StreamStatus, string> = {
@@ -52,6 +54,7 @@ export function NowPlayingWidget({
   streamStatus,
   theme,
   windowStyle,
+  label,
 }: NowPlayingWidgetProps): ReactElement {
   const isLive = streamStatus === 'live';
   const title = nowPlaying.title.trim() === '' ? '@netscapedidnothingwrong' : nowPlaying.title;
@@ -107,7 +110,7 @@ export function NowPlayingWidget({
               color: theme.accent,
             }}
           >
-            NOW PLAYING · 24/7
+            {label ?? 'NOW PLAYING · 24/7'}
           </div>
           <div style={{ fontWeight: 700, fontSize: '14px', lineHeight: 1.15, ...ellipsis }}>
             {title}

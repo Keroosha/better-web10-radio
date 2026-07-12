@@ -186,3 +186,71 @@ VALUES (@QueueItemId, @TrackId, 'fallback', 'Playing', 0, @NowUtc, @ClaimOwner, 
                 | actual ->
                     Assert.Fail(sprintf "Expected the fenced Playing row to project a complete stream assignment, but got %A." actual)
             })
+
+    [<Test>]
+    let ``removing a queued item soft-deletes it`` () =
+        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
+            task {
+                let trackId = newId ()
+                let queueItemId = newId ()
+                let nowUtc = DateTimeOffset(2026, 7, 12, 12, 0, 0, TimeSpan.Zero)
+
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+                use insert =
+                    new NpgsqlCommand(
+                        """INSERT INTO "Tracks" ("Id", "Title", "Artist", "IsDeleted") VALUES (@TrackId, 'T', 'A', false);
+INSERT INTO "PlaybackQueue" ("Id", "TrackId", "Source", "Status", "Priority", "RequestedAtUtc")
+VALUES (@QueueItemId, @TrackId, 'admin', 'Queued', 0, @RequestedAtUtc);""",
+                        connection
+                    )
+                insert.Parameters.AddWithValue("TrackId", trackId) |> ignore
+                insert.Parameters.AddWithValue("QueueItemId", queueItemId) |> ignore
+                insert.Parameters.AddWithValue("RequestedAtUtc", nowUtc) |> ignore
+                let! _ = insert.ExecuteNonQueryAsync()
+
+                use dataSource = NpgsqlDataSource.Create(connectionString)
+                let! result = PlaybackQueueRepository.removeQueuedItem dataSource queueItemId nowUtc CancellationToken.None
+                match result with
+                | Ok(PlaybackControlOutcome.Applied()) -> ()
+                | actual -> Assert.Fail(sprintf "Expected Applied, got %A." actual)
+
+                use check = new NpgsqlCommand("""SELECT "IsDeleted" FROM "PlaybackQueue" WHERE "Id" = @Id;""", connection)
+                check.Parameters.AddWithValue("Id", queueItemId) |> ignore
+                let! deleted = check.ExecuteScalarAsync()
+                Assert.That(deleted :?> bool, Is.True, "The queued item must be soft-deleted.")
+
+                let! missing = PlaybackQueueRepository.removeQueuedItem dataSource (newId ()) nowUtc CancellationToken.None
+                match missing with
+                | Ok PlaybackControlOutcome.NotFound -> ()
+                | actual -> Assert.Fail(sprintf "Expected NotFound for an unknown item, got %A." actual)
+            })
+
+    [<Test>]
+    let ``removing a playing item conflicts`` () =
+        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
+            task {
+                let trackId = newId ()
+                let queueItemId = newId ()
+                let nowUtc = DateTimeOffset(2026, 7, 12, 12, 0, 0, TimeSpan.Zero)
+
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+                use insert =
+                    new NpgsqlCommand(
+                        """INSERT INTO "Tracks" ("Id", "Title", "Artist", "IsDeleted") VALUES (@TrackId, 'T', 'A', false);
+INSERT INTO "PlaybackQueue" ("Id", "TrackId", "Source", "Status", "Priority", "RequestedAtUtc", "StartedAtUtc")
+VALUES (@QueueItemId, @TrackId, 'admin', 'Playing', 0, @RequestedAtUtc, @RequestedAtUtc);""",
+                        connection
+                    )
+                insert.Parameters.AddWithValue("TrackId", trackId) |> ignore
+                insert.Parameters.AddWithValue("QueueItemId", queueItemId) |> ignore
+                insert.Parameters.AddWithValue("RequestedAtUtc", nowUtc) |> ignore
+                let! _ = insert.ExecuteNonQueryAsync()
+
+                use dataSource = NpgsqlDataSource.Create(connectionString)
+                let! result = PlaybackQueueRepository.removeQueuedItem dataSource queueItemId nowUtc CancellationToken.None
+                match result with
+                | Ok PlaybackControlOutcome.Conflict -> ()
+                | actual -> Assert.Fail(sprintf "Expected Conflict for a playing item, got %A." actual)
+            })

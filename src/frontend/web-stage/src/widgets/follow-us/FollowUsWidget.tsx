@@ -11,6 +11,10 @@ interface FollowUsWidgetProps {
   readonly theme: StageTheme;
   /** `{...theme.win, ...layout.social}`. */
   readonly windowStyle: CSSProperties;
+  /** Title-bar caption; defaults to `FOLLOW US` when the banner omits it. */
+  readonly title?: string;
+  /** Seconds between featured-link changes; `0`/omitted uses the built-in default. */
+  readonly rotationSeconds?: number;
 }
 
 function glyphBox(social: SocialLink, size: number): CSSProperties {
@@ -34,8 +38,9 @@ function glyphBox(social: SocialLink, size: number): CSSProperties {
  * there are no socials (empty-state invariant). The rotation hook is always called so the
  * hook order stays stable.
  */
-export function FollowUsWidget({ socials, theme, windowStyle }: FollowUsWidgetProps): ReactElement | null {
-  const featuredIndex = useSocialRotation(socials.length);
+export function FollowUsWidget({ socials, theme, windowStyle, title, rotationSeconds }: FollowUsWidgetProps): ReactElement | null {
+  const intervalMs = rotationSeconds !== undefined && rotationSeconds >= 2 ? rotationSeconds * 1000 : undefined;
+  const featuredIndex = useSocialRotation(socials.length, intervalMs);
   if (socials.length === 0) {
     return null;
   }
@@ -45,7 +50,7 @@ export function FollowUsWidget({ socials, theme, windowStyle }: FollowUsWidgetPr
   }
 
   return (
-    <OverlayWindow title="FOLLOW US" theme={theme} windowStyle={windowStyle}>
+    <OverlayWindow title={title ?? 'FOLLOW US'} theme={theme} windowStyle={windowStyle}>
       <div style={{ display: 'flex', gap: '11px', alignItems: 'center' }}>
         <div
           style={{

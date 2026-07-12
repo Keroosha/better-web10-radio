@@ -1,9 +1,9 @@
 import { describe, expect, test } from 'vitest';
 
 import {
-  AdminSayMessageSchema,
   AdminSessionSchema,
   AdminTrackSchema,
+  BannerReplaceItemSchema,
   LibraryScanAcceptedSchema,
   LibraryScanStatusSchema,
   PaidVerticalSliceFixtureSchema,
@@ -24,44 +24,28 @@ function expectStrictObject(
   expect(schema.safeParse({ ...value, unpinned: true }).success).toBe(false);
 }
 
-describe('AdminSayMessageSchema', () => {
-  test('parses a fully-populated approved row', () => {
+describe('BannerReplaceItemSchema', () => {
+  test('accepts a create row with a null id and nullable fields', () => {
     const row = {
-      id,
-      telegramUserId: 42,
-      displayName: 'CyberDove',
-      text: 'hello stage',
-      amountStars: 50,
-      color: '#33ccff',
-      status: 'approved',
-      submittedAtUtc: '2026-07-10T12:00:00Z',
-      paidAtUtc: '2026-07-10T12:00:05Z',
-      moderatedAtUtc: '2026-07-10T12:01:00Z',
-      moderationReason: null,
-    };
-    expect(AdminSayMessageSchema.parse(row)).toEqual(row);
-  });
-
-  test('accepts null optional fields and rejects an internal status literal', () => {
-    const row = {
-      id,
-      telegramUserId: null,
-      displayName: 'anon',
-      text: 't',
-      amountStars: 100,
-      color: null,
-      status: 'pending',
-      submittedAtUtc: null,
-      paidAtUtc: null,
-      moderatedAtUtc: null,
-      moderationReason: null,
+      id: null,
+      type: 'social',
+      title: 'FOLLOW US',
+      subtitle: null,
+      text: null,
+      style: 'aero',
+      screenPosition: 'bottom-right',
+      accent: null,
+      enabled: true,
+      rotationSeconds: 5,
     };
 
-    expect(AdminSayMessageSchema.parse(row).status).toBe('pending');
-    expect(AdminSayMessageSchema.safeParse({ ...row, status: 'PaidPendingModeration' }).success).toBe(
-      false,
-    );
-    expectStrictObject(AdminSayMessageSchema, row);
+    expect(BannerReplaceItemSchema.parse(row)).toEqual(row);
+    expect(BannerReplaceItemSchema.parse({ ...row, rotationSeconds: null }).rotationSeconds).toBeNull();
+    expect(BannerReplaceItemSchema.safeParse({ ...row, rotationSeconds: 1 }).success).toBe(false);
+    expect(BannerReplaceItemSchema.safeParse({ ...row, rotationSeconds: 121 }).success).toBe(false);
+    expect(BannerReplaceItemSchema.safeParse({ ...row, type: 'ticker' }).success).toBe(false);
+    expect(BannerReplaceItemSchema.safeParse({ ...row, screenPosition: 'middle' }).success).toBe(false);
+    expectStrictObject(BannerReplaceItemSchema, row);
   });
 });
 
@@ -112,6 +96,7 @@ describe('pinned admin DTO schemas', () => {
       hasCachedFile: true,
       coverImageUrl: '',
       metadataSource: 'filename',
+      storageBackendId: '',
     };
 
     expect(AdminTrackSchema.parse(track)).toEqual(track);

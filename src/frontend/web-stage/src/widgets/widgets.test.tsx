@@ -117,10 +117,11 @@ describe('SuperChatWidget', () => {
     expect(screen.getByText('vhs_wanderer')).toBeTruthy();
   });
 
-  test('empty: shows the quiet placeholder', () => {
+  test('empty: renders the titled block with no placeholder text', () => {
     const empty = selectApprovedMessages(createEmptyPlayerState(), 4);
     render(<SuperChatWidget messages={empty} theme={theme} windowStyle={layout.superChat} />);
-    expect(screen.getByText('Пока тихо…')).toBeTruthy();
+    expect(screen.getByText('SUPER CHAT')).toBeTruthy();
+    expect(screen.queryByText('Пока тихо…')).toBeNull();
   });
 });
 

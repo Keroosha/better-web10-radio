@@ -13,6 +13,7 @@ const tracks = [
     hasCachedFile: true,
     coverImageUrl: '',
     metadataSource: 'filename',
+    storageBackendId: '',
   },
   {
     id: '018f0aaa-0000-7000-8000-000000000021',
@@ -23,6 +24,7 @@ const tracks = [
     hasCachedFile: true,
     coverImageUrl: '',
     metadataSource: 'filename',
+    storageBackendId: '',
   },
 ];
 

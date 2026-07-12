@@ -22,7 +22,7 @@ export function SuperChatWidget({ messages, theme, windowStyle }: SuperChatWidge
   return (
     <OverlayWindow title="SUPER CHAT" theme={theme} windowStyle={windowStyle}>
       {messages.length === 0 ? (
-        <div style={{ fontSize: '12px', opacity: 0.6, padding: '2px 0' }}>Пока тихо…</div>
+        <div />
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '7px' }}>
           {messages.map((message) => (

@@ -5,6 +5,7 @@ import {
   getPlayerState,
   type FetchImpl,
   type NowPlaying,
+  type PlaybackState,
   type PlayerEventsTransport,
   type QueueState,
   type SseConnector,
@@ -24,6 +25,8 @@ export interface LiveQueueValue {
   readonly nowPlaying: NowPlaying;
   readonly queue: QueueState;
   readonly streamStatus: StreamStatus;
+  /** Desired playback transport state (`playing`/`paused`/`stopped`). */
+  readonly playbackState: PlaybackState;
   /** Which transport is live: `sse` or the polling fallback. */
   readonly transport: PlayerEventsTransport;
 }
@@ -55,6 +58,7 @@ export function useLiveQueue(options: UseLiveQueueOptions = {}): LiveQueueValue 
   const [nowPlaying, setNowPlaying] = useState<NowPlaying>(EMPTY_NOW_PLAYING);
   const [queue, setQueue] = useState<QueueState>(EMPTY_QUEUE);
   const [streamStatus, setStreamStatus] = useState<StreamStatus>('offline');
+  const [playbackState, setPlaybackState] = useState<PlaybackState>('playing');
   const [transport, setTransport] = useState<PlayerEventsTransport>('sse');
 
   useEffect(() => {
@@ -72,6 +76,7 @@ export function useLiveQueue(options: UseLiveQueueOptions = {}): LiveQueueValue 
         setNowPlaying(snapshot.nowPlaying);
         setQueue(snapshot.queue);
         setStreamStatus(snapshot.stream.status);
+        setPlaybackState(snapshot.playbackState);
       })
       .catch(() => {
         // Offline seed: empty defaults already render; SSE/polling will recover.
@@ -88,6 +93,7 @@ export function useLiveQueue(options: UseLiveQueueOptions = {}): LiveQueueValue 
           setNowPlaying(snapshot.nowPlaying);
           setQueue(snapshot.queue);
           setStreamStatus(snapshot.stream.status);
+          setPlaybackState(snapshot.playbackState);
         },
         onQueue: (next) => setQueue(next),
         onHealth: (stream) => setStreamStatus(stream.status),
@@ -103,5 +109,5 @@ export function useLiveQueue(options: UseLiveQueueOptions = {}): LiveQueueValue 
     };
   }, [connector, fetchImpl, now]);
 
-  return { nowPlaying, queue, streamStatus, transport };
+  return { nowPlaying, queue, streamStatus, playbackState, transport };
 }

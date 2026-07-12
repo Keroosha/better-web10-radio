@@ -37,10 +37,12 @@ type ApiContractTests() =
               DurationMs = 123000
               HasCachedFile = true
               CoverImageUrl = "/api/v0/player/cover/asset"
-              MetadataSource = "Embedded" }
+              MetadataSource = "Embedded"
+              StorageBackendId = "019f0000-0000-7000-8000-0000000000aa" }
         let json = JsonSerializer.Serialize(contract, ApiContractTests.JsonOptions())
         Assert.That(json, Does.Contain("\"album\":\"Album\""))
         Assert.That(json, Does.Contain("\"metadataSource\":\"Embedded\""))
+        Assert.That(json, Does.Contain("\"storageBackendId\":\"019f0000-0000-7000-8000-0000000000aa\""))
 
     [<Test>]
     member _.``queue reorder request preserves ordered identifiers``() =

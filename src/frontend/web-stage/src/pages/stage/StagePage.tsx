@@ -12,9 +12,7 @@ import { useStageState, type UseStageStateOptions } from '../../features/stage-s
 import { StreamAudio } from '../../features/stream-audio';
 import { getOverlayLayout } from '../../shared/ui/layout';
 import { getOverlayTheme } from '../../shared/ui/theme';
-import { DonationGoalWidget } from '../../widgets/donation-goal';
-import { FollowUsWidget } from '../../widgets/follow-us';
-import { NowPlayingWidget } from '../../widgets/now-playing';
+import { BannersLayer } from '../../widgets/banners';
 import {
   StageScene,
   type SceneFactory,
@@ -115,28 +113,19 @@ export function StagePage({
   return (
     <>
       <StageScene {...sceneProps} />
+      <BannersLayer
+        banners={state.banners}
+        nowPlaying={state.nowPlaying}
+        streamStatus={state.stream.status}
+        donationGoal={state.donationGoal}
+        donationPercent={selectDonationPercent(state)}
+        socials={state.socials}
+      />
       <div style={layout.container}>
-        <NowPlayingWidget
-          nowPlaying={state.nowPlaying}
-          streamStatus={state.stream.status}
-          theme={theme}
-          windowStyle={{ ...theme.win, ...layout.now }}
-        />
-        <DonationGoalWidget
-          donationGoal={state.donationGoal}
-          percent={selectDonationPercent(state)}
-          theme={theme}
-          windowStyle={{ ...theme.win, ...layout.donation }}
-        />
         <SuperChatWidget
           messages={selectApprovedMessages(state, layout.messageLimit)}
           theme={theme}
           windowStyle={{ ...theme.win, ...layout.superChat }}
-        />
-        <FollowUsWidget
-          socials={state.socials}
-          theme={theme}
-          windowStyle={{ ...theme.win, ...layout.social }}
         />
       </div>
       <DonationToast newDonation={newDonation} theme={theme} />

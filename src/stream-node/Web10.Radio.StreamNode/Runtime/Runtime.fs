@@ -456,6 +456,8 @@ type RuntimeSupervisor(
                 if desiredState = "stopped" then
                     do! this.StopMediaAsync(token)
                     this.ClearAssignment()
+                elif desiredState = "paused" then
+                    do! this.StopMediaAsync(token)
                 elif not terminalFailure then
                     if not (ProcessSupervisor.isAlive xvfb && ProcessSupervisor.isAlive chromium && ProcessSupervisor.isAlive unclutter) then
                         try do! this.StartVisualAsync(token) with _ -> this.ScheduleRestart("Pipeline startup failed", true)
@@ -498,6 +500,7 @@ type RuntimeSupervisor(
     member this.Snapshot() =
         let status, reason =
             if desiredState = "stopped" then "offline", None
+            elif desiredState = "paused" then "offline", None
             elif terminalFailure then "failed", failureReason
             elif restartAt.IsSome then "restarting", failureReason
             elif timeProvider.GetTimestamp() < degradedUntil then "degraded", failureReason

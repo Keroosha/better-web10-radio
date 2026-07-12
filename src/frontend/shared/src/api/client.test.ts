@@ -88,7 +88,7 @@ describe('admin session transport', () => {
       return Promise.resolve(noContentResponse());
     });
 
-    await apiSend('/api/v0/admin/say-messages/message-1/approve', {
+    await apiSend('/api/v0/admin/playback/skip', {
       method: 'POST',
       body: {},
       admin: true,
@@ -176,7 +176,7 @@ describe('admin session transport', () => {
     ).rejects.toBeInstanceOf(ApiError);
 
     const nextFetch: FetchImpl = vi.fn(() => Promise.resolve(noContentResponse()));
-    await apiSend('/api/v0/admin/say-messages/message-1/approve', {
+    await apiSend('/api/v0/admin/playback/skip', {
       method: 'POST',
       body: {},
       admin: true,
@@ -235,7 +235,7 @@ describe('apiSend errors', () => {
     };
     const fetchImpl: FetchImpl = () => Promise.resolve(jsonResponse(problem, 409));
 
-    const error = await apiSend('/api/v0/admin/say-messages/x/approve', {
+    const error = await apiSend('/api/v0/admin/playback/skip', {
       method: 'POST',
       body: {},
       fetchImpl,

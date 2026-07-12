@@ -46,6 +46,7 @@ describe('@web10/shared public contracts', () => {
         hasCachedFile: true,
         coverImageUrl: '',
         metadataSource: 'filename',
+        storageBackendId: '',
       }).hasCachedFile,
     ).toBe(true);
     expect(

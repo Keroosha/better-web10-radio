@@ -1,15 +1,11 @@
-import { useEffect, useState, type ReactElement } from 'react';
+import { useEffect, useRef, useState, type ReactElement } from 'react';
 
 import {
-  ApiError,
   createPlaylist,
   getPlaylistItems,
   getPlaylists,
-  PlaylistMutationRequestSchema,
-  queueTrack,
   replacePlaylist,
   replacePlaylistItems,
-  type AdminTrack,
   type Playlist,
   type PlaylistItem,
   type PlaylistMutationRequest,
@@ -19,56 +15,28 @@ import {
   type PlaylistType,
 } from '@web10/shared';
 
-import { TrackSearch } from '../../widgets/track-search/TrackSearch';
-
-type LoadState<T> =
-  | { readonly status: 'loading' }
-  | { readonly status: 'error'; readonly message: string }
-  | { readonly status: 'ready'; readonly data: T };
-
-interface EditablePlaylistItem {
-  readonly id: string | null;
-  readonly trackId: string;
-  readonly title: string;
-  readonly artist: string;
-  readonly position: number;
-}
+import { errorMessage } from '../../shared/lib/errorMessage';
+import { useToast } from '../../shared/ui/toast';
+import { COLORS, ellipsis, formGrid, iconButton, panel } from '../../shared/ui/tokens';
 
 interface PlaylistForm {
-  readonly name: string;
-  readonly description: string;
-  readonly isActive: boolean;
-  readonly type: PlaylistType;
-  readonly source: PlaylistSource;
-  readonly order: PlaylistOrder;
-  readonly weight: number;
-  readonly isJingle: boolean;
-  readonly interrupt: boolean;
-  readonly avoidDuplicates: boolean;
-  readonly playEverySongs: number | null;
-  readonly playEveryMinutes: number | null;
-  readonly playAtMinute: number | null;
-  readonly schedules: readonly PlaylistSchedule[];
+  name: string;
+  description: string;
+  isActive: boolean;
+  type: PlaylistType;
+  source: PlaylistSource;
+  order: PlaylistOrder;
+  weight: number;
+  isJingle: boolean;
+  interrupt: boolean;
+  avoidDuplicates: boolean;
+  playEverySongs: number | null;
+  playEveryMinutes: number | null;
+  playAtMinute: number | null;
+  schedules: readonly PlaylistSchedule[];
 }
 
-const DEFAULT_FORM: PlaylistForm = {
-  name: '',
-  description: '',
-  isActive: false,
-  type: 'general',
-  source: 'manual',
-  order: 'sequential',
-  weight: 3,
-  isJingle: false,
-  interrupt: false,
-  avoidDuplicates: true,
-  playEverySongs: null,
-  playEveryMinutes: null,
-  playAtMinute: null,
-  schedules: [],
-};
-
-function formFromPlaylist(playlist: Playlist): PlaylistForm {
+function formFrom(playlist: Playlist): PlaylistForm {
   return {
     name: playlist.name,
     description: playlist.description ?? '',
@@ -87,222 +55,78 @@ function formFromPlaylist(playlist: Playlist): PlaylistForm {
   };
 }
 
-function actionError<TCause>(cause: TCause, fallback: string): string {
-  if (cause instanceof ApiError) {
-    // Keep the exact server problem code visible to operators and tests. These
-    // are intentionally not collapsed into a generic HTTP status message.
-    switch (cause.code) {
-      case 'playlist.request_invalid':
-        return `playlist.request_invalid: ${cause.message}`;
-      case 'playlist.not_found':
-        return `playlist.not_found: ${cause.message}`;
-      case 'playlist.conflict':
-        return `playlist.conflict: ${cause.message}`;
-      case 'playlist.source_conflict':
-        return `playlist.source_conflict: ${cause.message}`;
-      default:
-        break;
-    }
-    if (cause.status === 404) {
-      return `playlist.not_found: ${cause.message}`;
-    }
-    if (cause.status === 409) {
-      return `playlist.conflict: ${cause.message}`;
-    }
-  }
-  return cause instanceof Error && cause.message.length > 0 ? cause.message : fallback;
-}
-
-function reindex(items: readonly EditablePlaylistItem[]): EditablePlaylistItem[] {
-  return items.map((item, position) => ({ ...item, position }));
-}
-
-function editableItems(items: readonly PlaylistItem[]): EditablePlaylistItem[] {
-  return items.map((item) => ({
-    id: item.id,
-    trackId: item.trackId,
-    title: item.title,
-    artist: item.artist,
-    position: item.position,
-  }));
-}
-
-function nullableNumber(value: string): number | null {
-  if (value.trim() === '') {
-    return null;
-  }
-  const parsed = Number(value);
-  return Number.isInteger(parsed) ? parsed : null;
-}
-
-function daysFromInput(value: string): number[] {
-  return value
-    .split(',')
-    .map((part) => part.trim())
-    .filter((part) => part.length > 0)
-    .map((part) => Number(part));
-}
-
-function emptySchedule(): PlaylistSchedule {
-  return {
-    id: null,
-    daysOfWeek: [],
-    startTime: '00:00',
-    endTime: '23:59',
-    startDate: null,
-    endDate: null,
-    timeZoneId: 'UTC',
-  };
-}
-
-/** Policy-driven playlist editor with multiple active playlists and manual-item ordering. */
+/** Плейлисты: список + редактор политики и ручного порядка треков. */
 export function PlaylistsPage(): ReactElement {
-  const [playlistsState, setPlaylistsState] = useState<LoadState<Playlist[]>>({ status: 'loading' });
-  const [selectedPlaylistId, setSelectedPlaylistId] = useState<string | null>(null);
-  const [itemsState, setItemsState] = useState<LoadState<EditablePlaylistItem[]>>({
-    status: 'ready',
-    data: [],
-  });
-  const [form, setForm] = useState<PlaylistForm>(DEFAULT_FORM);
-  const [isSavingPlaylist, setIsSavingPlaylist] = useState(false);
-  const [isSavingItems, setIsSavingItems] = useState(false);
-  const [isQueueingTrackId, setIsQueueingTrackId] = useState<string | null>(null);
-  const [itemsDirty, setItemsDirty] = useState(false);
-  const [validationError, setValidationError] = useState<string | null>(null);
-  const [actionMessage, setActionMessage] = useState<string | null>(null);
+  const { showToast } = useToast();
+  const [playlists, setPlaylists] = useState<Playlist[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [form, setForm] = useState<PlaylistForm | null>(null);
+  const [items, setItems] = useState<PlaylistItem[]>([]);
+  const [saving, setSaving] = useState(false);
+  const [reloadKey, setReloadKey] = useState(0);
+  const dragIndex = useRef<number | null>(null);
 
   useEffect(() => {
-    const controller = new AbortController();
-    let active = true;
-
-    void getPlaylists({ signal: controller.signal })
-      .then((playlists) => {
-        if (!active) {
-          return;
-        }
-        setPlaylistsState({ status: 'ready', data: playlists });
-        setSelectedPlaylistId((current) => {
-          if (current !== null && playlists.some((playlist) => playlist.id === current)) {
-            return current;
-          }
-          return playlists[0]?.id ?? null;
-        });
+    void getPlaylists()
+      .then((loaded) => {
+        setPlaylists(loaded);
+        setSelectedId((current) => (current !== null && loaded.some((p) => p.id === current) ? current : loaded[0]?.id ?? null));
       })
-      .catch((cause) => {
-        if (active) {
-          setPlaylistsState({
-            status: 'error',
-            message: actionError(cause, 'Playlists could not be loaded.'),
-          });
-        }
-      });
+      .catch((cause) => showToast(errorMessage(cause, 'Не удалось загрузить плейлисты')));
+  }, [reloadKey, showToast]);
 
-    return () => {
-      active = false;
-      controller.abort();
-    };
-  }, []);
-
-  const selectedPlaylist =
-    playlistsState.status === 'ready'
-      ? playlistsState.data.find((playlist) => playlist.id === selectedPlaylistId) ?? null
-      : null;
-
-  // Keep the policy form synchronized with the selected playlist. A new playlist
-  // starts with DEFAULT_FORM, while edits remain local until explicitly saved.
-  useEffect(() => {
-    if (selectedPlaylist !== null) {
-      setForm(formFromPlaylist(selectedPlaylist));
-    }
-  }, [selectedPlaylist]);
+  const selected = playlists.find((p) => p.id === selectedId) ?? null;
 
   useEffect(() => {
-    if (selectedPlaylist === null || selectedPlaylist.source === 'allStorage') {
-      setItemsDirty(false);
-      setItemsState({ status: 'ready', data: [] });
+    // `selected === null` is the "new playlist" mode — keep the draft set by newPlaylist().
+    if (selected === null) {
       return;
     }
-
-    setItemsDirty(false);
-    setItemsState({ status: 'loading' });
-    const controller = new AbortController();
-    let active = true;
-    void getPlaylistItems(selectedPlaylist.id, { signal: controller.signal })
-      .then((items) => {
-        if (active) {
-          setItemsState({ status: 'ready', data: reindex(editableItems(items)) });
-        }
-      })
-      .catch((cause) => {
-        if (active) {
-          setItemsState({
-            status: 'error',
-            message: actionError(cause, 'Playlist items could not be loaded.'),
-          });
-        }
-      });
-
-    return () => {
-      active = false;
-      controller.abort();
-    };
-  }, [selectedPlaylist]);
-
-  const setFormField = <K extends keyof PlaylistForm>(key: K, value: PlaylistForm[K]): void => {
-    setForm((current) => ({ ...current, [key]: value }));
-  };
-
-  const selectType = (type: PlaylistType): void => {
-    if (type === 'general') {
-      setForm((current) => ({
-        ...current,
-        type,
-        playEverySongs: null,
-        playEveryMinutes: null,
-        playAtMinute: null,
-      }));
-    } else if (type === 'oncePerSongs') {
-      setForm((current) => ({
-        ...current,
-        type,
-        playEverySongs: current.playEverySongs ?? 1,
-        playEveryMinutes: null,
-        playAtMinute: null,
-      }));
-    } else if (type === 'oncePerMinutes') {
-      setForm((current) => ({
-        ...current,
-        type,
-        playEverySongs: null,
-        playEveryMinutes: current.playEveryMinutes ?? 1,
-        playAtMinute: null,
-      }));
+    setForm(formFrom(selected));
+    if (selected.source === 'manual') {
+      void getPlaylistItems(selected.id).then(setItems).catch(() => setItems([]));
     } else {
-      setForm((current) => ({
-        ...current,
-        type,
-        playEverySongs: null,
-        playEveryMinutes: null,
-        playAtMinute: current.playAtMinute ?? 0,
-      }));
+      setItems([]);
     }
+  }, [selected]);
+
+  const setField = <K extends keyof PlaylistForm>(key: K, value: PlaylistForm[K]): void => {
+    setForm((current) => (current === null ? current : { ...current, [key]: value }));
   };
 
-  const savePlaylist = async (): Promise<void> => {
-    const name = form.name.trim();
-    const description = form.description.trim();
-    if (name.length === 0 || name.length > 120) {
-      setValidationError('playlist.request_invalid: Playlist name must contain 1 to 120 characters.');
-      return;
-    }
-    if (description.length > 1000) {
-      setValidationError('playlist.request_invalid: Playlist description must contain at most 1000 characters.');
-      return;
-    }
+  const newPlaylist = (): void => {
+    setSelectedId(null);
+    setForm({
+      name: 'Новый плейлист',
+      description: '',
+      isActive: false,
+      type: 'general',
+      source: 'manual',
+      order: 'sequential',
+      weight: 3,
+      isJingle: false,
+      interrupt: false,
+      avoidDuplicates: true,
+      playEverySongs: null,
+      playEveryMinutes: null,
+      playAtMinute: null,
+      schedules: [],
+    });
+    setItems([]);
+  };
 
+  const save = async (): Promise<void> => {
+    if (form === null) {
+      return;
+    }
+    const name = form.name.trim();
+    if (name.length < 1 || name.length > 120) {
+      showToast('Название: 1–120 символов');
+      return;
+    }
     const body: PlaylistMutationRequest = {
       name,
-      description: description === '' ? null : description,
+      description: form.description.trim() === '' ? null : form.description.trim(),
       isActive: form.isActive,
       type: form.type,
       source: form.source,
@@ -311,418 +135,194 @@ export function PlaylistsPage(): ReactElement {
       isJingle: form.isJingle,
       interrupt: form.interrupt,
       avoidDuplicates: form.avoidDuplicates,
-      playEverySongs: form.playEverySongs,
-      playEveryMinutes: form.playEveryMinutes,
-      playAtMinute: form.playAtMinute,
+      playEverySongs: form.type === 'oncePerSongs' ? form.playEverySongs ?? 1 : null,
+      playEveryMinutes: form.type === 'oncePerMinutes' ? form.playEveryMinutes ?? 1 : null,
+      playAtMinute: form.type === 'oncePerHour' ? form.playAtMinute ?? 0 : null,
       schedules: [...form.schedules],
     };
-    const parsed = PlaylistMutationRequestSchema.safeParse(body);
-    if (!parsed.success) {
-      const issue = parsed.error.issues[0];
-      setValidationError(`playlist.request_invalid: ${issue?.message ?? 'Invalid playlist policy.'}`);
-      return;
-    }
-
-    setValidationError(null);
-    setActionMessage(null);
-    setIsSavingPlaylist(true);
+    setSaving(true);
     try {
-      if (selectedPlaylist === null) {
-        const created = await createPlaylist(body);
-        setPlaylistsState((current) =>
-          current.status === 'ready' ? { status: 'ready', data: [...current.data, created] } : current,
-        );
-        setSelectedPlaylistId(created.id);
-        setForm(formFromPlaylist(created));
-      } else {
-        const updated = await replacePlaylist(selectedPlaylist.id, body);
-        setPlaylistsState((current) =>
-          current.status === 'ready'
-            ? {
-                status: 'ready',
-                data: current.data.map((playlist) => (playlist.id === updated.id ? updated : playlist)),
-              }
-            : current,
-        );
-        setForm(formFromPlaylist(updated));
+      const saved = selected === null ? await createPlaylist(body) : await replacePlaylist(selected.id, body);
+      if (selected !== null && selected.source === 'manual') {
+        await replacePlaylistItems(selected.id, { items: items.map((item) => ({ id: item.id, trackId: item.trackId })) });
       }
-      setActionMessage('Saved');
+      showToast('Плейлист сохранён');
+      setSelectedId(saved.id);
+      setReloadKey((key) => key + 1);
     } catch (cause) {
-      setValidationError(actionError(cause, 'The playlist could not be saved.'));
+      showToast(cause instanceof Error ? cause.message : 'Не удалось сохранить');
     } finally {
-      setIsSavingPlaylist(false);
+      setSaving(false);
     }
   };
 
-  const queueNow = async (track: AdminTrack): Promise<void> => {
-    setValidationError(null);
-    setActionMessage(null);
-    setIsQueueingTrackId(track.id);
-    try {
-      await queueTrack({ trackId: track.id });
-      setActionMessage('Queued');
-    } catch (cause) {
-      setValidationError(actionError(cause, 'The track could not be queued.'));
-    } finally {
-      setIsQueueingTrackId(null);
-    }
-  };
-
-  const addTrackToPlaylist = (track: AdminTrack): void => {
-    if (selectedPlaylist?.source === 'allStorage') {
-      setValidationError('playlist.source_conflict: All tracks is dynamic and cannot contain manual items.');
+  const onDrop = (index: number): void => {
+    const from = dragIndex.current;
+    dragIndex.current = null;
+    if (from === null || from === index) {
       return;
     }
-    if (itemsState.status !== 'ready') {
-      return;
-    }
-    if (itemsState.data.some((item) => item.trackId === track.id)) {
-      setValidationError('playlist.conflict: This track is already in the playlist.');
-      return;
-    }
-
-    setValidationError(null);
-    setItemsState({
-      status: 'ready',
-      data: reindex([
-        ...itemsState.data,
-        { id: null, trackId: track.id, title: track.title, artist: track.artist, position: itemsState.data.length },
-      ]),
+    setItems((current) => {
+      const next = [...current];
+      const [moved] = next.splice(from, 1);
+      if (moved === undefined) {
+        return current;
+      }
+      next.splice(index, 0, moved);
+      return next;
     });
-    setItemsDirty(true);
-    setActionMessage(null);
-  };
-
-  const moveItem = (index: number, direction: -1 | 1): void => {
-    if (itemsState.status !== 'ready') {
-      return;
-    }
-    const destination = index + direction;
-    if (destination < 0 || destination >= itemsState.data.length) {
-      return;
-    }
-
-    const reordered = [...itemsState.data];
-    const current = reordered[index];
-    const target = reordered[destination];
-    if (current === undefined || target === undefined) {
-      return;
-    }
-    reordered[index] = target;
-    reordered[destination] = current;
-    setItemsState({ status: 'ready', data: reindex(reordered) });
-    setItemsDirty(true);
-    setActionMessage(null);
-  };
-
-  const removeItem = (index: number): void => {
-    if (itemsState.status !== 'ready') {
-      return;
-    }
-    setItemsState({ status: 'ready', data: reindex(itemsState.data.filter((_, itemIndex) => itemIndex !== index)) });
-    setItemsDirty(true);
-    setActionMessage(null);
-  };
-
-  const saveItems = async (): Promise<void> => {
-    if (
-      selectedPlaylist === null ||
-      selectedPlaylist.source === 'allStorage' ||
-      itemsState.status !== 'ready' ||
-      !itemsDirty
-    ) {
-      if (selectedPlaylist?.source === 'allStorage' && itemsDirty) {
-        setValidationError('playlist.source_conflict: All tracks is dynamic and cannot contain manual items.');
-      }
-      return;
-    }
-
-    setValidationError(null);
-    setActionMessage(null);
-    setIsSavingItems(true);
-    try {
-      const saved = await replacePlaylistItems(selectedPlaylist.id, {
-        items: itemsState.data.map((item) => ({ id: item.id, trackId: item.trackId })),
-      });
-      setItemsState({ status: 'ready', data: reindex(editableItems(saved)) });
-      setItemsDirty(false);
-      setPlaylistsState((current) =>
-        current.status === 'ready'
-          ? {
-              status: 'ready',
-              data: current.data.map((playlist) =>
-                playlist.id === selectedPlaylist.id ? { ...playlist, itemCount: saved.length } : playlist,
-              ),
-            }
-          : current,
-      );
-      setActionMessage('Saved playlist items');
-    } catch (cause) {
-      setValidationError(actionError(cause, 'Playlist items could not be saved.'));
-    } finally {
-      setIsSavingItems(false);
-    }
-  };
-
-  const updateSchedule = (index: number, patch: Partial<PlaylistSchedule>): void => {
-    setForm((current) => ({
-      ...current,
-      schedules: current.schedules.map((schedule, scheduleIndex) =>
-        scheduleIndex === index ? { ...schedule, ...patch } : schedule,
-      ),
-    }));
   };
 
   return (
-    <section>
-      <h2>Playlists</h2>
-      <p className="admin-muted">
-        Configure policy-driven rotations, schedules, and manual tracks. Multiple playlists may be active at once.
-      </p>
-      {playlistsState.status === 'loading' ? <p className="admin-muted">Loading playlists…</p> : null}
-      {playlistsState.status === 'error' ? <p role="alert">Failed to load playlists: {playlistsState.message}</p> : null}
-      {validationError !== null ? <p role="alert">{validationError}</p> : null}
-      {actionMessage !== null ? <p aria-live="polite">{actionMessage}</p> : null}
-
-      <TrackSearch
-        renderActions={(track) => (
-          <>
-            <button
-              type="button"
-              onClick={() => void queueNow(track)}
-              disabled={isQueueingTrackId === track.id}
+    <div style={{ display: 'flex', gap: '16px', flexWrap: 'wrap', alignItems: 'flex-start' }}>
+      <div style={{ flex: 'none', width: '230px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+          <strong>Плейлисты</strong>
+          <button type="button" onClick={newPlaylist} style={{ minWidth: 0, padding: '2px 10px' }}>
+            ＋ Новый
+          </button>
+        </div>
+        <ul className="tree-view has-container">
+          {playlists.map((playlist) => (
+            <li
+              key={playlist.id}
+              onClick={() => setSelectedId(playlist.id)}
+              style={{ cursor: 'pointer', padding: '6px', borderRadius: '4px', background: playlist.id === selectedId ? COLORS.selection : 'transparent' }}
             >
-              {isQueueingTrackId === track.id ? 'Queueing…' : `Queue ${track.title} now`}
-            </button>
-            {selectedPlaylist?.source === 'manual' ? (
-              <button type="button" onClick={() => addTrackToPlaylist(track)}>
-                Add {track.title} to playlist
-              </button>
-            ) : null}
-          </>
-        )}
-      />
-
-      <hr />
-      {playlistsState.status === 'ready' && playlistsState.data.length === 0 ? (
-        <p>No active playlist exists yet.</p>
-      ) : null}
-      {playlistsState.status === 'ready' && playlistsState.data.length > 0 ? (
-        <ul aria-label="Loaded playlists">
-          {playlistsState.data.map((playlist) => (
-            <li key={playlist.id}>
-              <button
-                type="button"
-                aria-pressed={playlist.id === selectedPlaylistId}
-                onClick={() => setSelectedPlaylistId(playlist.id)}
-              >
-                {playlist.name}
-              </button>{' '}
-              {playlist.isSystem ? <strong>System</strong> : null}{' '}
-              {playlist.isActive ? '(active)' : '(inactive)'} — {playlist.source === 'allStorage' ? `${playlist.itemCount} playable tracks` : `${playlist.itemCount} items`}
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span style={{ fontWeight: 600 }}>{playlist.name}</span>
+                <span style={{ fontSize: '10px', color: playlist.isActive ? COLORS.live : '#999' }}>
+                  {playlist.isSystem ? 'система' : playlist.isActive ? 'активен' : 'выкл'}
+                </span>
+              </div>
+              <div style={{ fontSize: '11px', color: '#89a' }}>
+                {playlist.source === 'allStorage' ? 'все треки' : `${playlist.itemCount} тр.`}
+              </div>
             </li>
           ))}
         </ul>
-      ) : null}
+      </div>
 
-      {playlistsState.status === 'ready' ? (
-        <div style={{ display: 'grid', gap: '10px', maxWidth: '680px' }}>
-          {selectedPlaylist !== null ? <h3>{selectedPlaylist.name}</h3> : <h3>New playlist</h3>}
-          <div className="group">
-            <label htmlFor="playlist-name">Playlist name</label>
-            <input
-              id="playlist-name"
-              value={form.name}
-              onChange={(event) => setFormField('name', event.target.value)}
-              maxLength={120}
-              disabled={isSavingPlaylist}
-            />
+      {form !== null ? (
+        <div style={{ ...panel, flex: 1, minWidth: '320px' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: '10px' }}>
+            <strong style={{ fontSize: '15px' }}>{selected?.name ?? 'Новый плейлист'}</strong>
+            {selected?.isSystem === true ? <span style={{ fontSize: '11px', color: '#b8860b' }}>системный</span> : null}
           </div>
-          <div className="group">
-            <label htmlFor="playlist-description">Playlist description</label>
-            <textarea
-              id="playlist-description"
-              value={form.description}
-              onChange={(event) => setFormField('description', event.target.value)}
-              maxLength={1000}
-              disabled={isSavingPlaylist}
-            />
-          </div>
-          <div>
-            <input
-              id="playlist-active"
-              type="checkbox"
-              checked={form.isActive}
-              onChange={(event) => setFormField('isActive', event.target.checked)}
-              disabled={isSavingPlaylist}
-            />
-            <label htmlFor="playlist-active">Active playlist</label>
-          </div>
-          <div className="group">
-            <label htmlFor="playlist-type">Playlist type</label>
-            <select id="playlist-type" value={form.type} onChange={(event) => selectType(event.target.value as PlaylistType)} disabled={isSavingPlaylist || selectedPlaylist?.isSystem === true}>
-              <option value="general">General</option>
-              <option value="oncePerSongs">Once per songs</option>
-              <option value="oncePerMinutes">Once per minutes</option>
-              <option value="oncePerHour">Once per hour</option>
+          <div style={formGrid}>
+            <label htmlFor="pl-name">Название</label>
+            <input id="pl-name" value={form.name} maxLength={120} onChange={(event) => setField('name', event.target.value)} />
+            <label htmlFor="pl-desc">Описание</label>
+            <textarea id="pl-desc" rows={2} value={form.description} onChange={(event) => setField('description', event.target.value)} />
+            <label htmlFor="pl-active">Активен</label>
+            <div>
+              <input id="pl-active" type="checkbox" checked={form.isActive} onChange={(event) => setField('isActive', event.target.checked)} />{' '}
+              <span style={{ fontSize: '12px', color: COLORS.subtle }}>в ротации эфира</span>
+            </div>
+            <label htmlFor="pl-source">Источник</label>
+            <select id="pl-source" value={form.source} disabled={selected?.isSystem === true} onChange={(event) => setField('source', event.target.value === 'allStorage' ? 'allStorage' : 'manual')}>
+              <option value="manual">Ручной список</option>
+              <option value="allStorage">Все треки хранилища</option>
             </select>
-          </div>
-          <div className="group">
-            <label htmlFor="playlist-source">Playlist source</label>
-            <select
-              id="playlist-source"
-              value={form.source}
-              onChange={(event) => setFormField('source', event.target.value as PlaylistSource)}
-              disabled={isSavingPlaylist || selectedPlaylist?.isSystem === true}
-            >
-              <option value="manual">Manual</option>
-              <option value="allStorage">All tracks (storage)</option>
+            <label htmlFor="pl-type">Тип</label>
+            <select id="pl-type" value={form.type} onChange={(event) => setField('type', event.target.value as PlaylistType)}>
+              <option value="general">Обычный</option>
+              <option value="oncePerSongs">Раз в N треков</option>
+              <option value="oncePerMinutes">Раз в N минут</option>
+              <option value="oncePerHour">Раз в час</option>
             </select>
-          </div>
-          <div className="group">
-            <label htmlFor="playlist-order">Playlist order</label>
-            <select id="playlist-order" value={form.order} onChange={(event) => setFormField('order', event.target.value as PlaylistOrder)} disabled={isSavingPlaylist}>
-              <option value="sequential">Sequential</option>
-              <option value="shuffle">Shuffle</option>
-              <option value="random">Random</option>
+            {form.type === 'oncePerSongs' ? (
+              <>
+                <label htmlFor="pl-every-songs">Каждые N треков</label>
+                <input id="pl-every-songs" type="number" min={1} value={form.playEverySongs ?? 1} onChange={(event) => setField('playEverySongs', Number(event.target.value))} />
+              </>
+            ) : null}
+            {form.type === 'oncePerMinutes' ? (
+              <>
+                <label htmlFor="pl-every-min">Каждые N минут</label>
+                <input id="pl-every-min" type="number" min={1} value={form.playEveryMinutes ?? 1} onChange={(event) => setField('playEveryMinutes', Number(event.target.value))} />
+              </>
+            ) : null}
+            {form.type === 'oncePerHour' ? (
+              <>
+                <label htmlFor="pl-at-min">Минута часа</label>
+                <input id="pl-at-min" type="number" min={0} max={59} value={form.playAtMinute ?? 0} onChange={(event) => setField('playAtMinute', Number(event.target.value))} />
+              </>
+            ) : null}
+            <label htmlFor="pl-order">Порядок</label>
+            <select id="pl-order" value={form.order} onChange={(event) => setField('order', event.target.value as PlaylistOrder)}>
+              <option value="sequential">Последовательно</option>
+              <option value="shuffle">Перемешать</option>
+              <option value="random">Случайно</option>
             </select>
+            <label htmlFor="pl-weight">Вес (1–25)</label>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <input id="pl-weight" type="range" min={1} max={25} value={form.weight} onChange={(event) => setField('weight', Number(event.target.value))} style={{ flex: 1 }} />
+              <span style={{ width: '22px', textAlign: 'right' }}>{form.weight}</span>
+            </div>
           </div>
-          <div className="group">
-            <label htmlFor="playlist-weight">Playlist weight (1–25)</label>
-            <input
-              id="playlist-weight"
-              type="number"
-              min={1}
-              max={25}
-              step={1}
-              value={form.weight}
-              onChange={(event) => setFormField('weight', Number(event.target.value))}
-              disabled={isSavingPlaylist}
-            />
-          </div>
-          <fieldset>
-            <legend>Playback policy</legend>
+          <fieldset style={{ marginTop: '12px' }}>
+            <legend>Политика воспроизведения</legend>
+            <label style={{ marginRight: '14px' }}>
+              <input type="checkbox" checked={form.isJingle} onChange={(event) => setField('isJingle', event.target.checked)} /> Джингл
+            </label>
+            <label style={{ marginRight: '14px' }}>
+              <input type="checkbox" checked={form.interrupt} onChange={(event) => setField('interrupt', event.target.checked)} /> Прерывать трек
+            </label>
             <label>
-              <input type="checkbox" checked={form.isJingle} onChange={(event) => setFormField('isJingle', event.target.checked)} disabled={isSavingPlaylist} />
-              Jingle
-            </label>{' '}
-            <label>
-              <input type="checkbox" checked={form.interrupt} onChange={(event) => setFormField('interrupt', event.target.checked)} disabled={isSavingPlaylist} />
-              Interrupt current track
-            </label>{' '}
-            <label>
-              <input type="checkbox" checked={form.avoidDuplicates} onChange={(event) => setFormField('avoidDuplicates', event.target.checked)} disabled={isSavingPlaylist} />
-              Avoid duplicates
+              <input type="checkbox" checked={form.avoidDuplicates} onChange={(event) => setField('avoidDuplicates', event.target.checked)} /> Избегать повторов
             </label>
           </fieldset>
-          {form.type === 'oncePerSongs' ? (
-            <div className="group">
-              <label htmlFor="playlist-play-every-songs">Play every songs</label>
-              <input id="playlist-play-every-songs" type="number" min={1} max={1000} value={form.playEverySongs ?? ''} onChange={(event) => setFormField('playEverySongs', nullableNumber(event.target.value))} disabled={isSavingPlaylist} />
-            </div>
-          ) : null}
-          {form.type === 'oncePerMinutes' ? (
-            <div className="group">
-              <label htmlFor="playlist-play-every-minutes">Play every minutes</label>
-              <input id="playlist-play-every-minutes" type="number" min={1} max={10080} value={form.playEveryMinutes ?? ''} onChange={(event) => setFormField('playEveryMinutes', nullableNumber(event.target.value))} disabled={isSavingPlaylist} />
-            </div>
-          ) : null}
-          {form.type === 'oncePerHour' ? (
-            <div className="group">
-              <label htmlFor="playlist-play-at-minute">Play at minute</label>
-              <input id="playlist-play-at-minute" type="number" min={0} max={59} value={form.playAtMinute ?? ''} onChange={(event) => setFormField('playAtMinute', nullableNumber(event.target.value))} disabled={isSavingPlaylist} />
-            </div>
-          ) : null}
 
-          <fieldset aria-label="Playlist schedules">
-            <legend>Schedules (optional)</legend>
-            {form.schedules.map((schedule, index) => (
-              <div key={schedule.id ?? `new-schedule-${index}`} style={{ display: 'grid', gap: '4px', border: '1px solid currentColor', padding: '8px' }}>
-                <label>
-                  Days of week (1–7, blank for every day)
-                  <input
-                    value={schedule.daysOfWeek.join(',')}
-                    onChange={(event) => updateSchedule(index, { daysOfWeek: daysFromInput(event.target.value) })}
-                  />
-                </label>
-                <label>
-                  Start time
-                  <input type="time" value={schedule.startTime} onChange={(event) => updateSchedule(index, { startTime: event.target.value })} />
-                </label>
-                <label>
-                  End time
-                  <input type="time" value={schedule.endTime} onChange={(event) => updateSchedule(index, { endTime: event.target.value })} />
-                </label>
-                <label>
-                  Start date
-                  <input type="date" value={schedule.startDate ?? ''} onChange={(event) => updateSchedule(index, { startDate: event.target.value === '' ? null : event.target.value })} />
-                </label>
-                <label>
-                  End date
-                  <input type="date" value={schedule.endDate ?? ''} onChange={(event) => updateSchedule(index, { endDate: event.target.value === '' ? null : event.target.value })} />
-                </label>
-                <label>
-                  Time zone
-                  <input value={schedule.timeZoneId} onChange={(event) => updateSchedule(index, { timeZoneId: event.target.value })} />
-                </label>
-                <button type="button" onClick={() => setForm((current) => ({ ...current, schedules: current.schedules.filter((_, scheduleIndex) => scheduleIndex !== index) }))}>
-                  Remove schedule {index + 1}
-                </button>
-              </div>
-            ))}
-            <button type="button" onClick={() => setForm((current) => ({ ...current, schedules: [...current.schedules, emptySchedule()] }))} disabled={form.schedules.length >= 32 || isSavingPlaylist}>
-              Add schedule
-            </button>
-          </fieldset>
+          <div style={{ marginTop: '12px' }}>
+            <strong style={{ fontSize: '13px' }}>Порядок треков</strong>
+            {form.source === 'allStorage' ? (
+              <p style={{ color: COLORS.subtle, fontSize: '12px' }}>
+                Динамический плейлист: треки берутся из хранилища автоматически, ручной порядок недоступен.
+              </p>
+            ) : items.length === 0 ? (
+              <p style={{ color: '#89a', fontSize: '12px' }}>Список пуст. Добавляйте треки из Библиотеки (⋯ → Плейлисты).</p>
+            ) : (
+              <>
+                <p style={{ fontSize: '11px', color: '#89a', margin: '4px 0 2px' }}>Перетащите строки, чтобы изменить порядок.</p>
+                <ol className="tree-view has-container" style={{ marginTop: '2px' }}>
+                  {items.map((item, index) => (
+                    <li
+                      key={item.id}
+                      draggable
+                      onDragStart={() => {
+                        dragIndex.current = index;
+                      }}
+                      onDragOver={(event) => event.preventDefault()}
+                      onDrop={() => onDrop(index)}
+                      style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '5px 6px', cursor: 'grab' }}
+                    >
+                      <span style={{ color: '#9ab', fontSize: '12px' }}>⋮⋮</span>
+                      <span style={{ flex: 1, ...ellipsis }}>
+                        <strong>{item.title}</strong> <span style={{ color: '#789', fontSize: '12px' }}>— {item.artist}</span>
+                      </span>
+                      <button
+                        type="button"
+                        title="Убрать"
+                        style={iconButton}
+                        onClick={() => setItems((current) => current.filter((_, i) => i !== index))}
+                      >
+                        ✕
+                      </button>
+                    </li>
+                  ))}
+                </ol>
+              </>
+            )}
+          </div>
 
-          <div>
-            <button type="button" className="default" onClick={() => void savePlaylist()} disabled={isSavingPlaylist}>
-              {isSavingPlaylist ? 'Saving…' : selectedPlaylist === null ? 'Create playlist' : 'Save playlist'}
+          <div style={{ marginTop: '14px' }}>
+            <button type="button" className="default" onClick={() => void save()} disabled={saving}>
+              {saving ? 'Сохранение…' : 'Сохранить плейлист'}
             </button>
           </div>
         </div>
       ) : null}
-
-      {selectedPlaylist?.source === 'allStorage' ? (
-        <div style={{ marginTop: '18px' }}>
-          <h3>All tracks</h3>
-          <p>This system playlist is populated dynamically from playable cached storage tracks.</p>
-          <p>Playable tracks: {selectedPlaylist.itemCount}</p>
-          <p className="admin-muted">Manual item controls are unavailable for allStorage playlists.</p>
-        </div>
-      ) : null}
-
-      {selectedPlaylist?.source === 'manual' ? (
-        <div style={{ marginTop: '18px' }}>
-          <h3>Playlist order</h3>
-          {itemsState.status === 'loading' ? <p className="admin-muted">Loading playlist items…</p> : null}
-          {itemsState.status === 'error' ? <p role="alert">Failed to load playlist items: {itemsState.message}</p> : null}
-          {itemsState.status === 'ready' && itemsState.data.length === 0 ? <p>No tracks in this playlist yet.</p> : null}
-          {itemsState.status === 'ready' && itemsState.data.length > 0 ? (
-            <ol>
-              {itemsState.data.map((item, index) => (
-                <li key={item.id ?? `${item.trackId}-${item.position}`} style={{ marginBottom: '8px' }}>
-                  <strong>{item.title}</strong> — {item.artist || 'Unknown artist'}
-                  <span style={{ display: 'inline-flex', gap: '6px', marginLeft: '8px' }}>
-                    <button type="button" onClick={() => moveItem(index, -1)} disabled={index === 0 || isSavingItems}>
-                      Move {item.title} up
-                    </button>
-                    <button type="button" onClick={() => moveItem(index, 1)} disabled={index === itemsState.data.length - 1 || isSavingItems}>
-                      Move {item.title} down
-                    </button>
-                    <button type="button" onClick={() => removeItem(index)} disabled={isSavingItems}>
-                      Remove {item.title}
-                    </button>
-                  </span>
-                </li>
-              ))}
-            </ol>
-          ) : null}
-          <button type="button" className="default" onClick={() => void saveItems()} disabled={itemsState.status !== 'ready' || !itemsDirty || isSavingItems}>
-            {isSavingItems ? 'Saving playlist items…' : 'Save playlist items'}
-          </button>
-        </div>
-      ) : null}
-    </section>
+    </div>
   );
 }

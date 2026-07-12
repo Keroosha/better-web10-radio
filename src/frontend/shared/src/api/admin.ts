@@ -2,13 +2,12 @@
 import { z } from 'zod';
 
 import {
-  AdminSayMessageSchema,
+  type BannersReplaceRequest,
   AdminSessionSchema,
   AdminTrackPageSchema,
   type AdminTrackPage,
   AdminTrackSchema,
   type AdminTrack,
-  type AdminSayMessage,
   type AdminSession,
   type DonationGoalUpdateRequest,
   EmptyAdminRequestSchema,
@@ -44,8 +43,9 @@ import {
   type StreamNodeStatus,
   StreamNodeStatusSchema,
 } from '../domain/admin';
-import { type SuperChatStatus } from '../domain/enums';
 import {
+  BannerSchema,
+  type Banner,
   DonationGoalSchema,
   type DonationGoal,
   QueueStateSchema,
@@ -64,7 +64,7 @@ import {
 } from './client';
 
 const SocialLinkListSchema = z.array(SocialLinkSchema);
-const AdminSayMessageListSchema = z.array(AdminSayMessageSchema);
+const BannerListSchema = z.array(BannerSchema);
 const PlaylistListSchema = z.array(PlaylistSchema);
 const PlaylistItemListSchema = z.array(PlaylistItemSchema);
 const emptyAdminRequest = EmptyAdminRequestSchema.parse({});
@@ -232,6 +232,15 @@ export function reorderQueue(
   });
 }
 
+/** Soft-delete a queued item (only items still in the `Queued` state). */
+export function removeQueueItem(queueItemId: string, opts: RequestOptions = {}): Promise<void> {
+  return apiSend<Record<string, never>>(`${API_V0_PREFIX}/admin/playback/queue/${queueItemId}`, {
+    method: 'DELETE',
+    admin: true,
+    ...opts,
+  });
+}
+
 /** Skip the currently playing or claimed item. */
 export function skipCurrent(opts: RequestOptions = {}): Promise<void> {
   return apiSend(`${API_V0_PREFIX}/admin/playback/skip`, {
@@ -301,6 +310,27 @@ export function replaceSocialLinks(
 ): Promise<SocialLink[]> {
   return apiFetch<SocialLink[], SocialLinksReplaceRequest>(`${API_V0_PREFIX}/admin/social-links`, {
     schema: SocialLinkListSchema,
+    method: 'PUT',
+    body,
+    admin: true,
+    ...opts,
+  });
+}
+
+export function getBanners(opts: RequestOptions = {}): Promise<Banner[]> {
+  return apiFetch(`${API_V0_PREFIX}/admin/banners`, {
+    schema: BannerListSchema,
+    admin: true,
+    ...opts,
+  });
+}
+
+export function replaceBanners(
+  body: BannersReplaceRequest,
+  opts: RequestOptions = {},
+): Promise<Banner[]> {
+  return apiFetch<Banner[], BannersReplaceRequest>(`${API_V0_PREFIX}/admin/banners`, {
+    schema: BannerListSchema,
     method: 'PUT',
     body,
     admin: true,
@@ -418,7 +448,7 @@ export function getStreamNodeStatus(opts: RequestOptions = {}): Promise<StreamNo
 }
 
 function sendStreamNodeControl(
-  action: 'start' | 'stop' | 'restart',
+  action: 'start' | 'pause' | 'stop' | 'restart',
   opts: RequestOptions,
 ): Promise<StreamNodeControl> {
   return apiFetch(`${API_V0_PREFIX}/admin/stream-node/${action}`, {
@@ -432,6 +462,10 @@ function sendStreamNodeControl(
 
 export function startStreamNode(opts: RequestOptions = {}): Promise<StreamNodeControl> {
   return sendStreamNodeControl('start', opts);
+}
+
+export function pauseStreamNode(opts: RequestOptions = {}): Promise<StreamNodeControl> {
+  return sendStreamNodeControl('pause', opts);
 }
 
 export function stopStreamNode(opts: RequestOptions = {}): Promise<StreamNodeControl> {
@@ -458,35 +492,3 @@ export function createPaidVerticalSliceFixture(
   );
 }
 
-export function getSayMessages(
-  status: SuperChatStatus,
-  opts: RequestOptions = {},
-): Promise<AdminSayMessage[]> {
-  return apiFetch(`${API_V0_PREFIX}/admin/say-messages?status=${encodeURIComponent(status)}`, {
-    schema: AdminSayMessageListSchema,
-    admin: true,
-    ...opts,
-  });
-}
-
-export function approveSayMessage(messageId: string, opts: RequestOptions = {}): Promise<void> {
-  return apiSend(`${API_V0_PREFIX}/admin/say-messages/${encodeURIComponent(messageId)}/approve`, {
-    method: 'POST',
-    body: emptyAdminRequest,
-    admin: true,
-    ...opts,
-  });
-}
-
-export function rejectSayMessage(
-  messageId: string,
-  reason: string,
-  opts: RequestOptions = {},
-): Promise<void> {
-  return apiSend(`${API_V0_PREFIX}/admin/say-messages/${encodeURIComponent(messageId)}/reject`, {
-    method: 'POST',
-    body: { reason },
-    admin: true,
-    ...opts,
-  });
-}

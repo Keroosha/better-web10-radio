@@ -152,6 +152,19 @@ type OverlaySettingsDto =
     { Style: string
       Layout: string }
 
+type BannerDto =
+    { Id: string
+      Type: string
+      Title: string
+      Subtitle: string
+      Text: string
+      Style: string
+      ScreenPosition: string
+      Accent: string
+      Enabled: bool
+      SortOrder: int
+      RotationSeconds: int }
+
 type PlayerStateDto =
     { ServerTimeUtc: string
       Stream: StreamStateDto
@@ -160,7 +173,9 @@ type PlayerStateDto =
       DonationGoal: DonationGoalDto
       SuperChat: SuperChatStateDto
       Socials: SocialLinkDto list
-      Overlay: OverlaySettingsDto }
+      Overlay: OverlaySettingsDto
+      Banners: BannerDto list
+      PlaybackState: string }
 
 type StreamHealthDto =
     { Status: string
@@ -205,7 +220,8 @@ type AdminTrackDto =
       DurationMs: int
       HasCachedFile: bool
       CoverImageUrl: string
-      MetadataSource: string }
+      MetadataSource: string
+      StorageBackendId: string }
 
 type AdminTrackPageDto =
     { Items: AdminTrackDto list

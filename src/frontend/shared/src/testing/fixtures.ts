@@ -81,6 +81,22 @@ export function validPlayerState(): PlayerState {
       },
     ],
     overlay: { style: 'aero', layout: 'corners' },
+    banners: [
+      {
+        id: '01920000-0000-7000-8000-0000000000b1',
+        type: 'nowplaying',
+        title: 'NOW PLAYING',
+        subtitle: '24/7',
+        text: '',
+        style: 'aero',
+        screenPosition: 'top-center',
+        accent: '#e74c3c',
+        enabled: true,
+        sortOrder: 0,
+        rotationSeconds: 0,
+      },
+    ],
+    playbackState: 'playing',
   };
 }
 
@@ -122,5 +138,7 @@ export function emptyPlayerState(): PlayerState {
     superChat: { messages: [] },
     socials: [],
     overlay: { style: 'aero', layout: 'corners' },
+    banners: [],
+    playbackState: 'playing',
   };
 }

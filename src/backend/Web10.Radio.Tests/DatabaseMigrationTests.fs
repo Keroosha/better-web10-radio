@@ -63,6 +63,7 @@ ORDER BY table_name;""",
                       "Payments"
                       "DonationGoals"
                       "SocialLinks"
+                      "Banners"
                       "LibraryScanJobs"
                       "StreamNodeHeartbeats"
                       "AdminUsers"
@@ -134,6 +135,7 @@ VALUES (@ActiveId, 'Active title', 'Active artist', false),
               "Payments"
               "DonationGoals"
               "SocialLinks"
+              "Banners"
               "LibraryScanJobs"
               "StreamNodeHeartbeats"
               "AdminUsers"
@@ -597,6 +599,10 @@ ORDER BY index_class.relname;""",
                           "SayMessages", "SayMessages_Status_check"
                           "SocialLinks", "SocialLinks_Kind_check"
                           "SocialLinks", "SocialLinks_Position_check"
+                          "Banners", "Banners_Type_check"
+                          "Banners", "Banners_Style_check"
+                          "Banners", "Banners_ScreenPosition_check"
+                          "Banners", "Banners_SortOrder_check"
                           "StorageBackends", "StorageBackends_Type_check"
                           "StreamNodeHeartbeats", "StreamNodeHeartbeats_Status_check"
                           "StreamNodeControlState", "CK_StreamNodeControlState_DesiredState"
@@ -642,6 +648,7 @@ ORDER BY index_class.relname;""",
                           "UX_DonationGoals_Active_Singleton", "IsDeleted=falseANDIsActive=true"
                           "IX_SocialLinks_Active_Position", "IsDeleted=false"
                           "IX_SocialLinks_Active_Featured", "IsDeleted=false"
+                          "IX_Banners_Active_SortOrder", "IsDeleted=false"
                           "IX_LibraryScanJobs_Active_Status_RequestedAtUtc", "IsDeleted=false"
                           "IX_LibraryScanJobs_Active_ClaimLease", "IsDeleted=falseANDStatusIN'Queued','Running'"
                           "IX_StreamNodeHeartbeats_Active_HeartbeatAtUtc", "IsDeleted=false"
@@ -817,7 +824,7 @@ VALUES ('00000000-0000-0000-0000-000000000302', '00000000-0000-0000-0000-0000000
 
                 Assert.That(
                     List.ofSeq versions,
-                    Is.EqualTo(([ 202607080001L; 202607100001L; 202607100002L; 202607100003L; 202607100004L; 202607110001L; 202607110002L; 202607110003L; 202607110004L ] : int64 list) :> obj),
+                    Is.EqualTo(([ 202607080001L; 202607100001L; 202607100002L; 202607100003L; 202607100004L; 202607110001L; 202607110002L; 202607110003L; 202607110004L; 202607120001L; 202607120002L; 202607120003L ] : int64 list) :> obj),
                     "A full down/up cycle must restore every migration in version order."
                 )
             })
@@ -1499,8 +1506,8 @@ VALUES (@Id, 'primary', @DesiredState, @RestartGeneration, false, @Timestamp, @T
                 do!
                     assertPostgresViolation
                         "23514"
-                        "A StreamNodeControlState desired state outside Running|Stopped"
-                        (fun () -> insertControlState (Guid.Parse("00000000-0000-0000-0000-000000000609")) "Paused" 0)
+                        "A StreamNodeControlState desired state outside Running|Paused|Stopped"
+                        (fun () -> insertControlState (Guid.Parse("00000000-0000-0000-0000-000000000609")) "Suspended" 0)
 
                 do!
                     assertPostgresViolation

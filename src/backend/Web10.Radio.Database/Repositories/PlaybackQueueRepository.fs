@@ -1092,6 +1092,45 @@ WHERE "Id" = @QueueItemId AND "IsDeleted" = false AND "Status" = 'Queued';""", c
             (fun connection transaction cancellationToken -> reorderQueuedInTransaction connection transaction queueItemIds nowUtc cancellationToken)
             cancellationToken
 
+    let private removeQueuedItemInTransaction
+        (connection: NpgsqlConnection)
+        (transaction: NpgsqlTransaction)
+        (queueItemId: Guid)
+        (nowUtc: DateTimeOffset)
+        (cancellationToken: CancellationToken)
+        : Task<Result<PlaybackControlOutcome<unit>, RepositoryError>> =
+        taskResult {
+            try
+                do! lockPlaybackControl connection transaction cancellationToken
+                use update = new NpgsqlCommand("""UPDATE "PlaybackQueue"
+SET "IsDeleted" = true, "UpdatedAtUtc" = @UpdatedAtUtc
+WHERE "Id" = @QueueItemId AND "IsDeleted" = false AND "Status" = 'Queued';""", connection, transaction)
+                update.Parameters.AddWithValue("QueueItemId", queueItemId) |> ignore
+                update.Parameters.AddWithValue("UpdatedAtUtc", nowUtc) |> ignore
+                let! affected = update.ExecuteNonQueryAsync(cancellationToken)
+                if affected = 1 then
+                    return PlaybackControlOutcome.Applied()
+                else
+                    use existing = new NpgsqlCommand("""SELECT "Status" FROM "PlaybackQueue" WHERE "Id" = @QueueItemId AND "IsDeleted" = false;""", connection, transaction)
+                    existing.Parameters.AddWithValue("QueueItemId", queueItemId) |> ignore
+                    let! status = existing.ExecuteScalarAsync(cancellationToken)
+                    if isNull status then return PlaybackControlOutcome.NotFound
+                    else return PlaybackControlOutcome.Conflict
+            with ex ->
+                return! Error(databaseError "PlaybackQueueRepository.removeQueuedItemInTransaction" ex)
+        }
+
+    let removeQueuedItem
+        (dataSource: NpgsqlDataSource)
+        (queueItemId: Guid)
+        (nowUtc: DateTimeOffset)
+        (cancellationToken: CancellationToken)
+        : Task<Result<PlaybackControlOutcome<unit>, RepositoryError>> =
+        DatabaseSession.withTransactionResult
+            dataSource
+            (fun connection transaction cancellationToken -> removeQueuedItemInTransaction connection transaction queueItemId nowUtc cancellationToken)
+            cancellationToken
+
     let skipCurrent
         (dataSource: NpgsqlDataSource)
         (nowUtc: DateTimeOffset)

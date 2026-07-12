@@ -34,7 +34,6 @@ describe('StagePage', () => {
     expect(screen.getByText('OFFLINE')).toBeTruthy();
     expect(screen.getByText('DONATION GOAL')).toBeTruthy();
     expect(screen.getByText('SUPER CHAT')).toBeTruthy();
-    expect(screen.getByText('Пока тихо…')).toBeTruthy();
     // FOLLOW US hides itself when there are no socials.
     expect(screen.queryByText('FOLLOW US')).toBeNull();
   });

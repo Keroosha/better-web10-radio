@@ -5,7 +5,13 @@
 // `z.infer`, never asserted from unvalidated JSON.
 import { z } from 'zod';
 
-import { SocialKindSchema, StreamStatusSchema, SuperChatStatusSchema } from './enums';
+import {
+  BannerPositionSchema,
+  BannerStyleSchema,
+  BannerTypeSchema,
+  SocialKindSchema,
+  StreamStatusSchema,
+} from './enums';
 
 const UuidSchema = z.string();
 const NonNegativeIntegerSchema = z.number().int().nonnegative();
@@ -56,6 +62,7 @@ export const AdminTrackSchema = z.strictObject({
   hasCachedFile: z.boolean(),
   coverImageUrl: z.string(),
   metadataSource: z.enum(['filename', 'embedded', 'manual']),
+  storageBackendId: z.string(),
 });
 export type AdminTrack = z.infer<typeof AdminTrackSchema>;
 export const AdminTrackPageSchema = z.strictObject({
@@ -126,6 +133,23 @@ export type SocialLinkReplaceItem = z.infer<typeof SocialLinkReplaceItemSchema>;
 
 export const SocialLinksReplaceRequestSchema = z.array(SocialLinkReplaceItemSchema);
 export type SocialLinksReplaceRequest = z.infer<typeof SocialLinksReplaceRequestSchema>;
+
+export const BannerReplaceItemSchema = z.strictObject({
+  id: UuidSchema.nullable(),
+  type: BannerTypeSchema,
+  title: z.string(),
+  subtitle: z.string().nullable(),
+  text: z.string().nullable(),
+  style: BannerStyleSchema,
+  screenPosition: BannerPositionSchema,
+  accent: z.string().nullable(),
+  enabled: z.boolean(),
+  rotationSeconds: z.number().int().min(2).max(120).nullable(),
+});
+export type BannerReplaceItem = z.infer<typeof BannerReplaceItemSchema>;
+
+export const BannersReplaceRequestSchema = z.array(BannerReplaceItemSchema);
+export type BannersReplaceRequest = z.infer<typeof BannersReplaceRequestSchema>;
 
 export const PlaylistTypeSchema = z.enum(['general', 'oncePerSongs', 'oncePerMinutes', 'oncePerHour']);
 export type PlaylistType = z.infer<typeof PlaylistTypeSchema>;
@@ -312,11 +336,6 @@ export const StorageReplaceRequestSchema = z.strictObject({
 });
 export type StorageReplaceRequest = z.infer<typeof StorageReplaceRequestSchema>;
 
-export const StreamNodeControlSchema = z.strictObject({
-  desiredState: z.enum(['running', 'stopped']),
-  restartGeneration: NonNegativeIntegerSchema,
-});
-export type StreamNodeControl = z.infer<typeof StreamNodeControlSchema>;
 export const PlaybackCommandSchema = z.strictObject({
   generation: NonNegativeIntegerSchema,
   action: z.enum(['skip', 'restart']),
@@ -326,8 +345,19 @@ export const PlaybackCommandSchema = z.strictObject({
 });
 export type PlaybackCommand = z.infer<typeof PlaybackCommandSchema>;
 
+// The admin control response reuses the stream-node control DTO, which also carries
+// the batched playback commands + next generation. Those are irrelevant to the admin
+// UI, so they are optional here while `desiredState`/`restartGeneration` are required.
+export const StreamNodeControlSchema = z.strictObject({
+  desiredState: z.enum(['running', 'paused', 'stopped']),
+  restartGeneration: NonNegativeIntegerSchema,
+  playbackCommands: z.array(PlaybackCommandSchema).optional(),
+  nextPlaybackGeneration: NonNegativeIntegerSchema.optional(),
+});
+export type StreamNodeControl = z.infer<typeof StreamNodeControlSchema>;
+
 export const StreamNodePlaybackControlSchema = z.strictObject({
-  desiredState: z.enum(['running', 'stopped']),
+  desiredState: z.enum(['running', 'paused', 'stopped']),
   restartGeneration: NonNegativeIntegerSchema,
   playbackCommands: z.array(PlaybackCommandSchema),
   nextPlaybackGeneration: NonNegativeIntegerSchema,
@@ -342,7 +372,7 @@ export type PlaybackControlQuery = z.infer<typeof PlaybackControlQuerySchema>;
 
 export const StreamNodeStatusSchema = z.strictObject({
   status: StreamStatusSchema,
-  desiredState: z.enum(['running', 'stopped']),
+  desiredState: z.enum(['running', 'paused', 'stopped']),
   lastHeartbeatUtc: z.string().nullable(),
   failureReason: z.string().nullable(),
   bitrateKbps: NonNegativeIntegerSchema,
@@ -361,19 +391,3 @@ export const PaidVerticalSliceFixtureSchema = z.strictObject({
   sayMessageId: UuidSchema,
 });
 export type PaidVerticalSliceFixture = z.infer<typeof PaidVerticalSliceFixtureSchema>;
-
-/** `AdminSayMessageDto` — paid `/say` moderation row. */
-export const AdminSayMessageSchema = z.strictObject({
-  id: UuidSchema,
-  telegramUserId: z.number().nullable(),
-  displayName: z.string(),
-  text: z.string(),
-  amountStars: z.number().int(),
-  color: z.string().nullable(),
-  status: SuperChatStatusSchema,
-  submittedAtUtc: z.string().nullable(),
-  paidAtUtc: z.string().nullable(),
-  moderatedAtUtc: z.string().nullable(),
-  moderationReason: z.string().nullable(),
-});
-export type AdminSayMessage = z.infer<typeof AdminSayMessageSchema>;

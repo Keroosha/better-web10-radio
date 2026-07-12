@@ -16,9 +16,13 @@
 import { z } from 'zod';
 
 import {
+  BannerPositionSchema,
+  BannerStyleSchema,
+  BannerTypeSchema,
   NowPlayingSourceSchema,
   OverlayLayoutSchema,
   OverlayStyleSchema,
+  PlaybackStateSchema,
   QueueItemSourceSchema,
   QueueItemStatusSchema,
   SocialKindSchema,
@@ -135,6 +139,22 @@ export const OverlaySettingsSchema = z.object({
 });
 export type OverlaySettings = z.infer<typeof OverlaySettingsSchema>;
 
+/** `state.banners[]` — admin-managed overlay banners rendered on the stage. */
+export const BannerSchema = z.object({
+  id: z.string(),
+  type: BannerTypeSchema,
+  title: z.string(),
+  subtitle: z.string(),
+  text: z.string(),
+  style: BannerStyleSchema,
+  screenPosition: BannerPositionSchema,
+  accent: z.string(),
+  enabled: z.boolean(),
+  sortOrder: z.number().int(),
+  rotationSeconds: z.number().int(),
+});
+export type Banner = z.infer<typeof BannerSchema>;
+
 /**
  * `GET /api/v0/player/state` full snapshot — SPEC §5.
  * Also the payload of the `player.state` SSE event.
@@ -148,5 +168,7 @@ export const PlayerStateSchema = z.object({
   superChat: SuperChatStateSchema,
   socials: z.array(SocialLinkSchema),
   overlay: OverlaySettingsSchema,
+  banners: z.array(BannerSchema),
+  playbackState: PlaybackStateSchema,
 });
 export type PlayerState = z.infer<typeof PlayerStateSchema>;

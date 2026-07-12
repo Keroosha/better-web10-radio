@@ -8,6 +8,7 @@ open Web10.Radio.Database
 
 type StreamNodeDesiredState =
     | Running
+    | Paused
     | Stopped
 
 type StreamNodeControlState =
@@ -29,10 +30,12 @@ module StreamNodeControlRepository =
 
     let private stateToDatabase = function
         | Running -> "Running"
+        | Paused -> "Paused"
         | Stopped -> "Stopped"
 
     let private stateFromDatabase = function
         | "Running" -> Ok Running
+        | "Paused" -> Ok Paused
         | "Stopped" -> Ok Stopped
         | value -> Error(DatabaseError("StreamNodeControlRepository.read", sprintf "Unexpected desired state '%s'." value))
 

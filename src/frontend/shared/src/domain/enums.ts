@@ -57,3 +57,26 @@ export type OverlayStyle = z.infer<typeof OverlayStyleSchema>;
 /** `overlay.layout` — SPEC §5. */
 export const OverlayLayoutSchema = z.enum(['corners', 'sidebar', 'bottombar']);
 export type OverlayLayout = z.infer<typeof OverlayLayoutSchema>;
+
+/** `banners[].type` — the overlay banner kind rendered on the stage. */
+export const BannerTypeSchema = z.enum(['nowplaying', 'donation', 'social', 'custom']);
+export type BannerType = z.infer<typeof BannerTypeSchema>;
+
+/** `banners[].style` — banner chrome theme; mirrors {@link OverlayStyleSchema}. */
+export const BannerStyleSchema = z.enum(['aero', 'win9x']);
+export type BannerStyle = z.infer<typeof BannerStyleSchema>;
+
+/** `banners[].screenPosition` — where the banner renders over the 3D scene. */
+export const BannerPositionSchema = z.enum([
+  'top-left',
+  'top-center',
+  'top-right',
+  'bottom-left',
+  'bottom-center',
+  'bottom-right',
+]);
+export type BannerPosition = z.infer<typeof BannerPositionSchema>;
+
+/** `playbackState` — the desired playback transport state surfaced on the player snapshot. */
+export const PlaybackStateSchema = z.enum(['playing', 'paused', 'stopped']);
+export type PlaybackState = z.infer<typeof PlaybackStateSchema>;

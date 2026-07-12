@@ -27,6 +27,7 @@ module DomainEventTests =
           "StreamNodeFailureDetected"
           "AdminGoalChanged"
           "SocialLinkChanged"
+          "BannerChanged"
           "PlaybackReordered"
           "PlaybackSkipped"
           "PlaybackRestarted"

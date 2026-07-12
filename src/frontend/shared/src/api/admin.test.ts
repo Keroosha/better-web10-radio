@@ -1,29 +1,30 @@
 import { afterEach, describe, expect, test, vi } from 'vitest';
 
 import {
-  approveSayMessage,
   clearAdminSession,
   createLibraryScan,
   createPaidVerticalSliceFixture,
   createPlaylist,
   createPlaylistItem,
   getAdminSession,
+  getBanners,
   getDonationGoal,
   getLibraryScan,
   getPlaylistItems,
   getPlaylists,
-  getSayMessages,
   getSocialLinks,
   getStorage,
   getStreamNodeStatus,
   getTracksPage,
   loginAdmin,
   logoutAdmin,
+  pauseStreamNode,
   playNow,
   queueTrack,
+  removeQueueItem,
   removeTrackCover,
   reorderQueue,
-  rejectSayMessage,
+  replaceBanners,
   replacePlaylist,
   replacePlaylistItems,
   replaceSocialLinks,
@@ -37,7 +38,7 @@ import {
   stopStreamNode,
   updateDonationGoal,
   updateTrackMetadata,
-  type AdminSayMessage,
+  type BannersReplaceRequest,
   type FetchImpl,
   type SocialLinksReplaceRequest,
   type StorageReplaceRequest,
@@ -97,6 +98,20 @@ const track = {
   hasCachedFile: true,
   coverImageUrl: '',
   metadataSource: 'filename' as const,
+  storageBackendId: '',
+};
+const banner = {
+  id,
+  type: 'social' as const,
+  title: 'FOLLOW US',
+  subtitle: '@web1.radio',
+  text: '',
+  style: 'aero' as const,
+  screenPosition: 'bottom-right' as const,
+  accent: '#c0392b',
+  enabled: true,
+  sortOrder: 0,
+  rotationSeconds: 5,
 };
 const playlistPolicy = {
   type: 'general' as const,
@@ -160,19 +175,6 @@ const paidFixture = {
   donationPaymentId: id,
   sayPaymentId: otherId,
   sayMessageId: '0197f0a3-0000-7000-8000-000000000000',
-};
-const pendingSayMessage: AdminSayMessage = {
-  id: 'msg-1',
-  telegramUserId: 7,
-  displayName: 'CyberDove',
-  text: 'hi',
-  amountStars: 50,
-  color: '#33ccff',
-  status: 'pending',
-  submittedAtUtc: '2026-07-10T12:00:00Z',
-  paidAtUtc: '2026-07-10T12:00:05Z',
-  moderatedAtUtc: null,
-  moderationReason: null,
 };
 afterEach(() => {
   clearAdminSession?.();
@@ -363,6 +365,15 @@ describe('library and playback routes', () => {
     expect(request.requestInit()?.method).toBe('POST');
     expect(request.requestInit()?.body).toBe(JSON.stringify({ trackId: id }));
   });
+
+  test('removes a queued item with a DELETE to the per-item path', async () => {
+    const request = capturingFetch({ queueItemId: id }, 200);
+
+    await removeQueueItem(id, { fetchImpl: request.fetchImpl });
+
+    expect(request.requestUrl()).toBe(`/api/v0/admin/playback/queue/${id}`);
+    expect(request.requestInit()?.method).toBe('DELETE');
+  });
 });
 
 describe('donation and social routes', () => {
@@ -547,6 +558,7 @@ describe('storage and stream-node routes', () => {
 
   test.each([
     ['start', startStreamNode],
+    ['pause', pauseStreamNode],
     ['stop', stopStreamNode],
     ['restart', restartStreamNode],
   ])('posts exact empty JSON to stream-node %s and validates accepted control', async (action, call) => {
@@ -561,7 +573,42 @@ describe('storage and stream-node routes', () => {
   });
 });
 
-describe('paid fixture and say moderation routes', () => {
+describe('banner and paid fixture routes', () => {
+  test('reads the banner list through the banner array schema', async () => {
+    const request = capturingFetch([banner]);
+
+    const banners = await getBanners({ fetchImpl: request.fetchImpl });
+
+    expect(banners[0]?.type).toBe('social');
+    expect(request.requestUrl()).toBe('/api/v0/admin/banners');
+    expect(request.requestInit()?.method).toBe('GET');
+  });
+
+  test('replaces the banner set with a PUT of the full array', async () => {
+    const request = capturingFetch([banner]);
+    const body: BannersReplaceRequest = [
+      {
+        id: null,
+        type: 'custom',
+        title: 'Giveaway',
+        subtitle: null,
+        text: 'Type /join',
+        style: 'win9x',
+        screenPosition: 'bottom-center',
+        accent: null,
+        enabled: false,
+        rotationSeconds: null,
+      },
+    ];
+
+    const banners = await replaceBanners(body, { fetchImpl: request.fetchImpl });
+
+    expect(banners).toHaveLength(1);
+    expect(request.requestUrl()).toBe('/api/v0/admin/banners');
+    expect(request.requestInit()?.method).toBe('PUT');
+    expect(request.requestInit()?.body).toBe(JSON.stringify(body));
+  });
+
   test('posts an exact fixture key and validates all returned payment/message identifiers', async () => {
     const request = capturingFetch(paidFixture);
 
@@ -574,49 +621,5 @@ describe('paid fixture and say moderation routes', () => {
     expect(request.requestUrl()).toBe('/api/v0/admin/dev/fixtures/paid-vertical-slice');
     expect(request.requestInit()?.method).toBe('POST');
     expect(request.requestInit()?.body).toBe(JSON.stringify({ fixtureKey: 'demo-fixture' }));
-  });
-
-  test('queries moderated messages by the requested lowercase status', async () => {
-    const request = capturingFetch([pendingSayMessage]);
-
-    const messages = await getSayMessages('pending', { fetchImpl: request.fetchImpl });
-
-    expect(messages[0]?.status).toBe('pending');
-    expect(request.requestUrl()).toBe('/api/v0/admin/say-messages?status=pending');
-    expect(request.requestInit()?.method).toBe('GET');
-  });
-
-  test('approves a say message with exact empty JSON and resolves on 204', async () => {
-    setAdminSession(session);
-    let url: string | undefined;
-    let init: RequestInit | undefined;
-    const fetchImpl: FetchImpl = vi.fn((requestUrl, requestInit) => {
-      url = requestUrl;
-      init = requestInit;
-      return Promise.resolve(noContentResponse());
-    });
-
-    await expect(approveSayMessage('msg-1', { fetchImpl })).resolves.toBeUndefined();
-
-    expect(url).toBe('/api/v0/admin/say-messages/msg-1/approve');
-    expect(init?.method).toBe('POST');
-    expect(init?.body).toBe('{}');
-  });
-
-  test('rejects a say message with the exact reason body and resolves on 204', async () => {
-    setAdminSession(session);
-    let url: string | undefined;
-    let init: RequestInit | undefined;
-    const fetchImpl: FetchImpl = vi.fn((requestUrl, requestInit) => {
-      url = requestUrl;
-      init = requestInit;
-      return Promise.resolve(noContentResponse());
-    });
-
-    await expect(rejectSayMessage('msg-1', 'off-topic', { fetchImpl })).resolves.toBeUndefined();
-
-    expect(url).toBe('/api/v0/admin/say-messages/msg-1/reject');
-    expect(init?.method).toBe('POST');
-    expect(init?.body).toBe(JSON.stringify({ reason: 'off-topic' }));
   });
 });

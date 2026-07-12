@@ -12,6 +12,8 @@ interface DonationGoalWidgetProps {
   readonly theme: StageTheme;
   /** `{...theme.win, ...layout.donation}`. */
   readonly windowStyle: CSSProperties;
+  /** Title-bar caption; defaults to `DONATION GOAL` when the banner omits it. */
+  readonly title?: string;
 }
 
 const vt323: CSSProperties = { fontFamily: "'VT323',monospace", lineHeight: 1 };
@@ -26,11 +28,12 @@ export function DonationGoalWidget({
   percent,
   theme,
   windowStyle,
+  title,
 }: DonationGoalWidgetProps): ReactElement {
   const { topDonator, raisedStars, goalStars, recent } = donationGoal;
 
   return (
-    <OverlayWindow title="DONATION GOAL" theme={theme} windowStyle={windowStyle}>
+    <OverlayWindow title={title ?? 'DONATION GOAL'} theme={theme} windowStyle={windowStyle}>
       <div
         style={{
           display: 'flex',

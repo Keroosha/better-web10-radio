@@ -188,9 +188,11 @@ export function AdminAuthGate({ children }: AdminAuthGateProps): ReactElement {
               />
             </div>
             {serverError !== null && (
-              <p role="alert" className="admin-error">
-                {serverError}
-              </p>
+              <div role="alert" style={{ alignSelf: 'stretch' }}>
+                <div role="tooltip" className="admin-error">
+                  {serverError}
+                </div>
+              </div>
             )}
             <button type="submit" className="default" disabled={isSubmitting} style={{ alignSelf: 'flex-start' }}>
               {isSubmitting ? 'Signing in…' : 'Sign in'}

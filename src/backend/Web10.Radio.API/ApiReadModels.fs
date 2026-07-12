@@ -261,6 +261,18 @@ WHERE "IsDeleted" = false
 ORDER BY "Position" ASC, "CreatedAtUtc" ASC;"""
 
     [<Literal>]
+    let private bannersSql = """SELECT "Id", "Type", "Title", "Subtitle", "Text", "Style", "ScreenPosition", "Accent", "Enabled", "SortOrder", "RotationSeconds"
+FROM "Banners"
+WHERE "IsDeleted" = false
+ORDER BY "SortOrder" ASC, "CreatedAtUtc" ASC;"""
+
+    [<Literal>]
+    let private playbackStateSql = """SELECT "DesiredState"
+FROM "StreamNodeControlState"
+WHERE "SingletonKey" = 'primary' AND "IsDeleted" = false
+LIMIT 1;"""
+
+    [<Literal>]
     let private streamFileSql = """SELECT tf."CachePath", COALESCE(tf."ContentType", 'audio/mpeg')
 FROM "PlaybackQueue" q
 INNER JOIN "Tracks" t ON t."Id" = q."TrackId" AND t."IsDeleted" = false
@@ -375,6 +387,9 @@ LIMIT 1;"""
                 let startedAtUtc = readNullableDateTimeOffset reader 8
                 let startedForContract = startedAtUtc |> Option.defaultValue nowUtc
                 let source = mapNowPlayingSource hasTrack (reader.GetString(7))
+                let durationMs = readNullableInt32 reader 6 |> Option.defaultValue 0
+                let elapsedMs = startedAtUtc |> Option.map (fun started -> positiveMillisecondsBetween started nowUtc) |> Option.defaultValue 0
+                let positionMs = if durationMs > 0 then min elapsedMs durationMs else elapsedMs
 
                 return
                     { TrackId = if hasTrack then reader.GetGuid(1).ToString("D") else "01920000-0000-7000-8000-0000000000ff"
@@ -384,8 +399,8 @@ LIMIT 1;"""
                       Source = source
                       ExternalUrl = readStringOrEmpty reader 9
                       CoverImageUrl = readStringOrEmpty reader 5
-                      DurationMs = readNullableInt32 reader 6 |> Option.defaultValue 0
-                      PositionMs = startedAtUtc |> Option.map (fun started -> positiveMillisecondsBetween started nowUtc) |> Option.defaultValue 0
+                      DurationMs = durationMs
+                      PositionMs = positionMs
                       StartedAtUtc = ApiTime.toIsoUtc startedForContract }
         }
 
@@ -540,6 +555,50 @@ LIMIT 1;"""
             return List.ofSeq socials
         }
 
+    let private loadBannersFromConnection (connection: NpgsqlConnection) (cancellationToken: CancellationToken) =
+        task {
+            use command = new NpgsqlCommand(bannersSql, connection)
+            let! reader = command.ExecuteReaderAsync(cancellationToken)
+            use reader = reader
+            let banners = ResizeArray<BannerDto>()
+            let mutable keepReading = true
+
+            while keepReading do
+                let! hasRow = reader.ReadAsync(cancellationToken)
+
+                if hasRow then
+                    banners.Add
+                        { Id = reader.GetGuid(0).ToString("D")
+                          Type = reader.GetString(1)
+                          Title = reader.GetString(2)
+                          Subtitle = readStringOrEmpty reader 3
+                          Text = readStringOrEmpty reader 4
+                          Style = reader.GetString(5)
+                          ScreenPosition = reader.GetString(6)
+                          Accent = readStringOrEmpty reader 7
+                          Enabled = reader.GetBoolean(8)
+                          SortOrder = reader.GetInt32(9)
+                          RotationSeconds = if reader.IsDBNull(10) then 0 else reader.GetInt32(10) }
+                else
+                    keepReading <- false
+
+            return List.ofSeq banners
+        }
+
+    let private loadPlaybackStateFromConnection (connection: NpgsqlConnection) (cancellationToken: CancellationToken) =
+        task {
+            use command = new NpgsqlCommand(playbackStateSql, connection)
+            let! value = command.ExecuteScalarAsync(cancellationToken)
+            return
+                match value with
+                | :? string as desired ->
+                    match desired with
+                    | "Paused" -> "paused"
+                    | "Stopped" -> "stopped"
+                    | _ -> "playing"
+                | _ -> "playing"
+        }
+
     let loadSnapshot (dataSource: NpgsqlDataSource) (timeProvider: TimeProvider) (cancellationToken: CancellationToken) : Task<Result<PlayerStateDto, RepositoryError>> =
         task {
             try
@@ -550,6 +609,8 @@ LIMIT 1;"""
                 let! donationGoal = loadDonationGoalFromConnection connection cancellationToken
                 let! superChat = loadSuperChatFromConnection connection cancellationToken
                 let! socials = loadSocialsFromConnection connection cancellationToken
+                let! banners = loadBannersFromConnection connection cancellationToken
+                let! playbackState = loadPlaybackStateFromConnection connection cancellationToken
                 let! queue = loadQueueFromConnection connection cancellationToken
 
                 return
@@ -561,7 +622,9 @@ LIMIT 1;"""
                           DonationGoal = donationGoal
                           SuperChat = superChat
                           Socials = socials
-                          Overlay = overlayDefaults }
+                          Overlay = overlayDefaults
+                          Banners = banners
+                          PlaybackState = playbackState }
             with ex ->
                 return Error(databaseError "PlayerStateReadModel.loadSnapshot" ex)
         }

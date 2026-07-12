@@ -53,6 +53,31 @@ type SocialLinkReplacement =
       QrImageUrl: string option
       IsFeatured: bool }
 
+type Banner =
+    { Id: Guid
+      Type: string
+      Title: string
+      Subtitle: string
+      Text: string
+      Style: string
+      ScreenPosition: string
+      Accent: string
+      Enabled: bool
+      SortOrder: int
+      RotationSeconds: int }
+
+type BannerReplacement =
+    { Id: Guid
+      Type: string
+      Title: string
+      Subtitle: string option
+      Text: string option
+      Style: string
+      ScreenPosition: string
+      Accent: string option
+      Enabled: bool
+      RotationSeconds: int option }
+
 type AdminTrack =
     { Id: Guid
       Title: string
@@ -61,7 +86,8 @@ type AdminTrack =
       DurationMs: int
       HasCachedFile: bool
       CoverImageUrl: string
-      MetadataSource: string }
+      MetadataSource: string
+      StorageBackendId: Guid option }
 
 type AdminTrackPage =
     { Items: AdminTrack list
@@ -231,7 +257,8 @@ module AdminContentRepository =
           DurationMs = if reader.IsDBNull(4) then 0 else reader.GetInt32(4)
           HasCachedFile = reader.GetBoolean(5)
           CoverImageUrl = if reader.IsDBNull(6) then "" else reader.GetString(6)
-          MetadataSource = if reader.IsDBNull(7) then "Filename" else reader.GetString(7) }
+          MetadataSource = if reader.IsDBNull(7) then "Filename" else reader.GetString(7)
+          StorageBackendId = if reader.IsDBNull(8) then None else Some(reader.GetGuid(8)) }
 
     [<Literal>]
     let private adminTrackByIdSql = """SELECT track."Id", track."Title", track."Artist", track."Album", track."DurationMs",
@@ -241,7 +268,8 @@ module AdminContentRepository =
            WHEN cover."Sha256" IS NOT NULL THEN '/api/v0/player/assets/cover/' || track."Id"::text || '?v=' || cover."Sha256"
            ELSE ''
        END,
-       track."MetadataSource"
+       track."MetadataSource",
+       (SELECT file."StorageBackendId" FROM "TrackFiles" AS file WHERE file."TrackId" = track."Id" AND file."IsDeleted" = false AND file."StorageBackendId" IS NOT NULL LIMIT 1)
 FROM "Tracks" AS track
 LEFT JOIN LATERAL (
     SELECT asset."Source", asset."ExternalUrl", asset."Sha256"
@@ -519,11 +547,100 @@ FROM "SocialLinks" WHERE "IsDeleted" = false ORDER BY "Position" ASC, "Id" ASC;"
                     })
                 cancellationToken
 
+    let private readBanner (reader: NpgsqlDataReader) =
+        { Id = reader.GetGuid(0)
+          Type = reader.GetString(1)
+          Title = reader.GetString(2)
+          Subtitle = if reader.IsDBNull(3) then "" else reader.GetString(3)
+          Text = if reader.IsDBNull(4) then "" else reader.GetString(4)
+          Style = reader.GetString(5)
+          ScreenPosition = reader.GetString(6)
+          Accent = if reader.IsDBNull(7) then "" else reader.GetString(7)
+          Enabled = reader.GetBoolean(8)
+          SortOrder = reader.GetInt32(9)
+          RotationSeconds = if reader.IsDBNull(10) then 0 else reader.GetInt32(10) }
+
+    [<Literal>]
+    let private bannerSelectSql = """SELECT "Id", "Type", "Title", "Subtitle", "Text", "Style", "ScreenPosition", "Accent", "Enabled", "SortOrder", "RotationSeconds"
+FROM "Banners" WHERE "IsDeleted" = false ORDER BY "SortOrder" ASC, "Id" ASC;"""
+
+    let listBanners (dataSource: NpgsqlDataSource) (cancellationToken: CancellationToken) : Task<Result<Banner list, RepositoryError>> =
+        task {
+            try
+                use! connection = dataSource.OpenConnectionAsync(cancellationToken)
+                use command = new NpgsqlCommand(bannerSelectSql, connection)
+                use! reader = command.ExecuteReaderAsync(cancellationToken)
+                let! values = readAll reader readBanner cancellationToken
+                return Ok values
+            with
+            | :? OperationCanceledException as ex when cancellationToken.IsCancellationRequested -> return raise ex
+            | ex -> return Error(databaseError "AdminContentRepository.listBanners" ex)
+        }
+
+    let replaceBanners
+        (dataSource: NpgsqlDataSource)
+        (banners: BannerReplacement list)
+        (updatedAtUtc: DateTimeOffset)
+        (cancellationToken: CancellationToken)
+        : Task<Result<AdminContentMutation<Banner list>, RepositoryError>> =
+        if banners |> List.map _.Id |> Set.ofList |> Set.count <> List.length banners then
+            Task.FromResult(Ok AdminContentMutation.Conflict)
+        else
+            DatabaseSession.withTransactionResult
+                dataSource
+                (fun connection transaction token ->
+                    task {
+                        try
+                            let mutable missing = false
+                            for banner in banners do
+                                let! exists = lookupLiveId "Banners" banner.Id connection transaction token
+                                if not exists then
+                                    use historical = new NpgsqlCommand("SELECT 1 FROM \"Banners\" WHERE \"Id\" = @Id;", connection, transaction)
+                                    historical.Parameters.AddWithValue("Id", banner.Id) |> ignore
+                                    let! known = historical.ExecuteScalarAsync(token)
+                                    if not (isNull known) then missing <- true
+                            if missing then return Ok AdminContentMutation.NotFound
+                            else
+                                for (position, banner) in banners |> List.indexed do
+                                    use command = new NpgsqlCommand("""INSERT INTO "Banners" ("Id", "Type", "Title", "Subtitle", "Text", "Style", "ScreenPosition", "Accent", "Enabled", "SortOrder", "RotationSeconds", "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc")
+VALUES (@Id, @Type, @Title, @Subtitle, @Text, @Style, @ScreenPosition, @Accent, @Enabled, @SortOrder, @RotationSeconds, false, @UpdatedAtUtc, @UpdatedAtUtc)
+ON CONFLICT ("Id") DO UPDATE SET "Type" = EXCLUDED."Type", "Title" = EXCLUDED."Title", "Subtitle" = EXCLUDED."Subtitle", "Text" = EXCLUDED."Text", "Style" = EXCLUDED."Style", "ScreenPosition" = EXCLUDED."ScreenPosition", "Accent" = EXCLUDED."Accent", "Enabled" = EXCLUDED."Enabled", "SortOrder" = EXCLUDED."SortOrder", "RotationSeconds" = EXCLUDED."RotationSeconds", "IsDeleted" = false, "UpdatedAtUtc" = EXCLUDED."UpdatedAtUtc";""", connection, transaction)
+                                    command.Parameters.AddWithValue("Id", banner.Id) |> ignore
+                                    command.Parameters.AddWithValue("Type", banner.Type) |> ignore
+                                    command.Parameters.AddWithValue("Title", banner.Title) |> ignore
+                                    addNullableText command "Subtitle" banner.Subtitle
+                                    addNullableText command "Text" banner.Text
+                                    command.Parameters.AddWithValue("Style", banner.Style) |> ignore
+                                    command.Parameters.AddWithValue("ScreenPosition", banner.ScreenPosition) |> ignore
+                                    addNullableText command "Accent" banner.Accent
+                                    command.Parameters.AddWithValue("Enabled", banner.Enabled) |> ignore
+                                    command.Parameters.AddWithValue("SortOrder", position) |> ignore
+                                    addNullableInt command "RotationSeconds" banner.RotationSeconds
+                                    command.Parameters.AddWithValue("UpdatedAtUtc", updatedAtUtc) |> ignore
+                                    do! (command.ExecuteNonQueryAsync(token) :> Task)
+                                use deleteOmitted = new NpgsqlCommand("""UPDATE "Banners" SET "IsDeleted" = true, "UpdatedAtUtc" = @UpdatedAtUtc
+WHERE "IsDeleted" = false AND NOT ("Id" = ANY(@Ids));""", connection, transaction)
+                                deleteOmitted.Parameters.AddWithValue("UpdatedAtUtc", updatedAtUtc) |> ignore
+                                deleteOmitted.Parameters.AddWithValue("Ids", NpgsqlDbType.Array ||| NpgsqlDbType.Uuid, banners |> List.map _.Id |> List.toArray) |> ignore
+                                let! _ = deleteOmitted.ExecuteNonQueryAsync(token)
+                                use select = new NpgsqlCommand(bannerSelectSql, connection, transaction)
+                                use! reader = select.ExecuteReaderAsync(token)
+                                let! values = readAll reader readBanner token
+                                return Ok(AdminContentMutation.Applied values)
+                        with
+                        | :? OperationCanceledException as ex when token.IsCancellationRequested -> return raise ex
+                        | :? PostgresException as ex when isUniqueViolation ex -> return Ok AdminContentMutation.Conflict
+                        | :? PostgresException as ex when isForeignKeyViolation ex -> return Ok AdminContentMutation.NotFound
+                        | ex -> return Error(databaseError "AdminContentRepository.replaceBanners" ex)
+                    })
+                cancellationToken
+
     let listActiveTracksPage
         (dataSource: NpgsqlDataSource)
         (query: string)
         (limit: int)
         (cursor: string option)
+        (storageBackendId: Guid option)
         (cancellationToken: CancellationToken)
         : Task<Result<AdminTrackPage, RepositoryError>> =
         task {
@@ -549,7 +666,9 @@ FROM "SocialLinks" WHERE "IsDeleted" = false ORDER BY "Position" ASC, "Id" ASC;"
            WHEN cover."Sha256" IS NOT NULL THEN '/api/v0/player/assets/cover/' || track."Id"::text || '?v=' || cover."Sha256"
            ELSE ''
        END,
-       track."MetadataSource", track."CreatedAtUtc"
+       track."MetadataSource",
+       (SELECT file."StorageBackendId" FROM "TrackFiles" AS file WHERE file."TrackId" = track."Id" AND file."IsDeleted" = false AND file."StorageBackendId" IS NOT NULL LIMIT 1),
+       track."CreatedAtUtc"
 FROM "Tracks" AS track
 LEFT JOIN LATERAL (
     SELECT asset."Source", asset."ExternalUrl", asset."Sha256"
@@ -559,11 +678,19 @@ LEFT JOIN LATERAL (
 ) AS cover ON true
 WHERE track."IsDeleted" = false
   AND (@Query = '' OR track."Title" ILIKE '%' || @Query || '%' OR track."Artist" ILIKE '%' || @Query || '%' OR COALESCE(track."Album", '') ILIKE '%' || @Query || '%')
+  AND (@FilterStorage = false OR EXISTS (SELECT 1 FROM "TrackFiles" AS storageFile WHERE storageFile."TrackId" = track."Id" AND storageFile."IsDeleted" = false AND storageFile."StorageBackendId" = @StorageBackendId))
   AND (@HasCursor = false OR track."CreatedAtUtc" < @CursorCreatedAt OR (track."CreatedAtUtc" = @CursorCreatedAt AND track."Id" > @CursorId))
 ORDER BY track."CreatedAtUtc" DESC, track."Id" ASC
 LIMIT @Limit;""", connection)
                         command.Parameters.AddWithValue("Query", query.Trim()) |> ignore
                         command.Parameters.AddWithValue("Limit", limit + 1) |> ignore
+                        match storageBackendId with
+                        | Some backendId ->
+                            command.Parameters.AddWithValue("FilterStorage", true) |> ignore
+                            command.Parameters.AddWithValue("StorageBackendId", backendId) |> ignore
+                        | None ->
+                            command.Parameters.AddWithValue("FilterStorage", false) |> ignore
+                            command.Parameters.Add("StorageBackendId", NpgsqlDbType.Uuid).Value <- DBNull.Value
                         match decodedCursor with
                         | None ->
                             command.Parameters.AddWithValue("HasCursor", false) |> ignore
@@ -578,7 +705,7 @@ LIMIT @Limit;""", connection)
                         let mutable reading = true
                         while reading do
                             let! found = reader.ReadAsync(cancellationToken)
-                            if found then rows.Add(readAdminTrack reader, reader.GetFieldValue<DateTimeOffset>(8)) else reading <- false
+                            if found then rows.Add(readAdminTrack reader, reader.GetFieldValue<DateTimeOffset>(9)) else reading <- false
                         let hasNext = rows.Count > limit
                         let pageRows = rows |> Seq.truncate limit |> Seq.toList
                         let nextCursor =
@@ -598,7 +725,7 @@ LIMIT @Limit;""", connection)
         (cancellationToken: CancellationToken)
         : Task<Result<AdminTrack list, RepositoryError>> =
         task {
-            let! result = listActiveTracksPage dataSource query limit None cancellationToken
+            let! result = listActiveTracksPage dataSource query limit None None cancellationToken
             return result |> Result.map _.Items
         }
 

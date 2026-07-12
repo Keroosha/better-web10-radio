@@ -28,6 +28,7 @@
     <Compile Include="BackgroundWorkerTests.fs" />
     <Compile Include="ApiContractTests.fs" />
     <Compile Include="AdminRepositoryTests.fs" />
+    <Compile Include="BannerRepositoryTests.fs" />
     <Compile Include="StreamNodeContractTests.fs" />
   </ItemGroup>
 

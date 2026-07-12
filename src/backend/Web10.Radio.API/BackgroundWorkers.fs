@@ -333,6 +333,10 @@ module private PayloadValidation =
                 let! count = requireInt eventType "count" root
                 do! (count >= 0) |> Result.requireTrue (InvalidPayload(eventType, "count must be non-negative."))
                 return ()
+            | BannerChanged ->
+                let! count = requireInt eventType "count" root
+                do! (count >= 0) |> Result.requireTrue (InvalidPayload(eventType, "count must be non-negative."))
+                return ()
             | PlaybackReordered ->
                 do! requireArray eventType "queueItemIds" root
                 return ()
@@ -502,6 +506,7 @@ type DomainEventDispatcher
             | StreamNodeFailureDetected -> dispatchToAgent streamNodeAgent envelope cancellationToken
             | AdminGoalChanged
             | SocialLinkChanged
+            | BannerChanged
             | PlaybackReordered
             | PlaybackSkipped
             | PlaybackRestarted
@@ -1437,24 +1442,36 @@ type PlaybackProgramHostedService
 
     member _.ProcessOneQueueItemAsync(cancellationToken: CancellationToken) : Task<Result<bool, BackgroundWorkerError>> =
         taskResult {
-            let! initiallyClaimed = claimNextQueueItem cancellationToken
+            let! controlState =
+                StreamNodeControlRepository.getOrCreate
+                    dataSource
+                    (Uuid.CreateVersion7().ToGuidBigEndian())
+                    (timeProvider.GetUtcNow())
+                    cancellationToken
+                |> TaskResult.mapError RepositoryError
 
-            if initiallyClaimed then
-                return true
-            else
-                let! enqueued =
-                    PlaybackQueueRepository.enqueueNextActivePlaylistItemIfIdle
-                        dataSource
-                        (Uuid.CreateVersion7().ToGuidBigEndian())
-                        (timeProvider.GetUtcNow())
-                        cancellationToken
-                    |> TaskResult.mapError RepositoryError
+            match controlState.DesiredState with
+            | StreamNodeDesiredState.Paused
+            | StreamNodeDesiredState.Stopped -> return false
+            | StreamNodeDesiredState.Running ->
+                let! initiallyClaimed = claimNextQueueItem cancellationToken
 
-                match enqueued with
-                | Some item -> do! appendPlaylistQueuedEvent item cancellationToken
-                | None -> ()
+                if initiallyClaimed then
+                    return true
+                else
+                    let! enqueued =
+                        PlaybackQueueRepository.enqueueNextActivePlaylistItemIfIdle
+                            dataSource
+                            (Uuid.CreateVersion7().ToGuidBigEndian())
+                            (timeProvider.GetUtcNow())
+                            cancellationToken
+                        |> TaskResult.mapError RepositoryError
 
-                return! claimNextQueueItem cancellationToken
+                    match enqueued with
+                    | Some item -> do! appendPlaylistQueuedEvent item cancellationToken
+                    | None -> ()
+
+                    return! claimNextQueueItem cancellationToken
         }
 
     member _.HandleEventAsync(envelope: DomainEventEnvelope, cancellationToken: CancellationToken) =

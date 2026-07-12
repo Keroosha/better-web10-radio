@@ -15,6 +15,10 @@ export {
   SocialKindSchema,
   OverlayStyleSchema,
   OverlayLayoutSchema,
+  BannerTypeSchema,
+  BannerStyleSchema,
+  BannerPositionSchema,
+  PlaybackStateSchema,
   type StreamStatus,
   type NowPlayingSource,
   type QueueItemSource,
@@ -23,6 +27,10 @@ export {
   type SocialKind,
   type OverlayStyle,
   type OverlayLayout,
+  type BannerType,
+  type BannerStyle,
+  type BannerPosition,
+  type PlaybackState,
 } from './domain/enums';
 
 // Player-state DTOs (schemas + inferred types).
@@ -38,6 +46,7 @@ export {
   SuperChatStateSchema,
   SocialLinkSchema,
   OverlaySettingsSchema,
+  BannerSchema,
   PlayerStateSchema,
   type StreamState,
   type NowPlaying,
@@ -50,6 +59,7 @@ export {
   type SuperChatState,
   type SocialLink,
   type OverlaySettings,
+  type Banner,
   type PlayerState,
 } from './domain/player-state';
 
@@ -76,6 +86,8 @@ export {
   DonationGoalUpdateRequestSchema,
   SocialLinkReplaceItemSchema,
   SocialLinksReplaceRequestSchema,
+  BannerReplaceItemSchema,
+  BannersReplaceRequestSchema,
   PlaylistTypeSchema,
   PlaylistSourceSchema,
   PlaylistOrderSchema,
@@ -95,7 +107,6 @@ export {
   StreamNodeStatusSchema,
   PaidVerticalSliceFixtureRequestSchema,
   PaidVerticalSliceFixtureSchema,
-  AdminSayMessageSchema,
   type AdminSession,
   type LoginAdminRequest,
   type EmptyAdminRequest,
@@ -117,6 +128,8 @@ export {
   type DonationGoalUpdateRequest,
   type SocialLinkReplaceItem,
   type SocialLinksReplaceRequest,
+  type BannerReplaceItem,
+  type BannersReplaceRequest,
   type PlaylistSchedule,
   type PlaylistType,
   type PlaylistSource,
@@ -137,7 +150,6 @@ export {
   type StreamNodeStatus,
   type PaidVerticalSliceFixtureRequest,
   type PaidVerticalSliceFixture,
-  type AdminSayMessage,
 } from './domain/admin';
 
 // Error contract.
@@ -174,6 +186,7 @@ export {
   removeTrackCover,
   queueTrack,
   reorderQueue,
+  removeQueueItem,
   skipCurrent,
   restartCurrent,
   playNow,
@@ -181,6 +194,8 @@ export {
   updateDonationGoal,
   getSocialLinks,
   replaceSocialLinks,
+  getBanners,
+  replaceBanners,
   getPlaylists,
   createPlaylist,
   replacePlaylist,
@@ -191,12 +206,10 @@ export {
   replaceStorage,
   getStreamNodeStatus,
   startStreamNode,
+  pauseStreamNode,
   stopStreamNode,
   restartStreamNode,
   createPaidVerticalSliceFixture,
-  getSayMessages,
-  approveSayMessage,
-  rejectSayMessage,
   type TracksQuery,
   type CoverUploadBody,
 } from './api/admin';

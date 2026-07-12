@@ -128,7 +128,7 @@ type BackendClient(config: RuntimeConfig, ?httpClient: HttpClient) =
         result {
             let! root = Json.objectRoot bytes operation
             let! desired = Json.requiredString "desiredState" operation root
-            do! if desired = "running" || desired = "stopped" then Ok() else Error(BackendError.InvalidResponse operation)
+            do! if desired = "running" || desired = "paused" || desired = "stopped" then Ok() else Error(BackendError.InvalidResponse operation)
             let! restartGeneration = Json.int64 "restartGeneration" operation root
             let! commands =
                 match Json.tryProperty "playbackCommands" root with

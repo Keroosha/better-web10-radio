@@ -28,6 +28,7 @@ type DomainEventType =
     | StreamNodeFailureDetected
     | AdminGoalChanged
     | SocialLinkChanged
+    | BannerChanged
     | PlaybackReordered
     | PlaybackSkipped
     | PlaybackRestarted
@@ -59,6 +60,7 @@ module DomainEventType =
           StreamNodeFailureDetected
           AdminGoalChanged
           SocialLinkChanged
+          BannerChanged
           PlaybackReordered
           PlaybackSkipped
           PlaybackRestarted
@@ -89,6 +91,7 @@ module DomainEventType =
         | StreamNodeFailureDetected -> "StreamNodeFailureDetected"
         | AdminGoalChanged -> "AdminGoalChanged"
         | SocialLinkChanged -> "SocialLinkChanged"
+        | BannerChanged -> "BannerChanged"
         | PlaybackReordered -> "PlaybackReordered"
         | PlaybackSkipped -> "PlaybackSkipped"
         | PlaybackRestarted -> "PlaybackRestarted"
@@ -119,6 +122,7 @@ module DomainEventType =
         | "StreamNodeFailureDetected" -> Some StreamNodeFailureDetected
         | "AdminGoalChanged" -> Some AdminGoalChanged
         | "SocialLinkChanged" -> Some SocialLinkChanged
+        | "BannerChanged" -> Some BannerChanged
         | "PlaybackReordered" -> Some PlaybackReordered
         | "PlaybackSkipped" -> Some PlaybackSkipped
         | "PlaybackRestarted" -> Some PlaybackRestarted
@@ -154,6 +158,7 @@ module DomainEventAudience =
         | StreamNodeFailureDetected
         | AdminGoalChanged
         | SocialLinkChanged
+        | BannerChanged
         | PlaybackReordered
         | PlaybackSkipped
         | PlaybackRestarted

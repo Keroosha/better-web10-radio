@@ -38,5 +38,50 @@ export function createEmptyPlayerState(): PlayerState {
     superChat: { messages: [] },
     socials: [],
     overlay: { style: 'aero', layout: 'corners' },
+    // The default overlay banners the seeded backend always returns, so the
+    // offline/pre-seed baseline still shows NOW PLAYING + DONATION GOAL (+ FOLLOW US
+    // once socials exist), matching the always-on panels the stage had before banners.
+    banners: [
+      {
+        id: '01920000-0000-7000-8000-0000000000d1',
+        type: 'nowplaying',
+        title: 'NOW PLAYING',
+        subtitle: '24/7',
+        text: '',
+        style: 'aero',
+        screenPosition: 'top-center',
+        accent: '#e74c3c',
+        enabled: true,
+        sortOrder: 0,
+        rotationSeconds: 0,
+      },
+      {
+        id: '01920000-0000-7000-8000-0000000000d2',
+        type: 'donation',
+        title: 'DONATION GOAL',
+        subtitle: '',
+        text: '',
+        style: 'aero',
+        screenPosition: 'top-left',
+        accent: '#2ecc71',
+        enabled: true,
+        sortOrder: 1,
+        rotationSeconds: 0,
+      },
+      {
+        id: '01920000-0000-7000-8000-0000000000d3',
+        type: 'social',
+        title: 'FOLLOW US',
+        subtitle: '@web1.radio',
+        text: '',
+        style: 'aero',
+        screenPosition: 'bottom-right',
+        accent: '#c0392b',
+        enabled: true,
+        sortOrder: 2,
+        rotationSeconds: 5,
+      },
+    ],
+    playbackState: 'playing',
   };
 }

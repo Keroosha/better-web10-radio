@@ -563,7 +563,8 @@ module ApiEndpoints =
             match track.MetadataSource with
             | "Embedded" -> "embedded"
             | "Manual" -> "manual"
-            | _ -> "filename" }
+            | _ -> "filename"
+          StorageBackendId = track.StorageBackendId |> Option.map (fun id -> id.ToString("D")) |> Option.defaultValue "" }
 
     let private playlistTypeDto = function
         | PlaylistType.General -> "general"
@@ -615,8 +616,21 @@ module ApiEndpoints =
           Artist = item.Artist
           Position = max 0 item.Position }
 
+    let private toBannerDto (banner: Banner) : BannerDto =
+        { Id = banner.Id.ToString("D")
+          Type = banner.Type
+          Title = banner.Title
+          Subtitle = banner.Subtitle
+          Text = banner.Text
+          Style = banner.Style
+          ScreenPosition = banner.ScreenPosition
+          Accent = banner.Accent
+          Enabled = banner.Enabled
+          SortOrder = banner.SortOrder
+          RotationSeconds = banner.RotationSeconds }
+
     let private toControlDto (state: StreamNodeControlState) (commands: StreamNodePlaybackCommandDto list) (nextPlaybackGeneration: int64) : StreamNodeControlDto =
-        { DesiredState = match state.DesiredState with | Running -> "running" | Stopped -> "stopped"
+        { DesiredState = match state.DesiredState with | Running -> "running" | Paused -> "paused" | Stopped -> "stopped"
           RestartGeneration = max 0 state.RestartGeneration
           PlaybackCommands = commands
           NextPlaybackGeneration = nextPlaybackGeneration }
@@ -626,6 +640,8 @@ module ApiEndpoints =
         && (root.EnumerateObject() |> Seq.isEmpty)
     [<Literal>]
     let PlaybackCallbackMaxBodyBytes = 4096
+
+    let SocialLinksMaxBodyBytes = 8 * 1024 * 1024
 
     let private parsePlaybackCallback requireOutcome (buffer: byte array) length =
         try
@@ -820,6 +836,20 @@ module ApiEndpoints =
             match result with
             | Ok donationGoal ->
                 do! writeOk context donationGoal
+                return StatusCodes.Status200OK
+            | Error _ ->
+                do! repositoryReadFailed context
+                return StatusCodes.Status500InternalServerError
+        }
+
+    let private adminBanners (context: HttpContext) =
+        task {
+            let dataSource = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+            let! result = AdminContentRepository.listBanners dataSource context.RequestAborted
+
+            match result with
+            | Ok banners ->
+                do! writeOk context (banners |> List.map toBannerDto)
                 return StatusCodes.Status200OK
             | Error _ ->
                 do! repositoryReadFailed context
@@ -1033,6 +1063,9 @@ module ApiEndpoints =
             let query = if context.Request.Query.ContainsKey("query") then context.Request.Query["query"].ToString() else String.Empty
             let limitText = if context.Request.Query.ContainsKey("limit") then context.Request.Query["limit"].ToString() else "100"
             let cursor = if context.Request.Query.ContainsKey("cursor") then context.Request.Query["cursor"].ToString() else null
+            let storageBackendText = if context.Request.Query.ContainsKey("storageBackendId") then context.Request.Query["storageBackendId"].ToString() else null
+            let storageBackendId = if String.IsNullOrWhiteSpace storageBackendText then None else tryPositiveGuid storageBackendText
+            let storageBackendValid = String.IsNullOrWhiteSpace storageBackendText || storageBackendId.IsSome
             let mutable limit = 0
 
             let validCursor =
@@ -1059,13 +1092,13 @@ module ApiEndpoints =
                         && Guid.TryParse(id.GetString(), &parsedId)
                     with _ -> false
 
-            if query.Length > 200 || not (Int32.TryParse(limitText, &limit)) || limit < 1 || limit > 100 || not validCursor then
+            if query.Length > 200 || not (Int32.TryParse(limitText, &limit)) || limit < 1 || limit > 100 || not validCursor || not storageBackendValid then
                 do! writeDomainProblem context StatusCodes.Status400BadRequest "track.request_invalid" "Invalid track request" "The track query, limit, or cursor is invalid."
                 return StatusCodes.Status400BadRequest
             else
                 let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
                 let cursorOption = if isNull cursor then None else Some cursor
-                let! result = AdminContentRepository.listActiveTracksPage source query limit cursorOption context.RequestAborted
+                let! result = AdminContentRepository.listActiveTracksPage source query limit cursorOption storageBackendId context.RequestAborted
                 match result with
                 | Error _ ->
                     do! writeDomainProblem context StatusCodes.Status400BadRequest "track.request_invalid" "Invalid track request" "The track query, limit, or cursor is invalid."
@@ -1393,6 +1426,31 @@ module ApiEndpoints =
                 return StatusCodes.Status400BadRequest
         }
 
+    let private adminRemoveQueueItem (context: HttpContext) =
+        task {
+            match parseGuidRoute "queueItemId" context with
+            | None ->
+                do! writeDomainProblem context StatusCodes.Status400BadRequest "playback.request_invalid" "Invalid playback request" "The queue item identifier is invalid."
+                return StatusCodes.Status400BadRequest
+            | Some queueItemId ->
+                let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+                let clock = context.RequestServices.GetRequiredService<TimeProvider>()
+                let! result = PlaybackQueueRepository.removeQueuedItem source queueItemId (clock.GetUtcNow()) context.RequestAborted
+                match result with
+                | Error _ ->
+                    do! writeRepositoryFailure context
+                    return StatusCodes.Status500InternalServerError
+                | Ok PlaybackControlOutcome.NotFound ->
+                    do! writeDomainProblem context StatusCodes.Status404NotFound "playback.not_found" "Queue item not found" "The queue item does not exist."
+                    return StatusCodes.Status404NotFound
+                | Ok PlaybackControlOutcome.Conflict ->
+                    do! writeDomainProblem context StatusCodes.Status409Conflict "playback.conflict" "Playback conflict" "The queue item can no longer be removed."
+                    return StatusCodes.Status409Conflict
+                | Ok(PlaybackControlOutcome.Applied()) ->
+                    do! ApiJson.write context StatusCodes.Status200OK ApiJson.JsonContentType {| queueItemId = queueItemId.ToString("D") |}
+                    return StatusCodes.Status200OK
+        }
+
     let private adminSkipCurrent (context: HttpContext) =
         task {
             match! readJsonBody (16 * 1024) context with
@@ -1643,6 +1701,7 @@ module ApiEndpoints =
                     match initialized, operation with
                     | Error error, _ -> Task.FromResult(Error error)
                     | Ok _, "start" -> StreamNodeControlRepository.setDesiredState source Running (clock.GetUtcNow()) context.RequestAborted
+                    | Ok _, "pause" -> StreamNodeControlRepository.setDesiredState source Paused (clock.GetUtcNow()) context.RequestAborted
                     | Ok _, "stop" -> StreamNodeControlRepository.setDesiredState source Stopped (clock.GetUtcNow()) context.RequestAborted
                     | Ok _, _ -> StreamNodeControlRepository.restart source (clock.GetUtcNow()) context.RequestAborted
                 match result with
@@ -1744,7 +1803,7 @@ module ApiEndpoints =
 
     let private adminSocialLinksUpdate (context: HttpContext) =
         task {
-            match! readJsonBody (64 * 1024) context with
+            match! readJsonBody SocialLinksMaxBodyBytes context with
             | BodyTooLarge ->
                 do! writeRequestTooLarge context
                 return StatusCodes.Status413PayloadTooLarge
@@ -1777,6 +1836,67 @@ module ApiEndpoints =
                             return StatusCodes.Status200OK
             | _ ->
                 do! writeDomainProblem context StatusCodes.Status400BadRequest "social-links.request_invalid" "Invalid social links request" "The social links body is invalid."
+                return StatusCodes.Status400BadRequest
+        }
+
+    let private bannerTypes = Set.ofList [ "nowplaying"; "donation"; "social"; "custom" ]
+    let private bannerStyles = Set.ofList [ "aero"; "win9x" ]
+    let private bannerPositions = Set.ofList [ "top-left"; "top-center"; "top-right"; "bottom-left"; "bottom-center"; "bottom-right" ]
+
+    let private parseBannerReplacement (element: JsonElement) : BannerReplacement option =
+        if not (hasExactProperties (Set.ofList [ "id"; "type"; "title"; "subtitle"; "text"; "style"; "screenPosition"; "accent"; "enabled"; "rotationSeconds" ]) element) then None
+        else
+            let rotationParsed =
+                match tryProperty "rotationSeconds" element with
+                | Some value when value.ValueKind = JsonValueKind.Null -> Some None
+                | Some value when value.ValueKind = JsonValueKind.Number ->
+                    let mutable parsed = 0
+                    if value.TryGetInt32(&parsed) then Some(Some parsed) else None
+                | _ -> None
+            match tryProperty "id" element, tryString "type" element, tryString "title" element, tryNullableString "subtitle" element, tryNullableString "text" element, tryString "style" element, tryString "screenPosition" element, tryNullableString "accent" element, tryProperty "enabled" element, rotationParsed with
+            | Some idElement, Some bannerType, Some title, Some subtitle, Some text, Some style, Some screenPosition, Some accent, Some enabled, Some rotationSeconds when idElement.ValueKind = JsonValueKind.Null || idElement.ValueKind = JsonValueKind.String ->
+                let id = if idElement.ValueKind = JsonValueKind.Null then Some(Uuid.CreateVersion7().ToGuidBigEndian()) else idElement.GetString() |> tryPositiveGuid
+                let accentValid = accent |> Option.forall (fun value -> value.Length = 7 && value.[0] = '#' && value |> Seq.skip 1 |> Seq.forall Uri.IsHexDigit)
+                let rotationValid = rotationSeconds |> Option.forall (fun value -> value >= 2 && value <= 120)
+                if id.IsNone || not (bannerTypes.Contains bannerType) || not (bannerStyles.Contains style) || not (bannerPositions.Contains screenPosition) || not accentValid || not rotationValid || (enabled.ValueKind <> JsonValueKind.True && enabled.ValueKind <> JsonValueKind.False) then None
+                else Some { Id = id.Value; Type = bannerType; Title = title.Trim(); Subtitle = subtitle |> Option.map _.Trim(); Text = text |> Option.map _.Trim(); Style = style; ScreenPosition = screenPosition; Accent = accent; Enabled = enabled.GetBoolean(); RotationSeconds = rotationSeconds }
+            | _ -> None
+
+    let private adminBannersUpdate (context: HttpContext) =
+        task {
+            match! readJsonBody (64 * 1024) context with
+            | BodyTooLarge ->
+                do! writeRequestTooLarge context
+                return StatusCodes.Status413PayloadTooLarge
+            | BodyParsed root when root.ValueKind = JsonValueKind.Array && root.GetArrayLength() <= 20 ->
+                let parsed = root.EnumerateArray() |> Seq.map parseBannerReplacement |> Seq.toList
+                if parsed |> List.exists Option.isNone then
+                    do! writeDomainProblem context StatusCodes.Status400BadRequest "banners.request_invalid" "Invalid banners request" "The banners body is invalid."
+                    return StatusCodes.Status400BadRequest
+                else
+                    let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+                    let clock = context.RequestServices.GetRequiredService<TimeProvider>()
+                    let! result = AdminContentRepository.replaceBanners source (parsed |> List.choose id) (clock.GetUtcNow()) context.RequestAborted
+                    match result with
+                    | Error _ ->
+                        do! writeRepositoryFailure context
+                        return StatusCodes.Status500InternalServerError
+                    | Ok AdminContentMutation.NotFound ->
+                        do! writeDomainProblem context StatusCodes.Status404NotFound "banners.not_found" "Banner not found" "A referenced banner does not exist."
+                        return StatusCodes.Status404NotFound
+                    | Ok AdminContentMutation.Conflict ->
+                        do! writeDomainProblem context StatusCodes.Status409Conflict "banners.conflict" "Banners conflict" "The banners replacement conflicts with current state."
+                        return StatusCodes.Status409Conflict
+                    | Ok(AdminContentMutation.Applied banners) ->
+                        let! published = publishEvent context DomainEventType.BannerChanged "Web10.Radio.API.Admin" (JsonSerializer.Serialize({| count = List.length banners |}, DomainJson.options))
+                        if not published then
+                            do! writeRepositoryFailure context
+                            return StatusCodes.Status500InternalServerError
+                        else
+                            do! writeOk context (banners |> List.map toBannerDto)
+                            return StatusCodes.Status200OK
+            | _ ->
+                do! writeDomainProblem context StatusCodes.Status400BadRequest "banners.request_invalid" "Invalid banners request" "The banners body is invalid."
                 return StatusCodes.Status400BadRequest
         }
     type private PlaylistBody =
@@ -2285,6 +2405,8 @@ module ApiEndpoints =
         map admin logger "DELETE" "/tracks/{trackId}/cover" "/api/v0/admin/tracks/{trackId}/cover" (csrfProtected adminRemoveTrackCover)
         map admin logger "GET" "/social-links" "/api/v0/admin/social-links" adminSocialLinks
         map admin logger "PUT" "/social-links" "/api/v0/admin/social-links" (csrfProtected adminSocialLinksUpdate)
+        map admin logger "GET" "/banners" "/api/v0/admin/banners" adminBanners
+        map admin logger "PUT" "/banners" "/api/v0/admin/banners" (csrfProtected adminBannersUpdate)
         map admin logger "GET" "/donation-goal" "/api/v0/admin/donation-goal" adminDonationGoal
         map admin logger "PUT" "/donation-goal" "/api/v0/admin/donation-goal" (csrfProtected adminDonationGoalUpdate)
         map admin logger "POST" "/library/scan" "/api/v0/admin/library/scan" (csrfProtected libraryScan)
@@ -2292,6 +2414,7 @@ module ApiEndpoints =
         map admin logger "GET" "/tracks" "/api/v0/admin/tracks" adminTracks
         map admin logger "POST" "/playback/queue" "/api/v0/admin/playback/queue" (csrfProtected adminQueueTrack)
         map admin logger "PUT" "/playback/queue/order" "/api/v0/admin/playback/queue/order" (csrfProtected adminReorderQueue)
+        map admin logger "DELETE" "/playback/queue/{queueItemId}" "/api/v0/admin/playback/queue/{queueItemId}" (csrfProtected adminRemoveQueueItem)
         map admin logger "POST" "/playback/skip" "/api/v0/admin/playback/skip" (csrfProtected adminSkipCurrent)
         map admin logger "POST" "/playback/restart-current" "/api/v0/admin/playback/restart-current" (csrfProtected adminRestartCurrent)
         map admin logger "POST" "/playback/play-now" "/api/v0/admin/playback/play-now" (csrfProtected adminPlayNow)
@@ -2305,5 +2428,6 @@ module ApiEndpoints =
         map admin logger "PUT" "/storage" "/api/v0/admin/storage" (csrfProtected adminStorageUpdate)
         map admin logger "GET" "/stream-node/status" "/api/v0/admin/stream-node/status" adminStreamStatus
         map admin logger "POST" "/stream-node/start" "/api/v0/admin/stream-node/start" (csrfProtected (adminStreamControl "start"))
+        map admin logger "POST" "/stream-node/pause" "/api/v0/admin/stream-node/pause" (csrfProtected (adminStreamControl "pause"))
         map admin logger "POST" "/stream-node/stop" "/api/v0/admin/stream-node/stop" (csrfProtected (adminStreamControl "stop"))
         map admin logger "POST" "/stream-node/restart" "/api/v0/admin/stream-node/restart" (csrfProtected (adminStreamControl "restart"))

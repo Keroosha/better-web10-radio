@@ -86,8 +86,7 @@ ALTER TABLE "Banners"
         CHECK ("Type" IN ('nowplaying', 'donation', 'social', 'superchat', 'custom'));
 
 INSERT INTO "Banners" ("Id", "Type", "Title", "Subtitle", "Text", "Style", "ScreenPosition", "Accent", "Enabled", "SortOrder", "RotationSeconds")
-SELECT gen_random_uuid(), 'superchat', 'SUPER CHAT', NULL, NULL, 'aero', 'bottom-left', '#e0439a', true, COALESCE(MAX("SortOrder"), -1) + 1, NULL
-FROM "Banners"
+SELECT gen_random_uuid(), 'superchat', 'SUPER CHAT', NULL, NULL, 'aero', 'bottom-left', '#e0439a', true, COALESCE((SELECT MAX("SortOrder") FROM "Banners"), -1) + 1, NULL
 WHERE NOT EXISTS (
     SELECT 1
     FROM "Banners"

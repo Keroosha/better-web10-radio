@@ -48,9 +48,9 @@
 - [x] Implement local event dispatch where needed and move shared event envelopes, audience mapping, and relay contracts into `Web10.Radio.Application`.
 - [x] Persist audience-partitioned outbox events before restart-sensitive effects; API and Telegram relays claim only their own partition with owner/attempt fencing.
 - [x] Deduplicate Telegram updates using `TelegramUpdateInbox` before emitting domain events; `/request` and `/say` durable events create idempotent domain rows instead of no-op dispatch.
-- [x] Implement library scanner discovery for Local files and page-streamed S3 object metadata, renew the fenced scan lease per page, filter supported audio extensions, download supported audio into `CacheRoot/audio`, extract metadata, persist `IsCached=true`, and emit `TrackDiscovered`.
-- [x] Implement playback program claim/start plus 30-second fenced lease renewal and authoritative `Played|Failed` completion callbacks; terminal state and `PlaybackEnded` append commit atomically, and stale attempts recover without blocking the queue.
-- [x] Implement cache path for tracks needed for streaming; cache misses are explicit `degraded` state, not silent fallback.
+- [x] Implement library scanner discovery for Local and page-streamed S3 audio plus external FLAC+CUE sheets; resolve stale `.wav` FILE declarations to FLAC stems, persist logical CUE segments with shared source/cache state, retain ordinary-media fallback on per-sheet failure, and emit `TrackDiscovered`.
+- [x] Implement playback program claim/start plus 30-second fenced lease renewal and authoritative `Played|Failed` completion callbacks; terminal state and `PlaybackEnded` append commit atomically, stale attempts recover without blocking the queue, and CUE assignments expose paired decoder timing without changing whole-object media delivery.
+- [x] Implement cache paths for tracks needed for streaming; default-S3 accounting and eviction operate once per physical cache path so CUE segments never double-count or independently delete a shared source.
 
 ### Phase B3 — HTTP API
 
@@ -95,7 +95,7 @@
 - [x] Push stream to `WEB10_STREAM__RTMP_URL` using `WEB10_STREAM__RTMP_KEY`.
 - [x] Report heartbeat and failure states to backend.
 - [x] Implement bounded restart policy and admin-visible failure reason.
-- [x] Add smoke checks for Xvfb, Chromium launch, LiquidSoap syntax, FFmpeg availability, and backend heartbeat.
+- [x] Add smoke checks for Xvfb, Chromium launch, LiquidSoap syntax, FFmpeg/ffprobe availability, FLV capture, one-second FLAC CUE-window decode, and backend heartbeat.
 
 ### Phase B6 — Observability, Docker, verification
 

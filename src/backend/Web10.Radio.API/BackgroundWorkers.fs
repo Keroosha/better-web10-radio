@@ -550,6 +550,8 @@ type LibraryScanHostedService
     let supportedExtensions =
         Set.ofList [ ".mp3"; ".flac"; ".wav"; ".ogg"; ".m4a"; ".aac"; ".opus" ]
 
+    let cueExtensions = Set.singleton ".cue"
+
     let configuredDefaultBackend () =
         { Id = None
           Name = "configured-default"
@@ -655,16 +657,17 @@ type LibraryScanHostedService
               MetadataSource = "Filename"
               Cover = None }
 
-    let materializeCover (trackId: Guid) (cover: ExtractedCover option) : Task<DiscoveredCover option> =
+    let materializeCover (cover: ExtractedCover option) : Task<DiscoveredCover option> =
         task {
             match cover with
             | None -> return None
             | Some cover ->
-                let directory = Path.Combine(options.Storage.CacheRoot, "covers", trackId.ToString("D"))
+                let directory = Path.Combine(options.Storage.CacheRoot, "covers")
                 Directory.CreateDirectory(directory) |> ignore
                 let temporaryDirectory = Path.Combine(options.Storage.CacheRoot, "tmp")
                 Directory.CreateDirectory(temporaryDirectory) |> ignore
-                let temporary = Path.Combine(temporaryDirectory, sprintf "%s.%s.tmp" (Uuid.CreateVersion7().ToGuidBigEndian().ToString("N")) (cover.Extension.TrimStart([| '.' |])))
+                let extension = cover.Extension.TrimStart([| '.' |])
+                let temporary = Path.Combine(temporaryDirectory, sprintf "%s.%s.tmp" (Uuid.CreateVersion7().ToGuidBigEndian().ToString("N")) extension)
                 let finalPath = Path.Combine(directory, cover.Sha256 + cover.Extension)
 
                 try
@@ -677,7 +680,7 @@ type LibraryScanHostedService
                               SizeBytes = int64 cover.Bytes.LongLength
                               Sha256 = cover.Sha256 }
                 with ex ->
-                    logger.LogWarning(ex, "Cover materialization failed for {TrackId}", trackId)
+                    logger.LogWarning(ex, "Cover materialization failed for {CoverSha256}", cover.Sha256)
 
                     try
                         if File.Exists temporary then File.Delete temporary
@@ -687,7 +690,7 @@ type LibraryScanHostedService
         }
 
     let tryGetExistingTrackFile (backend: StorageBackendRecord) storagePath cancellationToken =
-        LibraryScanRepository.tryGetActiveTrackFileState dataSource backend.Id storagePath cancellationToken
+        LibraryScanRepository.tryGetActiveTrackFileState dataSource backend.Id storagePath None None cancellationToken
         |> TaskResult.mapError RepositoryError
     let insertDiscoveredFile
         (job: LibraryScanJobRecord)
@@ -705,7 +708,7 @@ type LibraryScanHostedService
             let metadata = metadataForPath storagePath mediaPath
             let candidateTrackId = existing |> Option.map _.TrackId |> Option.defaultValue (Uuid.CreateVersion7().ToGuidBigEndian())
             let candidateTrackFileId = existing |> Option.map _.TrackFileId |> Option.defaultValue (Uuid.CreateVersion7().ToGuidBigEndian())
-            let! cover = materializeCover candidateTrackId metadata.Cover
+            let! cover = materializeCover metadata.Cover
 
             let discovered =
                 { TrackId = candidateTrackId
@@ -722,6 +725,10 @@ type LibraryScanHostedService
                   Cover = cover
                   ContentType = contentTypeFor (Path.GetExtension(storagePath).ToLowerInvariant())
                   SizeBytes = sizeBytes
+                  CueSheetPath = None
+                  CueTrackNumber = None
+                  CueStartMs = None
+                  CueDurationMs = None
                   DiscoveredAtUtc = nowUtc }
 
             do!
@@ -767,6 +774,156 @@ type LibraryScanHostedService
                     cancellationToken
         }
 
+    let nonBlank value =
+        value |> Option.filter (String.IsNullOrWhiteSpace >> not)
+
+    let deriveCueSegments (sourceDurationMs: int) (tracks: CueSheetTrack list) =
+        let ordered = tracks |> List.sortBy (fun track -> track.StartMs)
+        let rec derive remaining segments =
+            match remaining with
+            | [] -> Ok(List.rev segments)
+            | track :: tail ->
+                let nextStart = tail |> List.tryHead |> Option.map (fun value -> value.StartMs) |> Option.defaultValue sourceDurationMs
+                let duration = nextStart - track.StartMs
+                if track.StartMs < 0 || track.StartMs >= sourceDurationMs then
+                    Error(sprintf "TRACK %d starts outside the physical FLAC duration." track.TrackNumber)
+                elif duration <= 0 then
+                    Error(sprintf "TRACK %d does not have a positive CUE segment duration." track.TrackNumber)
+                else
+                    derive tail ((track, duration) :: segments)
+        derive ordered []
+
+    let insertCueSourceGroup
+        (job: LibraryScanJobRecord)
+        (backend: StorageBackendRecord)
+        storagePath
+        mediaPath
+        cachePath
+        isCached
+        sizeBytes
+        cueSheetPath
+        (segments: (CueSheetTrack * int) list)
+        cancellationToken =
+        taskResult {
+            let metadata = metadataForPath storagePath mediaPath
+            let! sourceDuration =
+                metadata.DurationMs
+                |> Result.requireSome (UnexpectedException("LibraryScanHostedService", sprintf "CUE source %s does not expose a physical duration" storagePath))
+            let! cover = materializeCover metadata.Cover
+            let fallbackArtist, fallbackTitle = fallbackMetadataFromPath storagePath
+            let nowUtc = timeProvider.GetUtcNow()
+            let discovered =
+                segments
+                |> List.map (fun (cueTrack, cueDurationMs) ->
+                    { TrackId = Uuid.CreateVersion7().ToGuidBigEndian()
+                      TrackFileId = Uuid.CreateVersion7().ToGuidBigEndian()
+                      StorageBackendId = backend.Id
+                      StoragePath = storagePath
+                      CachePath = cachePath
+                      IsCached = isCached
+                      Title = cueTrack.Title |> nonBlank |> Option.orElse (Some metadata.Title |> nonBlank) |> Option.defaultValue fallbackTitle
+                      Artist = cueTrack.Artist |> nonBlank |> Option.orElse (Some metadata.Artist |> nonBlank) |> Option.defaultValue fallbackArtist
+                      Album = cueTrack.Album |> nonBlank |> Option.orElse (metadata.Album |> nonBlank)
+                      DurationMs = Some cueDurationMs
+                      MetadataSource = "Cue"
+                      Cover = cover
+                      ContentType = Some "audio/flac"
+                      SizeBytes = sizeBytes
+                      CueSheetPath = Some cueSheetPath
+                      CueTrackNumber = Some cueTrack.TrackNumber
+                      CueStartMs = Some cueTrack.StartMs
+                      CueDurationMs = Some cueDurationMs
+                      DiscoveredAtUtc = nowUtc })
+
+            do!
+                sourceDuration
+                |> fun duration ->
+                    discovered
+                    |> List.forall (fun track ->
+                        track.CueStartMs |> Option.exists (fun startMs -> startMs < duration)
+                        && track.CueDurationMs |> Option.exists (fun segmentDuration -> segmentDuration > 0))
+                |> Result.requireTrue (UnexpectedException("LibraryScanHostedService", sprintf "CUE source %s has invalid segment bounds" storagePath))
+
+            do!
+                DatabaseSession.withTransactionResult
+                    dataSource
+                    (fun connection transaction token ->
+                        taskResult {
+                            for track in discovered do
+                                let! discovery =
+                                    LibraryScanRepository.insertDiscoveredTrackInTransaction connection transaction track token
+                                    |> TaskResult.mapError RepositoryError
+
+                                match discovery with
+                                | DiscoveredTrackResult.Created identity ->
+                                    let! incremented =
+                                        LibraryScanRepository.incrementDiscoveredCountInTransaction
+                                            connection
+                                            transaction
+                                            job.Id
+                                            job.ClaimOwner
+                                            job.ClaimAttempt
+                                            nowUtc
+                                            token
+                                        |> TaskResult.mapError RepositoryError
+                                    do! requireTransition "increment CUE library scan discovered count" job.Id incremented
+                                    let payload =
+                                        JsonPayload.objectWithStrings
+                                            [ "trackId", string identity.TrackId
+                                              "trackFileId", string identity.TrackFileId
+                                              "storagePath", track.StoragePath ]
+                                    let! envelope = createLibraryEnvelope TrackDiscovered payload
+                                    do! appendEnvelope connection transaction envelope token
+                                | DiscoveredTrackResult.Updated _ -> ()
+                        })
+                    cancellationToken
+        }
+
+    let resolveLocalCueSource (localRootFull: string) (cuePath: string) (declaredFileName: string) =
+        let cueDirectory = Path.GetDirectoryName(cuePath)
+        let sourcePath = Path.GetFullPath(Path.Combine(cueDirectory, declaredFileName))
+        let flacFallback = Path.ChangeExtension(sourcePath, ".flac")
+        let withinRoot (path: string) =
+            path.StartsWith(localRootFull + string Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+            || String.Equals(path, localRootFull, StringComparison.OrdinalIgnoreCase)
+        let usable (path: string) =
+            withinRoot path
+            && Path.GetExtension(path).Equals(".flac", StringComparison.OrdinalIgnoreCase)
+            && File.Exists(path)
+        if usable sourcePath then Some sourcePath
+        elif usable flacFallback then Some flacFallback
+        else None
+
+    let processLocalCueSheets (job: LibraryScanJobRecord) (backend: StorageBackendRecord) localRootFull cacheRootFull cachePrefix cancellationToken =
+        taskResult {
+            let cueFiles =
+                Directory.EnumerateFiles(localRootFull, "*", SearchOption.AllDirectories)
+                |> Seq.filter (fun path -> cueExtensions.Contains(Path.GetExtension(path).ToLowerInvariant()))
+                |> Seq.filter (fun path ->
+                    let full = Path.GetFullPath path
+                    not (String.Equals(full, cacheRootFull, StringComparison.OrdinalIgnoreCase)
+                         || full.StartsWith(cachePrefix, StringComparison.OrdinalIgnoreCase)))
+
+            for cuePath in cueFiles do
+                do! renewClaim job cancellationToken
+                match CueSheet.parseBytes cuePath (File.ReadAllBytes(cuePath)) with
+                | Error parseError ->
+                    logger.LogWarning("CUE sheet {CueSheetPath} line {LineNumber} was skipped: {Error}", parseError.SheetPath, parseError.LineNumber, parseError.Message)
+                | Ok cueTracks ->
+                    for declaredFileName, sourceTracks in cueTracks |> List.groupBy (fun track -> track.FileName) do
+                        match resolveLocalCueSource localRootFull cuePath declaredFileName with
+                        | None ->
+                            logger.LogWarning("CUE sheet {CueSheetPath} source {CueSource} could not be resolved as FLAC.", cuePath, declaredFileName)
+                        | Some sourcePath ->
+                            let metadata = metadataForPath sourcePath sourcePath
+                            match metadata.DurationMs |> Option.bind (fun duration -> deriveCueSegments duration sourceTracks |> Result.toOption) with
+                            | None ->
+                                logger.LogWarning("CUE sheet {CueSheetPath} source {CueSource} has invalid FLAC duration or segment bounds.", cuePath, sourcePath)
+                            | Some segments ->
+                                let sourceInfo = FileInfo(sourcePath)
+                                do! insertCueSourceGroup job backend sourcePath sourcePath (Some sourcePath) true (Some sourceInfo.Length) cuePath segments cancellationToken
+        }
+
     let processLocalBackend (job: LibraryScanJobRecord) (backend: StorageBackendRecord) localRoot cancellationToken =
         taskResult {
             do!
@@ -785,11 +942,17 @@ type LibraryScanHostedService
                     not (String.Equals(full, cacheRootFull, StringComparison.OrdinalIgnoreCase)
                          || full.StartsWith(cachePrefix, StringComparison.OrdinalIgnoreCase)))
 
+            do! processLocalCueSheets job backend localRootFull cacheRootFull cachePrefix cancellationToken
+
             for filePath in files do
                 do! renewClaim job cancellationToken
-                let fileInfo = FileInfo(filePath)
-                let! existing = tryGetExistingTrackFile backend filePath cancellationToken
-                do! insertDiscoveredFile job backend filePath filePath (Some filePath) true (Some fileInfo.Length) false existing cancellationToken
+                let! hasCueTrack =
+                    LibraryScanRepository.hasActiveCueTrackFileForSource dataSource backend.Id filePath cancellationToken
+                    |> TaskResult.mapError RepositoryError
+                if not hasCueTrack then
+                    let fileInfo = FileInfo(filePath)
+                    let! existing = tryGetExistingTrackFile backend filePath cancellationToken
+                    do! insertDiscoveredFile job backend filePath filePath (Some filePath) true (Some fileInfo.Length) false existing cancellationToken
         }
 
     let canonicalAudioPath (backend: StorageBackendRecord) (key: string) =
@@ -825,6 +988,98 @@ type LibraryScanHostedService
                     |> TaskResult.mapError RepositoryError
                 available <- max 0L (settings.S3CacheMaxBytes - currentBytes)
 
+            let cueCachedSources = System.Collections.Generic.Dictionary<string, string>(StringComparer.Ordinal)
+
+            let cueSourceKey (cuePath: string) (declaredFileName: string) =
+                let directory = Path.GetDirectoryName(cuePath)
+                let declared = Path.Combine((if String.IsNullOrWhiteSpace(directory) then "" else directory), declaredFileName.Replace('\\', '/'))
+                if Path.GetExtension(declared).Equals(".flac", StringComparison.OrdinalIgnoreCase) then declared
+                else Path.ChangeExtension(declared, ".flac")
+
+            let materializeCueSource (cuePath: string) (declaredFileName: string) pageCancellationToken =
+                task {
+                    let sourceKey = cueSourceKey cuePath declaredFileName
+                    match cueCachedSources.TryGetValue(sourceKey) with
+                    | true, audioPath ->
+                        return Some(sourceKey, audioPath, Some audioPath, true, FileInfo(audioPath).Length)
+                    | _ ->
+                        let temporaryDirectory = Path.Combine(options.Storage.CacheRoot, "tmp")
+                        Directory.CreateDirectory(temporaryDirectory) |> ignore
+                        let temporary = Path.Combine(temporaryDirectory, sprintf "%s.flac.tmp" (Uuid.CreateVersion7().ToGuidBigEndian().ToString("N")))
+                        let audioPath = canonicalAudioPath backend sourceKey
+                        Directory.CreateDirectory(Path.GetDirectoryName(audioPath)) |> ignore
+                        try
+                            let! renewal = renewClaim job pageCancellationToken
+                            match renewal with
+                            | Error error -> raise (InvalidOperationException(BackgroundWorkerError.toMessage error))
+                            | Ok () -> ()
+                            do! s3ObjectStorage.DownloadToFileAsync(scope, bucketName, sourceKey, temporary, pageCancellationToken)
+                            let sourceSize = FileInfo(temporary).Length
+                            let alreadyCached = File.Exists(audioPath)
+                            let keepCached = (not budgetAware) || alreadyCached || available >= sourceSize
+                            if keepCached then
+                                File.Move(temporary, audioPath, true)
+                                cueCachedSources.[sourceKey] <- audioPath
+                                if budgetAware && not alreadyCached then available <- available - sourceSize
+                                return Some(sourceKey, audioPath, Some audioPath, true, sourceSize)
+                            else
+                                return Some(sourceKey, temporary, None, false, sourceSize)
+                        with ex ->
+                            logger.LogWarning(ex, "CUE sheet {CueSheetPath} source {CueSource} could not be materialized as FLAC.", cuePath, sourceKey)
+                            try
+                                if File.Exists(temporary) then File.Delete(temporary)
+                            with _ -> ()
+                            return None
+                }
+
+            let visitCuePage (items: System.Collections.Generic.IReadOnlyList<S3ObjectDescriptor>) (pageCancellationToken: CancellationToken) =
+                task {
+                    let! pageResult =
+                        taskResult {
+                            do! renewClaim job pageCancellationToken
+                            for item in items do
+                                if cueExtensions.Contains(Path.GetExtension(item.Key).ToLowerInvariant()) && S3KeyValidation.isCanonical item.Key then
+                                    let temporaryDirectory = Path.Combine(options.Storage.CacheRoot, "tmp")
+                                    Directory.CreateDirectory(temporaryDirectory) |> ignore
+                                    let temporaryCue = Path.Combine(temporaryDirectory, sprintf "%s.cue.tmp" (Uuid.CreateVersion7().ToGuidBigEndian().ToString("N")))
+                                    try
+                                        try
+                                            do! renewClaim job pageCancellationToken
+                                            do! s3ObjectStorage.DownloadToFileAsync(scope, bucketName, item.Key, temporaryCue, pageCancellationToken)
+                                            match CueSheet.parseBytes item.Key (File.ReadAllBytes(temporaryCue)) with
+                                            | Error parseError ->
+                                                logger.LogWarning("CUE sheet {CueSheetPath} line {LineNumber} was skipped: {Error}", parseError.SheetPath, parseError.LineNumber, parseError.Message)
+                                            | Ok cueTracks ->
+                                                for declaredFileName, sourceTracks in cueTracks |> List.groupBy (fun track -> track.FileName) do
+                                                    let! source = materializeCueSource item.Key declaredFileName pageCancellationToken
+                                                    match source with
+                                                    | None -> ()
+                                                    | Some(sourceKey, mediaPath, cachePath, isCached, sourceSize) ->
+                                                        let metadata = metadataForPath sourceKey mediaPath
+                                                        match metadata.DurationMs with
+                                                        | None ->
+                                                            logger.LogWarning("CUE sheet {CueSheetPath} source {CueSource} has no physical FLAC duration.", item.Key, sourceKey)
+                                                        | Some duration ->
+                                                            match deriveCueSegments duration sourceTracks with
+                                                            | Error message ->
+                                                                logger.LogWarning("CUE sheet {CueSheetPath} source {CueSource} was skipped: {Error}", item.Key, sourceKey, message)
+                                                            | Ok segments ->
+                                                                do! insertCueSourceGroup job backend sourceKey mediaPath cachePath isCached (Some sourceSize) item.Key segments pageCancellationToken
+                                                        if not isCached then
+                                                            try
+                                                                if File.Exists(mediaPath) then File.Delete(mediaPath)
+                                                            with _ -> ()
+                                        with ex ->
+                                            logger.LogWarning(ex, "CUE sheet {CueSheetPath} could not be downloaded or parsed.", item.Key)
+                                    finally
+                                        try
+                                            if File.Exists(temporaryCue) then File.Delete(temporaryCue)
+                                        with _ -> ()
+                        }
+                    match pageResult with
+                    | Ok () -> return ()
+                    | Error error -> return raise (InvalidOperationException(BackgroundWorkerError.toMessage error))
+                }
             let visitPage (items: System.Collections.Generic.IReadOnlyList<S3ObjectDescriptor>) (pageCancellationToken: CancellationToken) =
                 task {
                     let! pageResult =
@@ -833,79 +1088,88 @@ type LibraryScanHostedService
 
                             for item in items do
                                 if supportedExtensions.Contains(Path.GetExtension(item.Key).ToLowerInvariant()) && S3KeyValidation.isCanonical item.Key then
-                                    let temporaryDirectory = Path.Combine(options.Storage.CacheRoot, "tmp")
-                                    Directory.CreateDirectory(temporaryDirectory) |> ignore
-                                    let temporary = Path.Combine(temporaryDirectory, sprintf "%s%s.tmp" (Uuid.CreateVersion7().ToGuidBigEndian().ToString("N")) (Path.GetExtension(item.Key).ToLowerInvariant()))
-                                    let audioPath = canonicalAudioPath backend item.Key
-                                    Directory.CreateDirectory(Path.GetDirectoryName(audioPath)) |> ignore
+                                    let! hasCueTrack =
+                                        LibraryScanRepository.hasActiveCueTrackFileForSource dataSource backend.Id item.Key pageCancellationToken
+                                        |> TaskResult.mapError RepositoryError
+                                    if not hasCueTrack then
+                                        let temporaryDirectory = Path.Combine(options.Storage.CacheRoot, "tmp")
+                                        Directory.CreateDirectory(temporaryDirectory) |> ignore
+                                        let temporary = Path.Combine(temporaryDirectory, sprintf "%s%s.tmp" (Uuid.CreateVersion7().ToGuidBigEndian().ToString("N")) (Path.GetExtension(item.Key).ToLowerInvariant()))
+                                        let audioPath = canonicalAudioPath backend item.Key
+                                        Directory.CreateDirectory(Path.GetDirectoryName(audioPath)) |> ignore
 
-                                    try
-                                        do! s3ObjectStorage.DownloadToFileAsync(scope, bucketName, item.Key, temporary, pageCancellationToken)
-                                        let! existing = tryGetExistingTrackFile backend item.Key pageCancellationToken
-                                        let keepCached = (not budgetAware) || available >= item.SizeBytes
-                                        if keepCached then
-                                            File.Move(temporary, audioPath, true)
-                                            let emitMaterialized = existing |> Option.exists (fun value -> not value.IsCached)
-                                            do!
-                                                insertDiscoveredFile
-                                                    job
-                                                    backend
-                                                    item.Key
-                                                    audioPath
-                                                    (Some audioPath)
-                                                    true
-                                                    (Some item.SizeBytes)
-                                                    emitMaterialized
-                                                    existing
-                                                    pageCancellationToken
-                                            if budgetAware then available <- available - item.SizeBytes
-                                        else
-                                            do!
-                                                insertDiscoveredFile
-                                                    job
-                                                    backend
-                                                    item.Key
-                                                    temporary
-                                                    None
-                                                    false
-                                                    (Some item.SizeBytes)
-                                                    false
-                                                    existing
-                                                    pageCancellationToken
+                                        try
+                                            do! s3ObjectStorage.DownloadToFileAsync(scope, bucketName, item.Key, temporary, pageCancellationToken)
+                                            let! existing = tryGetExistingTrackFile backend item.Key pageCancellationToken
+                                            let keepCached = (not budgetAware) || available >= item.SizeBytes
+                                            if keepCached then
+                                                File.Move(temporary, audioPath, true)
+                                                let emitMaterialized = existing |> Option.exists (fun value -> not value.IsCached)
+                                                do!
+                                                    insertDiscoveredFile
+                                                        job
+                                                        backend
+                                                        item.Key
+                                                        audioPath
+                                                        (Some audioPath)
+                                                        true
+                                                        (Some item.SizeBytes)
+                                                        emitMaterialized
+                                                        existing
+                                                        pageCancellationToken
+                                                if budgetAware then available <- available - item.SizeBytes
+                                            else
+                                                do!
+                                                    insertDiscoveredFile
+                                                        job
+                                                        backend
+                                                        item.Key
+                                                        temporary
+                                                        None
+                                                        false
+                                                        (Some item.SizeBytes)
+                                                        false
+                                                        existing
+                                                        pageCancellationToken
+                                                try
+                                                    if File.Exists temporary then File.Delete temporary
+                                                with _ -> ()
+                                        with ex ->
+                                            logger.LogWarning(ex, "S3 object {ObjectKey} could not be materialized; retrying on next scan", item.Key)
+
                                             try
                                                 if File.Exists temporary then File.Delete temporary
                                             with _ -> ()
-                                    with ex ->
-                                        logger.LogWarning(ex, "S3 object {ObjectKey} could not be materialized; retrying on next scan", item.Key)
-
-                                        try
-                                            if File.Exists temporary then File.Delete temporary
-                                        with _ -> ()
                         }
 
                     match pageResult with
                     | Ok () -> return ()
                     | Error error -> return raise (InvalidOperationException(BackgroundWorkerError.toMessage error))
                 }
-                :> Task
 
-            let mutable continuationToken: string option = None
-            let mutable hasMore = true
-            while hasMore do
-                let! page =
-                    s3ObjectStorage.ListPageAsync(
-                        scope,
-                        bucketName,
-                        "",
-                        None,
-                        1000,
-                        continuationToken,
-                        cancellationToken
-                    )
-                let objects = page.Objects |> List.toArray :> System.Collections.Generic.IReadOnlyList<S3ObjectDescriptor>
-                do! visitPage objects cancellationToken
-                continuationToken <- page.NextContinuationToken
-                hasMore <- continuationToken.IsSome
+            let scanPages visitor =
+                task {
+                    let mutable continuationToken: string option = None
+                    let mutable hasMore = true
+                    while hasMore do
+                        let! page =
+                            s3ObjectStorage.ListPageAsync(
+                                scope,
+                                bucketName,
+                                "",
+                                None,
+                                1000,
+                                continuationToken,
+                                cancellationToken
+                            )
+                        let objects = page.Objects |> List.toArray :> System.Collections.Generic.IReadOnlyList<S3ObjectDescriptor>
+                        do! visitor objects cancellationToken
+                        continuationToken <- page.NextContinuationToken
+                        hasMore <- continuationToken.IsSome
+                }
+
+            do! scanPages visitCuePage
+            do! scanPages visitPage
         }
 
 
@@ -1648,7 +1912,7 @@ type CacheEvictionHostedService
                             let candidate = List.head pending
                             pending <- List.tail pending
                             let _ = (try File.Delete(candidate.CachePath) with _ -> ())
-                            let! markResult = StorageSettingsRepository.markCacheEvicted dataSource candidate.TrackFileId (timeProvider.GetUtcNow()) cancellationToken
+                            let! markResult = StorageSettingsRepository.markCacheEvicted dataSource candidate.CachePath (timeProvider.GetUtcNow()) cancellationToken
                             match markResult with
                             | Error error -> BackgroundWorkerLog.operationFailed logger "Cache eviction mark" (RepositoryError error)
                             | Ok _ -> evicted <- evicted + 1

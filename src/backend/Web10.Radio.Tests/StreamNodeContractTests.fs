@@ -95,12 +95,40 @@ type StreamNodeContractTests() =
               ContentType = "audio/mpeg"
               Title = "t"
               Artist = "a"
-              DurationMs = 1000 }
+              DurationMs = 1000
+              CueStartMs = None
+              CueDurationMs = None }
 
         Assert.Multiple(fun () ->
             Assert.That(Liquidsoap.mediaProtocolUri baseAssignment, Is.EqualTo("web10media:00000000-0000-0000-0000-0000000000ab.mp3"))
             Assert.That(Liquidsoap.mediaProtocolUri { baseAssignment with ContentType = "audio/ogg" }, Is.EqualTo("web10media:00000000-0000-0000-0000-0000000000ab.ogg"))
             Assert.That(Liquidsoap.mediaProtocolUri { baseAssignment with ContentType = "application/unknown" }, Is.EqualTo("web10media:00000000-0000-0000-0000-0000000000ab.mp3")))
+
+    [<Test>]
+    member _.``CUE assignments preserve paired timing and build a FLAC segment URI``() =
+        let json = """{"queueItemId":"00000000-0000-0000-0000-0000000000ab","claimOwner":"00000000-0000-0000-0000-0000000000bc","claimAttempt":1,"trackId":"00000000-0000-0000-0000-0000000000cd","contentType":"audio/x-flac","title":"Segment","artist":"Artist","durationMs":3000,"cueStartMs":1200,"cueDurationMs":3000}"""
+        use handler = new StubHttpHandler(json)
+        use httpClient = new HttpClient(handler)
+        use client = new BackendClient(StreamNodeContractTests.SampleConfig(), httpClient)
+        let result = (client :> IBackendClient).GetAssignmentAsync(CancellationToken.None).GetAwaiter().GetResult()
+        match result with
+        | Ok(Some assignment) ->
+            Assert.Multiple(fun () ->
+                Assert.That(assignment.CueStartMs, Is.EqualTo(Some 1200))
+                Assert.That(assignment.CueDurationMs, Is.EqualTo(Some 3000))
+                Assert.That(Liquidsoap.mediaProtocolUri assignment, Is.EqualTo("web10cue:00000000-0000-0000-0000-0000000000ab:1200:3000.flac")))
+        | actual -> Assert.Fail(sprintf "Expected a valid CUE assignment, got %A." actual)
+
+    [<Test>]
+    member _.``CUE assignment rejects unpaired or invalid timing``() =
+        let json = """{"queueItemId":"00000000-0000-0000-0000-0000000000ab","claimOwner":"00000000-0000-0000-0000-0000000000bc","claimAttempt":1,"trackId":"00000000-0000-0000-0000-0000000000cd","contentType":"audio/flac","cueStartMs":0}"""
+        use handler = new StubHttpHandler(json)
+        use httpClient = new HttpClient(handler)
+        use client = new BackendClient(StreamNodeContractTests.SampleConfig(), httpClient)
+        let result = (client :> IBackendClient).GetAssignmentAsync(CancellationToken.None).GetAwaiter().GetResult()
+        match result with
+        | Error(BackendError.InvalidResponse _) -> ()
+        | actual -> Assert.Fail(sprintf "Expected invalid CUE timing rejection, got %A." actual)
 
     static member private SampleConfig() =
         let values = Dictionary<string, string>()

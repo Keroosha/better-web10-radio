@@ -67,6 +67,28 @@ services:
             -y "$$tmp"
           mv -f "$$tmp" "$$track"
         fi
+        cue_source=/var/lib/web10/storage/web10-compose-cue-source.flac
+        cue_sheet=/var/lib/web10/storage/web10-compose-cue.cue
+        if [ ! -e "$$cue_source" ] && [ ! -L "$$cue_source" ]; then
+          tmp="$${cue_source}.tmp.flac"
+          ffmpeg -hide_banner -loglevel error \
+            -f lavfi -i "sine=frequency=1000:sample_rate=48000" \
+            -t 6 -map 0:a:0 -vn -sn -dn -c:a flac -y "$$tmp"
+          mv -f "$$tmp" "$$cue_source"
+        fi
+        if [ ! -e "$$cue_sheet" ] && [ ! -L "$$cue_sheet" ]; then
+        cat > "$$cue_sheet" <<'EOF'
+        PERFORMER "Web10.Radio"
+        TITLE "web10-compose-cue-album"
+        FILE "web10-compose-cue-source.wav" WAVE
+          TRACK 01 AUDIO
+            TITLE "web10-compose-cue-track-01"
+            INDEX 01 00:00:00
+          TRACK 02 AUDIO
+            TITLE "web10-compose-cue-track-02"
+            INDEX 01 00:03:00
+        EOF
+        fi
         chmod -R a+rX /var/lib/web10/storage
         chmod a+rwx /var/lib/web10/storage
         if command -v setpriv >/dev/null 2>&1; then

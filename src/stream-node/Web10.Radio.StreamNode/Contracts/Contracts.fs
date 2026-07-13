@@ -82,7 +82,9 @@ type Assignment =
       ContentType: string
       Title: string
       Artist: string
-      DurationMs: int }
+      DurationMs: int
+      CueStartMs: int option
+      CueDurationMs: int option }
 
 module Assignment =
     let identity (assignment: Assignment) =

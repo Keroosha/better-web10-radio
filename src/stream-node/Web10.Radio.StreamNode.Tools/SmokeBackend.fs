@@ -18,10 +18,13 @@ type SmokeOptions =
       TimeoutSeconds: float }
 
 module SmokeBackend =
+    let private supportedModes =
+        Set.ofList [ "restart-live"; "flac-cue"; "reorder"; "skip"; "restart-current"; "play-now"; "expect-output-failure"; "recover" ]
+
     let options (arguments: Map<string, string>) =
-        let mode =
-            Parsing.option "mode" "" arguments
-            |> Parsing.requireChoice "mode" (set [ "restart-live"; "reorder"; "skip"; "restart-current"; "play-now"; "expect-output-failure"; "recover" ])
+        let mode = Parsing.option "mode" "" arguments
+        if not (Set.contains mode supportedModes) then
+            raise (ToolError("mode", "invalid"))
         let baseUrl = Parsing.required "base-url" arguments
         let rtmpStatUrl = Parsing.required "rtmp-stat-url" arguments
         let username = Parsing.required "username" arguments
@@ -79,16 +82,16 @@ module SmokeBackend =
             | None -> return raise (ToolError("stream-stop", "invalid-response"))
         }
 
-    let private findTrack (admin: AdminConnection) (deadline: Time.Deadline) cancellationToken =
+    let private findTrack (expectedTitle: string) (admin: AdminConnection) (deadline: Time.Deadline) cancellationToken =
         task {
-            let query = Uri.EscapeDataString "web10-compose-smoke"
+            let query = Uri.EscapeDataString expectedTitle
             let! response = admin.Get("track-lookup", "/api/v0/admin/tracks?query=" + query + "&limit=100", deadline, cancellationToken)
             if response.Status <> 200 then
                 return raise (ToolError("track-lookup", string response.Status))
             else
                 let document = response.Body |> Option.bind Json.tryDocument |> Option.defaultWith (fun () -> raise (ToolError("track-lookup", "invalid-response")))
                 let candidates = Document.trackCandidates document |> Option.defaultValue [||]
-                match candidates |> Array.filter (fun track -> track.Title = "web10-compose-smoke" && track.HasCachedFile) with
+                match candidates |> Array.filter (fun track -> track.Title = expectedTitle && track.HasCachedFile) with
                 | [| candidate |] -> return candidate.Id
                 | [||] -> return raise (ToolError("track-lookup", "not-found"))
                 | _ -> return raise (ToolError("track-lookup", "ambiguous"))
@@ -155,6 +158,16 @@ module SmokeBackend =
                             return active, None
             })
 
+    let private waitForNowPlaying (admin: AdminConnection) (expectedTrackId: string) (deadline: Time.Deadline) cancellationToken =
+        waitFor "cue-now-playing" deadline cancellationToken (fun () ->
+            task {
+                let! state = admin.GetJson("player-state", "/api/v0/player/state", deadline, cancellationToken)
+                match property "nowPlaying" state with
+                | Some nowPlaying when nowPlaying.ValueKind = JsonValueKind.Object ->
+                    return stringValue "trackId" nowPlaying = Some expectedTrackId, stringValue "trackId" nowPlaying
+                | _ -> return false, Some "missing-now-playing"
+            })
+
     let private waitForOffline admin requiredGeneration requireStopped (deadline: Time.Deadline) cancellationToken =
         waitFor "offline" deadline cancellationToken (fun () ->
             task {
@@ -218,14 +231,20 @@ module SmokeBackend =
             match settings.Mode with
             | "restart-live" ->
                 let! _ = restart admin deadline cancellationToken
-                let! track = findTrack admin deadline cancellationToken
+                let! track = findTrack "web10-compose-smoke" admin deadline cancellationToken
                 do! enqueue admin track deadline cancellationToken
+                do! waitForLive admin settings.RtmpStatUrl deadline cancellationToken
+            | "flac-cue" ->
+                let! _ = restart admin deadline cancellationToken
+                let! track = findTrack "web10-compose-cue-track-02" admin deadline cancellationToken
+                let! _ = admin.PostWithCsrf("cue-play-now", "/api/v0/admin/playback/play-now", {| TrackId = track |}, 202, deadline, cancellationToken)
+                do! waitForNowPlaying admin track deadline cancellationToken
                 do! waitForLive admin settings.RtmpStatUrl deadline cancellationToken
             | "reorder" -> do! reorder admin deadline cancellationToken
             | "skip" -> do! control admin "/api/v0/admin/playback/skip" "playback-skip" deadline cancellationToken
             | "restart-current" -> do! control admin "/api/v0/admin/playback/restart-current" "playback-restart-current" deadline cancellationToken
             | "play-now" ->
-                let! track = findTrack admin deadline cancellationToken
+                let! track = findTrack "web10-compose-smoke" admin deadline cancellationToken
                 let! _ = admin.PostWithCsrf("play-now", "/api/v0/admin/playback/play-now", {| TrackId = track |}, 202, deadline, cancellationToken)
                 return ()
             | "expect-output-failure" ->
@@ -242,7 +261,7 @@ module SmokeBackend =
                         })
             | "recover" ->
                 let! firstGeneration = restart admin deadline cancellationToken
-                let! track = findTrack admin deadline cancellationToken
+                let! track = findTrack "web10-compose-smoke" admin deadline cancellationToken
                 do! enqueue admin track deadline cancellationToken
                 do! waitForLive admin settings.RtmpStatUrl deadline cancellationToken
                 let! stoppedGeneration = stop admin deadline cancellationToken

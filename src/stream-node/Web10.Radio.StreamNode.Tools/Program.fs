@@ -6,7 +6,7 @@ open System.Threading
 module Program =
     let private usage () =
         printfn "Usage: Web10.Radio.StreamNode.Tools fake [options]"
-        printfn "       Web10.Radio.StreamNode.Tools smoke-backend --mode <restart-live|reorder|skip|restart-current|play-now|expect-output-failure|recover> --base-url <url> --rtmp-stat-url <url> --username <name> --password <password> [--timeout-seconds <seconds>]"
+        printfn "       Web10.Radio.StreamNode.Tools smoke-backend --mode <restart-live|flac-cue|reorder|skip|restart-current|play-now|expect-output-failure|recover> --base-url <url> --rtmp-stat-url <url> --username <name> --password <password> [--timeout-seconds <seconds>]"
 
     let private run command arguments =
         let parsed = Parsing.parseOptions arguments

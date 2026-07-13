@@ -23,7 +23,11 @@ module Liquidsoap =
         | _ -> "mp3"
 
     let mediaProtocolUri (assignment: Assignment) =
-        sprintf "web10media:%s.%s" (assignment.QueueItemId.ToString("D")) (extensionForContentType assignment.ContentType)
+        match assignment.CueStartMs, assignment.CueDurationMs with
+        | Some startMs, Some durationMs ->
+            sprintf "web10cue:%s:%d:%d.flac" (assignment.QueueItemId.ToString("D")) startMs durationMs
+        | _ ->
+            sprintf "web10media:%s.%s" (assignment.QueueItemId.ToString("D")) (extensionForContentType assignment.ContentType)
 
     let annotatedFileUri assignment path =
         let metadata =

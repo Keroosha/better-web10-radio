@@ -19,6 +19,7 @@
     <Compile Include="Migrations\TelegramServiceOutboxPartition.fs" />
     <Compile Include="Migrations\AdminBannersAndPlaybackPause.fs" />
     <Compile Include="Migrations\StorageCacheSettings.fs" />
+    <Compile Include="Migrations\FlacCueTracks.fs" />
     <Compile Include="Repositories\RepositoryError.fs" />
     <Compile Include="Repositories\AdminIdentityRepository.fs" />
     <Compile Include="Repositories\OutboxEventRepository.fs" />

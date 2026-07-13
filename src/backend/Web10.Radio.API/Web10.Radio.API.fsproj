@@ -13,6 +13,7 @@
     <Compile Include="ApiContracts.fs" />
     <Compile Include="AdminIdentity.fs" />
     <Compile Include="ApiReadModels.fs" />
+    <Compile Include="CueSheet.fs" />
     <Compile Include="TrackMetadata.fs" />
     <Compile Include="BackgroundWorkers.fs" />
     <Compile Include="StorageContent.fs" />
@@ -30,6 +31,7 @@
     <PackageReference Include="AWSSDK.S3" Version="4.0.100.3" />
     <PackageReference Include="z440.atl.core" Version="7.15.3" />
     <PackageReference Include="FsToolkit.ErrorHandling" Version="5.2.0" />
+    <PackageReference Include="System.Text.Encoding.CodePages" Version="10.0.0" />
     <PackageReference Include="Microsoft.Extensions.Identity.Core" Version="10.0.9" />
     <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.16.0" />
     <PackageReference Include="OpenTelemetry.Extensions.Hosting" Version="1.16.0" />

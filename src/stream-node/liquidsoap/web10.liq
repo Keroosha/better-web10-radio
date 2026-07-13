@@ -54,6 +54,44 @@ protocol.add(
   syntax="web10media:<queueItemId>.<ext>"
 )
 
+# A CUE request always resolves the ordinary authenticated FLAC object first.
+# process.uri gives FFmpeg a private local $(input) and a private $(output);
+# this resolver therefore never writes a trimmed object into shared cache/storage.
+def web10cue_protocol(~rlog, ~maxtime, arg) =
+  ignore(maxtime)
+  parts = string.split(separator=":", path.remove_extension(arg))
+  extension = file.extension(leading_dot=false, arg)
+  if list.length(parts) == 3 then
+    let [queue_item_id, start_raw, duration_raw] = parts
+    start_ms = int_of_string(start_raw, default=-1)
+    duration_ms = int_of_string(duration_raw, default=-1)
+    valid_uuid = r/^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/.test(queue_item_id)
+    if extension == "flac" and valid_uuid and start_ms >= 0 and duration_ms > 0 then
+      start_seconds = string.float(decimal_places=3, float_of_int(start_ms) / 1000.)
+      duration_seconds = string.float(decimal_places=3, float_of_int(duration_ms) / 1000.)
+      source_uri = "web10media:#{queue_item_id}.flac"
+      process.uri(
+        extname="flac",
+        uri=source_uri,
+        "ffmpeg -hide_banner -loglevel error -i $(input) -ss #{start_seconds} -t #{duration_seconds} -map 0:a:0 -vn -sn -dn -c:a flac -y $(output)"
+      )
+    else
+      rlog("Invalid web10cue request URI.")
+      failwith("Invalid web10cue request URI.")
+    end
+  else
+    rlog("Invalid web10cue request URI.")
+    failwith("Invalid web10cue request URI.")
+  end
+end
+protocol.add(
+  "web10cue",
+  web10cue_protocol,
+  temporary=true,
+  doc="Decode a bounded FLAC CUE segment from an assigned media object",
+  syntax="web10cue:<queueItemId>:<cueStartMs>:<cueDurationMs>.flac"
+)
+
 # Liquidsoap 2.4's experimental external readers do not preserve pipe framing
 # for rawvideo or AVI. Its native FFmpeg input captures the same X11 surface
 # directly, with decoded YUV frames and no intermediary framing failure.

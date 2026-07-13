@@ -800,3 +800,41 @@ VALUES (@QueueItemId, @TrackId, 'fallback', 'Playing', 0, @NowUtc, @NowUtc, @Cla
                 | Ok None -> ()
                 | actual -> Assert.Fail(sprintf "The same item is not playable in Local mode without a cache, got %A." actual)
             })
+
+    [<Test>]
+    let ``current assignment exposes CUE decoder timing`` () =
+        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
+            task {
+                let trackId = newId ()
+                let fileId = newId ()
+                let queueItemId = newId ()
+                let owner = newId ()
+                let now = DateTimeOffset(2026, 7, 13, 21, 0, 0, TimeSpan.Zero)
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+                use setup =
+                    new NpgsqlCommand(
+                        """INSERT INTO "Tracks" ("Id", "Title", "Artist", "DurationMs", "MetadataSource", "IsDeleted")
+VALUES (@TrackId, 'Segment', 'Artist', 3000, 'Cue', false);
+INSERT INTO "TrackFiles" ("Id", "TrackId", "StoragePath", "CachePath", "ContentType", "IsCached", "CueSheetPath", "CueTrackNumber", "CueStartMs", "CueDurationMs", "IsDeleted")
+VALUES (@FileId, @TrackId, 'album.flac', '/cache/album.flac', 'audio/flac', true, 'album.cue', 2, 3000, 3000, false);
+INSERT INTO "PlaybackQueue" ("Id", "TrackId", "Source", "Status", "Priority", "RequestedAtUtc", "StartedAtUtc", "ClaimOwner", "ClaimAttempt", "ClaimLeaseExpiresAtUtc", "IsDeleted")
+VALUES (@QueueItemId, @TrackId, 'fallback', 'Playing', 0, @Now, @Now, @Owner, 1, @Lease, false);""",
+                        connection
+                    )
+                for name, value in
+                    [ "TrackId", box trackId; "FileId", box fileId; "QueueItemId", box queueItemId
+                      "Owner", box owner; "Now", box now; "Lease", box (now.AddSeconds 30.0) ] do
+                    setup.Parameters.AddWithValue(name, value) |> ignore
+                let! _ = setup.ExecuteNonQueryAsync()
+                use dataSource = NpgsqlDataSource.Create(connectionString)
+                let! current = PlaybackQueueRepository.getCurrentAssignment dataSource false CancellationToken.None
+                match current with
+                | Ok(Some assignment) ->
+                    Assert.Multiple(fun () ->
+                        Assert.That(assignment.QueueItemId, Is.EqualTo(queueItemId))
+                        Assert.That(assignment.ContentType, Is.EqualTo("audio/flac"))
+                        Assert.That(assignment.CueStartMs, Is.EqualTo(Some 3000))
+                        Assert.That(assignment.CueDurationMs, Is.EqualTo(Some 3000)))
+                | actual -> Assert.Fail(sprintf "Expected timed CUE assignment, got %A." actual)
+            })

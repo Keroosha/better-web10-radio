@@ -3,6 +3,8 @@ namespace Web10.Radio.API
 open System
 open System.Net.Http
 open Microsoft.AspNetCore.Builder
+open Microsoft.AspNetCore.Hosting
+open Microsoft.AspNetCore.Server.Kestrel.Core
 open Microsoft.Extensions.Configuration
 open Microsoft.Extensions.DependencyInjection
 open System.Text.Json
@@ -34,6 +36,9 @@ module Program =
         with _ ->
             1
 
+    let configureRequestBodyLimit (maxUploadBytes: int64) (limits: KestrelServerLimits) : unit =
+        limits.MaxRequestBodySize <- Nullable(maxUploadBytes)
+
     [<EntryPoint>]
     let main args =
         match args with
@@ -52,6 +57,10 @@ module Program =
                 | Ok options -> options
                 | Error errors -> raise (InvalidOperationException(invalidConfigurationMessage errors))
 
+
+            builder.WebHost.ConfigureKestrel(fun serverOptions ->
+                configureRequestBodyLimit options.Storage.MaxUploadBytes serverOptions.Limits)
+            |> ignore
             builder.Services
             |> DatabaseComposition.addDatabase options.Postgres
             |> ApplicationComposition.addApplicationServices

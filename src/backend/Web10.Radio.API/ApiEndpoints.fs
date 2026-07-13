@@ -26,6 +26,7 @@ open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.Logging
 open Microsoft.Extensions.Options
 open Microsoft.Extensions.Primitives
+open Microsoft.Net.Http.Headers
 open Microsoft.Extensions.Hosting
 open Npgsql
 open Web10.Radio.Database
@@ -2449,6 +2450,11 @@ module ApiEndpoints =
         let safe = if String.IsNullOrWhiteSpace candidate then "download" else candidate
         safe.Replace("\r", String.Empty, StringComparison.Ordinal).Replace("\n", String.Empty, StringComparison.Ordinal)
 
+    let storageDownloadContentDisposition (path: string) =
+        let disposition = ContentDispositionHeaderValue("attachment")
+        disposition.SetHttpFileName(StringSegment(storageFileName path))
+        disposition.ToString()
+
     let private storageInlineContentType (contentType: string) =
         let value = contentType.ToLowerInvariant()
         value.StartsWith("audio/", StringComparison.Ordinal)
@@ -2505,8 +2511,7 @@ module ApiEndpoints =
                     handle.ContentRange |> Option.iter (fun value -> context.Response.Headers["Content-Range"] <- value)
                     context.Response.ContentLength <- Nullable handle.ContentLength
                     if storageDownloadRequested context || not (storageInlineContentType contentType) then
-                        let disposition: string = sprintf "attachment; filename=\"%s\"" (storageFileName path)
-                        context.Response.Headers["Content-Disposition"] <- StringValues(disposition)
+                        context.Response.Headers["Content-Disposition"] <- StringValues(storageDownloadContentDisposition path)
                     if not (HttpMethods.IsHead(context.Request.Method)) then
                         do! handle.Stream.CopyToAsync(context.Response.Body, context.RequestAborted)
                     return context.Response.StatusCode

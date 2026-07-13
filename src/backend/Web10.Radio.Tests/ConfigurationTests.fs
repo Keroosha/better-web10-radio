@@ -6,6 +6,7 @@ open System.Diagnostics
 open System.IO
 open System.Threading
 open Microsoft.Extensions.Configuration
+open Microsoft.AspNetCore.Server.Kestrel.Core
 open NUnit.Framework
 open Web10.Radio.API
 
@@ -232,6 +233,19 @@ module ConfigurationTests =
             requiredEnvironmentVariables
             |> List.iter (fun environmentVariable -> Assert.That(message, Does.Contain(environmentVariable)))
 
+
+    [<Test>]
+    let ``configured storage upload ceiling configures Kestrel request body limit`` () =
+        withTemporaryDirectory (fun root ->
+            let pairs = configurationPairs root |> Map.add "STORAGE:MAX_UPLOAD_BYTES" "52428800"
+
+            match Configuration.load (buildConfiguration pairs) with
+            | Ok options ->
+                let serverOptions = KestrelServerOptions()
+                Program.configureRequestBodyLimit options.Storage.MaxUploadBytes serverOptions.Limits
+                Assert.That(serverOptions.Limits.MaxRequestBodySize, Is.EqualTo(Nullable 52428800L))
+            | Error errors ->
+                Assert.Fail(sprintf "Expected overridden storage upload ceiling to load, but got %s." (joinedErrors errors)))
 
     [<Test>]
     let ``load rejects every semantic invalid configuration category without leaking secrets`` () =

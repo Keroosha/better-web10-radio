@@ -17,6 +17,20 @@ type StorageContentTests() =
         | Ok actual -> Assert.That(actual, Is.EqualTo(expected))
         | Error () -> Assert.Fail("Expected a valid value.")
 
+    [<TestCase("Altær.flac")>]
+    [<TestCase("Песня 漢字 🌟.flac")>]
+    member _.``storage download headers RFC 5987 encode Unicode file names``(fileName: string) =
+        let disposition = ApiEndpoints.storageDownloadContentDisposition("album/" + fileName)
+        let encodedPrefix = "filename*=UTF-8''"
+        let startIndex = disposition.IndexOf(encodedPrefix, StringComparison.Ordinal)
+
+        Assert.That(disposition, Does.StartWith("attachment;"))
+        Assert.That(startIndex, Is.GreaterThanOrEqualTo(0), "Expected an RFC 5987 filename* parameter.")
+        Assert.That(disposition |> Seq.forall (fun character -> int character <= 127), Is.True, "HTTP header values must remain ASCII.")
+
+        let encodedFileName = disposition.Substring(startIndex + encodedPrefix.Length)
+        Assert.That(Uri.UnescapeDataString(encodedFileName), Is.EqualTo(fileName))
+
     [<Test>]
     member _.``storage paths accept root and canonical descendants``() =
         expectOk "" (StoragePath.canonical "")

@@ -837,6 +837,84 @@ VALUES ('00000000-0000-0000-0000-000000000302', '00000000-0000-0000-0000-0000000
             })
 
     [<Test>]
+    let ``202607130003 reconciles the legacy FLAC CUE migration version collision`` () =
+        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
+            task {
+                withMigrationRunner connectionString (fun runner -> runner.MigrateDown(202607130001L))
+
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+
+                use legacyFlacSchema =
+                    new NpgsqlCommand(
+                        """ALTER TABLE "TrackFiles"
+    ADD COLUMN "CueSheetPath" text NULL,
+    ADD COLUMN "CueTrackNumber" integer NULL,
+    ADD COLUMN "CueStartMs" integer NULL,
+    ADD COLUMN "CueDurationMs" integer NULL;
+
+DROP INDEX IF EXISTS "UX_TrackFiles_Active_Backend_StoragePath";
+DROP INDEX IF EXISTS "UX_TrackFiles_Active_NullBackend_StoragePath";
+
+CREATE UNIQUE INDEX "UX_TrackFiles_Active_Backend_StoragePath_Cue"
+    ON "TrackFiles" (
+        "StorageBackendId",
+        "StoragePath",
+        COALESCE("CueSheetPath", ''),
+        COALESCE("CueTrackNumber", 0)
+    )
+    WHERE "IsDeleted" = false AND "StorageBackendId" IS NOT NULL;
+
+CREATE UNIQUE INDEX "UX_TrackFiles_Active_NullBackend_StoragePath_Cue"
+    ON "TrackFiles" (
+        "StoragePath",
+        COALESCE("CueSheetPath", ''),
+        COALESCE("CueTrackNumber", 0)
+    )
+    WHERE "IsDeleted" = false AND "StorageBackendId" IS NULL;
+
+INSERT INTO "VersionInfo" ("Version", "AppliedOn", "Description")
+VALUES (202607130002, CURRENT_TIMESTAMP, 'Add logical FLAC CUE track segments');""",
+                        connection
+                    )
+
+                let! _ = legacyFlacSchema.ExecuteNonQueryAsync()
+                withMigrationRunner connectionString (fun runner -> runner.MigrateUp())
+
+                use verification =
+                    new NpgsqlCommand(
+                        """SELECT
+    (
+        SELECT COUNT(*)
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'TrackFiles'
+          AND column_name IN ('CueSheetPath', 'CueTrackNumber', 'CueStartMs', 'CueDurationMs')
+    ) = 4,
+    EXISTS (
+        SELECT 1
+        FROM "Banners"
+        WHERE "Type" = 'superchat' AND "IsDeleted" = false
+    ),
+    EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'CK_TrackFiles_CueSegment_AllOrNone'
+          AND conrelid = '"TrackFiles"'::regclass
+    );""",
+                        connection
+                    )
+
+                let! reader = verification.ExecuteReaderAsync()
+                use reader = reader
+                let! hasRow = reader.ReadAsync()
+                Assert.That(hasRow, Is.True)
+                Assert.That(reader.GetBoolean(0), Is.True, "Legacy FLAC CUE columns must remain available after reconciliation.")
+                Assert.That(reader.GetBoolean(1), Is.True, "The skipped version-202607130002 banner migration must be reconciled.")
+                Assert.That(reader.GetBoolean(2), Is.True, "Legacy FLAC CUE columns must receive their missing schema invariant.")
+            })
+
+    [<Test>]
     let ``soft-deleted track parents cannot supply an active stream file join`` () =
         DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
             task {

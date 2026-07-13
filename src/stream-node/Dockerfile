@@ -42,7 +42,9 @@ RUN set -eu; \
         xvfb \
         dumb-init \
         socat \
-        unclutter-xfixes; \
+        unclutter-xfixes \
+        fontconfig \
+        fonts-noto-cjk; \
     liquidsoap_deb=/tmp/liquidsoap.deb; \
     curl --fail --location --proto '=https' --tlsv1.2 "${LIQUIDSOAP_DEB_URL}" --output "${liquidsoap_deb}"; \
     printf '%s  %s\n' "${LIQUIDSOAP_DEB_SHA256}" "${liquidsoap_deb}" | sha256sum --check --status -; \

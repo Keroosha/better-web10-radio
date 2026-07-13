@@ -1,9 +1,18 @@
 #!/bin/sh
 set -eu
 
-for command in liquidsoap Xvfb chromium ffmpeg ffprobe unclutter; do
+for command in liquidsoap Xvfb chromium ffmpeg ffprobe unclutter fc-match; do
     command -v "$command" >/dev/null
 done
+
+japanese_font="$(fc-match --format='%{family}' 'sans-serif:lang=ja')"
+case "$japanese_font" in
+    *"Noto Sans CJK"*) ;;
+    *)
+        echo "Japanese font fallback is unavailable: ${japanese_font}" >&2
+        exit 1
+        ;;
+esac
 
 # Validate the same required configuration that the F# runtime uses.
 ./Web10.Radio.StreamNode validate-config

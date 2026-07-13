@@ -14,7 +14,7 @@ import {
   type StorageEntry,
 } from '@web10/shared';
 
-import { StoragePage } from './StoragePage';
+import { collectDroppedUploads, StoragePage, type DroppedEntry } from './StoragePage';
 import { ToastProvider } from '../../shared/ui/toast';
 
 vi.mock('@web10/shared', async () => {
@@ -126,6 +126,28 @@ test('opens a drive and navigates into a folder', async () => {
     { storageBackendId: S3_ID, path: 'album', limit: 100 },
     expect.objectContaining({ signal: expect.any(AbortSignal) }),
   );
+});
+
+test('collects nested dropped folder files with their relative paths', async () => {
+  const cover = new File(['cover'], 'cover.png', { type: 'image/png' });
+  const track = new File(['track'], 'track.flac', { type: 'audio/flac' });
+  const entries: DroppedEntry[] = [
+    {
+      kind: 'directory',
+      readChildren: async () => [
+        { kind: 'file', relativePath: 'album/cover.png', readFile: async () => cover },
+        {
+          kind: 'directory',
+          readChildren: async () => [{ kind: 'file', relativePath: 'album/disc-1/track.flac', readFile: async () => track }],
+        },
+      ],
+    },
+  ];
+
+  await expect(collectDroppedUploads(entries)).resolves.toEqual([
+    { file: cover, relativePath: 'album/cover.png' },
+    { file: track, relativePath: 'album/disc-1/track.flac' },
+  ]);
 });
 
 test('joins a directory upload path to the current folder', async () => {

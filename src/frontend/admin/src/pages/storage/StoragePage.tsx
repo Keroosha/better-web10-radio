@@ -77,6 +77,121 @@ interface DeleteDialogState {
   readonly entries: StorageDeleteSelection[];
 }
 
+export interface StorageUpload {
+  readonly file: File;
+  readonly relativePath: string;
+}
+
+export interface DroppedFileEntry {
+  readonly kind: 'file';
+  readonly relativePath: string;
+  readonly readFile: () => Promise<File>;
+}
+
+export interface DroppedDirectoryEntry {
+  readonly kind: 'directory';
+  readonly readChildren: () => Promise<readonly DroppedEntry[]>;
+}
+
+export type DroppedEntry = DroppedFileEntry | DroppedDirectoryEntry;
+
+function uploadsFromFiles(files: readonly File[]): StorageUpload[] {
+  return files.map((file) => ({ file, relativePath: file.webkitRelativePath || file.name }));
+}
+
+function readEntryFile(entry: FileSystemFileEntry): Promise<File> {
+  const deferred = Promise.withResolvers<File>();
+  entry.file(deferred.resolve, deferred.reject);
+  return deferred.promise;
+}
+
+function readDirectoryBatch(reader: FileSystemDirectoryReader): Promise<FileSystemEntry[]> {
+  const deferred = Promise.withResolvers<FileSystemEntry[]>();
+  reader.readEntries(deferred.resolve, deferred.reject);
+  return deferred.promise;
+}
+
+async function readDirectoryEntries(entry: FileSystemDirectoryEntry): Promise<FileSystemEntry[]> {
+  const reader = entry.createReader();
+  const entries: FileSystemEntry[] = [];
+
+  for (;;) {
+    const batch = await readDirectoryBatch(reader);
+    if (batch.length === 0) return entries;
+    entries.push(...batch);
+  }
+}
+
+function isFileEntry(entry: FileSystemEntry): entry is FileSystemFileEntry {
+  return entry.isFile;
+}
+
+function isDirectoryEntry(entry: FileSystemEntry): entry is FileSystemDirectoryEntry {
+  return entry.isDirectory;
+}
+
+function dropRelativePath(entry: FileSystemEntry): string {
+  const fullPath = entry.fullPath.startsWith('/') ? entry.fullPath.slice(1) : entry.fullPath;
+  return fullPath === '' ? entry.name : fullPath;
+}
+
+function toDroppedEntry(entry: FileSystemEntry): DroppedEntry | null {
+  if (isFileEntry(entry)) {
+    return { kind: 'file', relativePath: dropRelativePath(entry), readFile: () => readEntryFile(entry) };
+  }
+
+  if (isDirectoryEntry(entry)) {
+    return {
+      kind: 'directory',
+      readChildren: async () => {
+        const children: DroppedEntry[] = [];
+        for (const child of await readDirectoryEntries(entry)) {
+          const dropped = toDroppedEntry(child);
+          if (dropped !== null) children.push(dropped);
+        }
+        return children;
+      },
+    };
+  }
+
+  return null;
+}
+
+export async function collectDroppedUploads(entries: readonly DroppedEntry[]): Promise<StorageUpload[]> {
+  const uploads: StorageUpload[] = [];
+
+  const collect = async (entry: DroppedEntry): Promise<void> => {
+    if (entry.kind === 'file') {
+      uploads.push({ file: await entry.readFile(), relativePath: entry.relativePath });
+      return;
+    }
+
+    for (const child of await entry.readChildren()) {
+      await collect(child);
+    }
+  };
+
+  for (const entry of entries) {
+    await collect(entry);
+  }
+
+  return uploads;
+}
+
+async function uploadsFromDrop(dataTransfer: DataTransfer): Promise<StorageUpload[]> {
+  const entries: DroppedEntry[] = [];
+
+  for (const item of Array.from(dataTransfer.items)) {
+    const entry = item.webkitGetAsEntry?.() ?? null;
+    if (entry !== null) {
+      const dropped = toDroppedEntry(entry);
+      if (dropped !== null) entries.push(dropped);
+    }
+  }
+
+  return entries.length === 0 ? uploadsFromFiles(Array.from(dataTransfer.files)) : collectDroppedUploads(entries);
+}
+
 const ROOT: Loc = { driveKey: null, path: '' };
 const SELECT_BG = 'linear-gradient(#dcecfb,#bcdcf7)';
 const NAV_BG = 'linear-gradient(#e3f0fb,#c9e2fb)';
@@ -340,16 +455,15 @@ function StorageExplorer({ initial }: { readonly initial: Storage }): ReactEleme
   );
 
   const uploadFiles = useCallback(
-    async (files: File[]): Promise<void> => {
+    async (uploads: readonly StorageUpload[]): Promise<void> => {
       if (activeDrive === null) return;
       const backendId = activeDrive.backendId;
       const base = loc.path;
-      const work = files.filter((file) => {
-        const relative = file.webkitRelativePath || file.name;
-        const target = base === '' ? relative : `${base}/${relative}`;
+      const work = uploads.filter((upload) => {
+        const target = base === '' ? upload.relativePath : `${base}/${upload.relativePath}`;
         return isSafeStoragePath(target);
       });
-      if (work.length !== files.length) showToast('Часть путей загрузки недопустима');
+      if (work.length !== uploads.length) showToast('Часть путей загрузки недопустима');
       if (work.length === 0) return;
       uploadAbort.current?.abort();
       const controller = new AbortController();
@@ -363,12 +477,11 @@ function StorageExplorer({ initial }: { readonly initial: Storage }): ReactEleme
           const index = nextIndex;
           nextIndex += 1;
           if (index >= work.length) return;
-          const file = work[index];
-          if (file === undefined) return;
-          const relative = file.webkitRelativePath || file.name;
-          const target = base === '' ? relative : `${base}/${relative}`;
+          const upload = work[index];
+          if (upload === undefined) return;
+          const target = base === '' ? upload.relativePath : `${base}/${upload.relativePath}`;
           try {
-            await uploadStorageFile({ storageBackendId: backendId, path: target }, file, { signal: controller.signal });
+            await uploadStorageFile({ storageBackendId: backendId, path: target }, upload.file, { signal: controller.signal });
             completed += 1;
           } catch {
             failed += 1;
@@ -636,7 +749,7 @@ function StorageExplorer({ initial }: { readonly initial: Storage }): ReactEleme
                 multiple
                 aria-label="Загрузить файлы"
                 hidden
-                onChange={(event) => void uploadFiles(Array.from(event.target.files ?? []))}
+                onChange={(event) => void uploadFiles(uploadsFromFiles(Array.from(event.target.files ?? [])))}
               />
               <button type="button" style={commandBtn} onClick={() => fileInputRef.current?.click()}>
                 ⭱ Загрузить файлы
@@ -652,7 +765,7 @@ function StorageExplorer({ initial }: { readonly initial: Storage }): ReactEleme
                 multiple
                 aria-label="Загрузить папку"
                 hidden
-                onChange={(event) => void uploadFiles(Array.from(event.target.files ?? []))}
+                onChange={(event) => void uploadFiles(uploadsFromFiles(Array.from(event.target.files ?? [])))}
               />
               <button type="button" style={commandBtn} onClick={() => folderInputRef.current?.click()}>
                 🗀 Загрузить папку
@@ -742,7 +855,9 @@ function StorageExplorer({ initial }: { readonly initial: Storage }): ReactEleme
               ? (event) => {
                   event.preventDefault();
                   setDragOver(false);
-                  void uploadFiles(Array.from(event.dataTransfer.files));
+                  void uploadsFromDrop(event.dataTransfer)
+                    .then((uploads) => uploadFiles(uploads))
+                    .catch((cause) => showToast(errorMessage(cause, 'Не удалось прочитать папку')));
                 }
               : undefined
           }

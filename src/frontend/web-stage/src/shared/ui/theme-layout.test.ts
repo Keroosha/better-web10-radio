@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest';
 
-import { getOverlayLayout } from './layout';
+import { getSuperChatMessageLimit } from './layout';
 import { getOverlayTheme } from './theme';
 
 describe('getOverlayTheme', () => {
@@ -13,34 +13,13 @@ describe('getOverlayTheme', () => {
   });
 });
 
-describe('getOverlayLayout', () => {
-  test('corners stacks widgets absolutely, limit 4', () => {
-    const l = getOverlayLayout('corners');
-    expect(l.container.display).toBeUndefined();
-    expect(l.donation.position).toBe('absolute');
-    expect(l.messageLimit).toBe(4);
+describe('getSuperChatMessageLimit', () => {
+  test('corners and sidebar preserve the four-message cap', () => {
+    expect(getSuperChatMessageLimit('corners')).toBe(4);
+    expect(getSuperChatMessageLimit('sidebar')).toBe(4);
   });
 
-  test('sidebar is a flex column, limit 4', () => {
-    const l = getOverlayLayout('sidebar');
-    expect(l.container.display).toBe('flex');
-    expect(l.container.flexDirection).toBe('column');
-    expect(l.donation.position).toBe('relative');
-    expect(l.messageLimit).toBe(4);
-  });
-
-  test('bottombar is a flex row, limit 3', () => {
-    const l = getOverlayLayout('bottombar');
-    expect(l.container.display).toBe('flex');
-    expect(l.container.flexDirection).toBe('row');
-    expect(l.messageLimit).toBe(3);
-  });
-
-  test('NOW PLAYING is pinned top-centre in every layout', () => {
-    for (const layout of ['corners', 'sidebar', 'bottombar'] as const) {
-      const l = getOverlayLayout(layout);
-      expect(l.now.position).toBe('absolute');
-      expect(l.now.top).toBe('16px');
-    }
+  test('bottombar preserves the three-message cap', () => {
+    expect(getSuperChatMessageLimit('bottombar')).toBe(3);
   });
 });

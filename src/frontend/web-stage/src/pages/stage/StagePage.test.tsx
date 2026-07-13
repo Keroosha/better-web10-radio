@@ -38,6 +38,25 @@ describe('StagePage', () => {
     expect(screen.queryByText('FOLLOW US')).toBeNull();
   });
 
+  test('does not restore a detached superchat widget when the snapshot omits its banner', async () => {
+    const fake = makeFakeConnector();
+    const snapshot = validPlayerState();
+    const withoutSuperChat = {
+      ...snapshot,
+      banners: snapshot.banners.filter((banner) => banner.type !== 'superchat'),
+    };
+    render(
+      <StagePage
+        createScene={fakeScene}
+        connector={fake.connector}
+        fetchImpl={fakeStateFetch(withoutSuperChat)}
+      />,
+    );
+
+    await waitFor(() => expect(screen.queryByText('SUPER CHAT')).toBeNull());
+    expect(screen.queryByText('vhs_wanderer')).toBeNull();
+  });
+
   test('capture mode hides the document cursor and cleans up on exit', () => {
     const fake = makeFakeConnector();
     const view = render(

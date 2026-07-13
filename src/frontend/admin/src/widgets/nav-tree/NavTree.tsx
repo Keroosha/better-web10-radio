@@ -68,9 +68,6 @@ export function NavTree({ nav, onNavigate }: NavTreeProps): ReactElement {
             <li style={itemStyle(nav.view === 'banners')} onClick={() => onNavigate('banners')}>
               <span style={glyph}>🖼️</span>Баннеры
             </li>
-            <li style={itemStyle(nav.view === 'goals')} onClick={() => onNavigate('goals')}>
-              <span style={glyph}>🎯</span>Цели сбора
-            </li>
             <li style={itemStyle(nav.view === 'storage')} onClick={() => onNavigate('storage')}>
               <span style={glyph}>🗄️</span>Хранилища
             </li>

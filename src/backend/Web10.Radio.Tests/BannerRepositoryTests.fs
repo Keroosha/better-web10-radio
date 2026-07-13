@@ -22,6 +22,49 @@ module BannerRepositoryTests =
           Enabled = true
           RotationSeconds = None }
 
+
+    [<Test>]
+    let ``migrated superchat banner seed is active and type constraint rejects unknown values`` () =
+        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
+            task {
+                use dataSource = NpgsqlDataSource.Create(connectionString)
+                let! listed = AdminContentRepository.listBanners dataSource CancellationToken.None
+
+                match listed with
+                | Ok banners ->
+                    let superChats = banners |> List.filter (fun banner -> banner.Type = "superchat")
+                    Assert.That(superChats |> List.length, Is.EqualTo(1), "The migration must seed exactly one active superchat banner.")
+                    let superChat = superChats |> List.head
+                    Assert.That(superChat.Title, Is.EqualTo("SUPER CHAT"))
+                    Assert.That(superChat.Enabled, Is.True)
+                    Assert.That(superChat.ScreenPosition, Is.EqualTo("bottom-left"))
+                    Assert.That(superChat.RotationSeconds, Is.EqualTo(0))
+                | actual -> Assert.Fail(sprintf "Expected the seeded banner list, got %A." actual)
+
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+                use invalidInsert =
+                    new NpgsqlCommand(
+                        """INSERT INTO "Banners" ("Id", "Type", "Title", "Style", "ScreenPosition")
+VALUES (gen_random_uuid(), 'invalid', 'INVALID', 'aero', 'top-left');""",
+                        connection
+                    )
+
+                let! failure =
+                    task {
+                        try
+                            let! _ = invalidInsert.ExecuteNonQueryAsync()
+                            return None
+                        with error ->
+                            return Some error
+                    }
+
+                match failure with
+                | Some (:? PostgresException as error) ->
+                    Assert.That(error.SqlState, Is.EqualTo("23514"))
+                    Assert.That(error.ConstraintName, Is.EqualTo("Banners_Type_check"))
+                | _ -> Assert.Fail("Banners_Type_check must reject unknown banner types.")
+            })
     [<Test>]
     let ``replacing banners upserts and soft-deletes omitted rows`` () =
         DatabaseTestSupport.withMigratedDatabase (fun connectionString ->

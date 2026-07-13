@@ -10,7 +10,7 @@ interface DonationGoalWidgetProps {
   /** Progress percentage (0–100) from `selectDonationPercent`. */
   readonly percent: number;
   readonly theme: StageTheme;
-  /** `{...theme.win, ...layout.donation}`. */
+  /** `{...theme.win, ...getBannerPositionStyle(banner.screenPosition)}`. */
   readonly windowStyle: CSSProperties;
   /** Title-bar caption; defaults to `DONATION GOAL` when the banner omits it. */
   readonly title?: string;

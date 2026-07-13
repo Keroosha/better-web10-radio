@@ -14,6 +14,7 @@ import {
   type SocialLink,
 } from '@web10/shared';
 
+import { DonationGoalEditor } from '../../features/donation-goal-editor/DonationGoalEditor';
 import { errorMessage } from '../../shared/lib/errorMessage';
 import { useToast } from '../../shared/ui/toast';
 import { COLORS, formGrid, iconButton, panel } from '../../shared/ui/tokens';
@@ -22,6 +23,7 @@ const TYPE_LABEL: Record<BannerType, string> = {
   nowplaying: 'Сейчас играет',
   donation: 'Цель сбора',
   social: 'Соцсети',
+  superchat: 'Супер чат',
   custom: 'Произвольный',
 };
 
@@ -51,7 +53,7 @@ function toRequest(banners: readonly Banner[]): BannersReplaceRequest {
   }));
 }
 
-/** Баннеры: список + редактор оверлеев с превью; для типа «Соцсети» — список ссылок. */
+/** Баннеры: список + редактор оверлеев с превью и type-specific content editors. */
 export function BannersPage(): ReactElement {
   const { showToast } = useToast();
   const [banners, setBanners] = useState<Banner[]>([]);
@@ -142,6 +144,7 @@ export function BannersPage(): ReactElement {
                 <option value="nowplaying">Сейчас играет</option>
                 <option value="donation">Цель сбора</option>
                 <option value="social">Соцсети</option>
+                <option value="superchat">Супер чат</option>
                 <option value="custom">Произвольный</option>
               </select>
               <label htmlFor="bn-title">Заголовок</label>
@@ -176,11 +179,10 @@ export function BannersPage(): ReactElement {
                   />
                 ))}
               </div>
-              <label htmlFor="bn-enabled">Показ</label>
-              <div>
-                <input id="bn-enabled" type="checkbox" checked={selected.enabled} onChange={(event) => patch({ enabled: event.target.checked })} />{' '}
-                <span style={{ fontSize: '12px', color: COLORS.subtle }}>{selected.enabled ? 'Показывается на стриме' : 'Скрыт со стрима'}</span>
-              </div>
+              <label htmlFor="bn-enabled" style={{ gridColumn: '1 / -1', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <input id="bn-enabled" type="checkbox" checked={selected.enabled} onChange={(event) => patch({ enabled: event.target.checked })} />
+                Показывать на стриме
+              </label>
               {selected.type === 'social' ? (
                 <>
                   <label htmlFor="bn-rotation">Смена ссылок</label>
@@ -209,6 +211,7 @@ export function BannersPage(): ReactElement {
               </button>
             </div>
             {selected.type === 'social' ? <SocialLinksEditor /> : null}
+            {selected.type === 'donation' ? <DonationGoalEditor /> : null}
           </div>
 
           <div style={{ flex: 1, minWidth: '280px', order: 2 }}>

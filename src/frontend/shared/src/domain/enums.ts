@@ -59,7 +59,7 @@ export const OverlayLayoutSchema = z.enum(['corners', 'sidebar', 'bottombar']);
 export type OverlayLayout = z.infer<typeof OverlayLayoutSchema>;
 
 /** `banners[].type` — the overlay banner kind rendered on the stage. */
-export const BannerTypeSchema = z.enum(['nowplaying', 'donation', 'social', 'custom']);
+export const BannerTypeSchema = z.enum(['nowplaying', 'donation', 'social', 'superchat', 'custom']);
 export type BannerType = z.infer<typeof BannerTypeSchema>;
 
 /** `banners[].style` — banner chrome theme; mirrors {@link OverlayStyleSchema}. */

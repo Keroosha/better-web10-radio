@@ -54,7 +54,7 @@
 
 - [x] Implement NOW PLAYING widget using `nowPlaying.title`, `nowPlaying.artist`, live pill, and equalizer bars.
 - [x] Implement DONATION GOAL widget using Stars amounts, top donator, raised/goal progress, and recent donations.
-- [x] Implement SUPER CHAT widget using approved `/say` messages only.
+- [x] Implement SUPER CHAT widget using approved `/say` messages only; its title, visibility, style, and position are controlled only by the `superchat` banner in the designer (`enabled` hides it completely).
 - [x] Implement FOLLOW US widget using social links, QR image URL, featured social rotation, glyphs, colors, and handles.
 - [x] Implement donation toast when `player.donation` SSE event arrives.
 - [x] Implement overlay style variants `aero` and `win9x`.
@@ -69,8 +69,8 @@
 
 - [x] Scaffold Feature-Sliced Design (FSD) layers for `src/frontend/admin`: `app`, `pages`, `widgets`, `features`, `entities`, `shared` imports only from `src/frontend/shared`.
 - [x] Implement dashboard page with stream status, current track, queue summary, and stream-node heartbeat.
-- [x] Implement social links management page backed by `/api/v0/admin/social-links`, including replacement writes.
-- [x] Implement donation goal management page backed by `/api/v0/admin/donation-goal`, including update writes.
+- [x] Implement social links management inside the banner designer’s `social` type panel, backed by `/api/v0/admin/social-links`, including replacement writes.
+- [x] Implement donation goal management inside the banner designer’s `donation` type panel, backed by `/api/v0/admin/donation-goal`, including update writes.
 - [x] Implement playlists page backed by `/api/v0/admin/playlists` and playlist item routes, including policy/schedule editing and system All tracks handling.
 - [x] Implement storage settings page for `Local` and `S3` values.
 - [x] Implement `/say` moderation queue with approve/reject actions. ✅ (2026-07-10) — `SayModerationPage` (status tabs + approve `{}` / reject `{reason}` 1–500 chars), backed by the pinned SPEC §5 contract and the real backend routes; `AdminSayMessageDto` + `getSayMessages`/`approveSayMessage`/`rejectSayMessage` in `shared`.

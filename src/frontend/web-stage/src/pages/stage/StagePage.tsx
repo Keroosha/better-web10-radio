@@ -10,7 +10,7 @@ import {
 import { DonationToast } from '../../features/donation-toast';
 import { useStageState, type UseStageStateOptions } from '../../features/stage-state';
 import { StreamAudio } from '../../features/stream-audio';
-import { getOverlayLayout } from '../../shared/ui/layout';
+import { getSuperChatMessageLimit } from '../../shared/ui/layout';
 import { getOverlayTheme } from '../../shared/ui/theme';
 import { BannersLayer } from '../../widgets/banners';
 import {
@@ -18,7 +18,6 @@ import {
   type SceneFactory,
   type StageSceneProps,
 } from '../../widgets/stage-scene/StageScene';
-import { SuperChatWidget } from '../../widgets/super-chat';
 import '../../shared/ui/overlay.css';
 
 export interface StagePageProps {
@@ -62,7 +61,7 @@ function readStageParams(): StageParams {
 }
 
 /**
- * The public stage: the 3D scene with the four overlay widgets, donation toast and audio
+ * The public stage: the 3D scene with configured overlay banners, donation toast and audio
  * layered on top, all driven by the single live `useStageState` hook. Renders correctly
  * from the empty/offline default (SPEC §10/§12) and never gates the scene on stream status.
  */
@@ -80,7 +79,7 @@ export function StagePage({
 
   const params = readStageParams();
   const theme = getOverlayTheme(params.style ?? state.overlay.style);
-  const layout = getOverlayLayout(params.layout ?? state.overlay.layout);
+  const superChatMessageLimit = getSuperChatMessageLimit(params.layout ?? state.overlay.layout);
   const capture = captureEnabled ?? params.capture;
 
   useEffect(() => {
@@ -120,14 +119,8 @@ export function StagePage({
         donationGoal={state.donationGoal}
         donationPercent={selectDonationPercent(state)}
         socials={state.socials}
+        superChatMessages={selectApprovedMessages(state, superChatMessageLimit)}
       />
-      <div style={layout.container}>
-        <SuperChatWidget
-          messages={selectApprovedMessages(state, layout.messageLimit)}
-          theme={theme}
-          windowStyle={{ ...theme.win, ...layout.superChat }}
-        />
-      </div>
       <DonationToast newDonation={newDonation} theme={theme} />
       <StreamAudio streamStatus={state.stream.status} captureEnabled={capture} theme={theme} />
     </>

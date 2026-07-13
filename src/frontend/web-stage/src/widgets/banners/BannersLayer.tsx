@@ -1,12 +1,20 @@
 import type { ReactElement } from 'react';
 
-import type { Banner, NowPlaying, DonationGoal, SocialLink, StreamStatus } from '@web10/shared';
+import type {
+  Banner,
+  NowPlaying,
+  DonationGoal,
+  SocialLink,
+  StreamStatus,
+  SuperChatMessage,
+} from '@web10/shared';
 
 import { getBannerPositionStyle } from '../../shared/ui/banner-position';
 import { getOverlayTheme } from '../../shared/ui/theme';
 import { DonationGoalWidget } from '../donation-goal';
 import { FollowUsWidget } from '../follow-us';
 import { NowPlayingWidget } from '../now-playing';
+import { SuperChatWidget } from '../super-chat';
 import { BannerCard } from './BannerCard';
 
 interface BannersLayerProps {
@@ -16,13 +24,14 @@ interface BannersLayerProps {
   readonly donationGoal: DonationGoal;
   readonly donationPercent: number;
   readonly socials: readonly SocialLink[];
+  readonly superChatMessages: readonly SuperChatMessage[];
 }
 
 /**
  * Renders every enabled admin-configured banner over the 3D scene. Each banner
  * resolves its own theme (from `style`) and absolute placement (from `screenPosition`);
- * the `nowplaying` / `donation` / `social` types reuse the existing overlay widgets so
- * their content stays live, while `custom` banners render free-form text.
+ * `nowplaying`, `donation`, and `social` reuse live overlay widgets, while `superchat`
+ * and `custom` respectively render approved messages and free-form text.
  */
 export function BannersLayer({
   banners,
@@ -31,6 +40,7 @@ export function BannersLayer({
   donationGoal,
   donationPercent,
   socials,
+  superChatMessages,
 }: BannersLayerProps): ReactElement {
   return (
     <>
@@ -71,6 +81,16 @@ export function BannersLayer({
                   windowStyle={windowStyle}
                   title={banner.title}
                   rotationSeconds={banner.rotationSeconds}
+                />
+              );
+            case 'superchat':
+              return (
+                <SuperChatWidget
+                  key={banner.id}
+                  title={banner.title}
+                  messages={superChatMessages}
+                  theme={theme}
+                  windowStyle={windowStyle}
                 />
               );
             case 'custom':

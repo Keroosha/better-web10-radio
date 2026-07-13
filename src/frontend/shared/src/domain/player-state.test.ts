@@ -1,9 +1,8 @@
 import { describe, expect, test } from 'vitest';
 import { z } from 'zod';
 
-import type { PlayerState } from './player-state';
-import { emptyPlayerState, validPlayerState } from '../testing/fixtures';
-import { PlayerStateSchema } from './player-state';
+import { BannerSchema, PlayerStateSchema, type PlayerState } from './player-state';
+import { emptyPlayerState, superChatBanner, validPlayerState } from '../testing/fixtures';
 
 // Deep clone that yields a mutable, structurally-typed-`any` value (JSON.parse's
 // return) so negative tests can craft malformed input without authored `any`/`unknown`.
@@ -16,6 +15,10 @@ describe('PlayerStateSchema', () => {
     const parsed = PlayerStateSchema.parse(validPlayerState());
     expect(parsed.nowPlaying.artist).toBe('Macintosh Plus');
     expect(parsed.donationGoal.topDonator?.amountStars).toBe(500);
+  });
+
+  test('accepts the exact superchat banner type', () => {
+    expect(BannerSchema.parse(superChatBanner()).type).toBe('superchat');
   });
 
   test('accepts the empty/offline snapshot (empty arrays, null top donator)', () => {

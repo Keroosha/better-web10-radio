@@ -19,6 +19,7 @@ function renderLayer(banners: readonly Banner[]): void {
       donationGoal={state.donationGoal}
       donationPercent={selectDonationPercent(state)}
       socials={state.socials}
+      superChatMessages={state.superChat.messages}
     />,
   );
 }
@@ -37,14 +38,28 @@ const customBanner: Banner = {
   rotationSeconds: 0,
 };
 
+const superChatBanner: Banner = {
+  id: 'b-superchat',
+  type: 'superchat',
+  title: 'SUPER CHAT',
+  subtitle: '',
+  text: '',
+  style: 'aero',
+  screenPosition: 'bottom-left',
+  accent: '#e0439a',
+  enabled: true,
+  sortOrder: 0,
+  rotationSeconds: 0,
+};
+
 describe('BannersLayer', () => {
   test('renders enabled banners by type and their live content', () => {
     const state = validPlayerState();
     renderLayer(state.banners);
-
     expect(screen.getByText('LIVE')).toBeTruthy();
     expect(screen.getByText('DONATION GOAL')).toBeTruthy();
     expect(screen.getByText('FOLLOW US')).toBeTruthy();
+    expect(screen.getByText('SUPER CHAT')).toBeTruthy();
   });
 
   test('renders custom banner title and text', () => {
@@ -58,5 +73,19 @@ describe('BannersLayer', () => {
     renderLayer([{ ...customBanner, enabled: false }]);
 
     expect(screen.queryByText('GIVEAWAY')).toBeNull();
+  });
+
+  test('renders approved messages through an enabled superchat banner', () => {
+    renderLayer([superChatBanner]);
+
+    expect(screen.getByText('SUPER CHAT')).toBeTruthy();
+    expect(screen.getByText('vhs_wanderer')).toBeTruthy();
+  });
+
+  test('renders neither title nor messages through a disabled superchat banner', () => {
+    renderLayer([{ ...superChatBanner, enabled: false }]);
+
+    expect(screen.queryByText('SUPER CHAT')).toBeNull();
+    expect(screen.queryByText('vhs_wanderer')).toBeNull();
   });
 });

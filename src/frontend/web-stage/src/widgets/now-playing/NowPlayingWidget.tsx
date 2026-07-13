@@ -7,7 +7,7 @@ interface NowPlayingWidgetProps {
   readonly nowPlaying: NowPlaying;
   readonly streamStatus: StreamStatus;
   readonly theme: StageTheme;
-  /** `{...theme.win, ...layout.now}`. */
+  /** `{...theme.win, ...getBannerPositionStyle(banner.screenPosition)}`. */
   readonly windowStyle: CSSProperties;
   /** Overhead label; defaults to the mock's `NOW PLAYING · 24/7` when the banner omits it. */
   readonly label?: string;

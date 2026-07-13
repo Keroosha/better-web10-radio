@@ -584,6 +584,45 @@ describe('banner and paid fixture routes', () => {
     expect(request.requestInit()?.method).toBe('GET');
   });
 
+  test('accepts the exact superchat literal in banner responses and replacement payloads', async () => {
+    const superChat = {
+      ...banner,
+      type: 'superchat' as const,
+      title: 'SUPER CHAT',
+      screenPosition: 'bottom-left' as const,
+      accent: '#e0439a',
+      rotationSeconds: 0,
+    };
+    const request = capturingFetch([superChat]);
+    const body: BannersReplaceRequest = [
+      {
+        id,
+        type: 'superchat',
+        title: 'SUPER CHAT',
+        subtitle: null,
+        text: null,
+        style: 'aero',
+        screenPosition: 'bottom-left',
+        accent: '#e0439a',
+        enabled: true,
+        rotationSeconds: null,
+      },
+    ];
+
+    const response = await getBanners({ fetchImpl: request.fetchImpl });
+    expect(response[0]?.type).toBe('superchat');
+
+    const replacement = capturingFetch([superChat]);
+    await replaceBanners(body, { fetchImpl: replacement.fetchImpl });
+    expect(replacement.requestInit()?.body).toBe(JSON.stringify(body));
+  });
+
+  test('rejects an unknown banner type', async () => {
+    const request = capturingFetch([{ ...banner, type: 'unknown-banner' }]);
+
+    await expect(getBanners({ fetchImpl: request.fetchImpl })).rejects.toThrow();
+  });
+
   test('replaces the banner set with a PUT of the full array', async () => {
     const request = capturingFetch([banner]);
     const body: BannersReplaceRequest = [

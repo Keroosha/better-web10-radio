@@ -175,6 +175,21 @@ flowchart LR
       "isFeatured": true
     }
   ],
+  "banners": [
+    {
+      "id": "uuid-v7",
+      "type": "nowplaying|donation|social|superchat|custom",
+      "title": "SUPER CHAT",
+      "subtitle": "",
+      "text": "",
+      "style": "aero|win9x",
+      "screenPosition": "top-left|top-center|top-right|bottom-left|bottom-center|bottom-right",
+      "accent": "#e0439a",
+      "enabled": true,
+      "sortOrder": 3,
+      "rotationSeconds": 0
+    }
+  ],
   "overlay": { "style": "aero|win9x", "layout": "corners|sidebar|bottombar" }
 }
 ```
@@ -231,6 +246,7 @@ All read/list routes return `200`. Admin queue, stream-control, and scan accepta
 | `POST` | `/api/v0/admin/playback/queue` | Queue a scanned track immediately. |
 | `GET/PUT` | `/api/v0/admin/social-links` | Read/replace social links. |
 | `GET/PUT` | `/api/v0/admin/donation-goal` | Read/update donation goal. |
+| `GET/PUT` | `/api/v0/admin/banners` | Read/replace stage overlay banners. |
 | `GET/POST` | `/api/v0/admin/playlists` | List/create playlists. |
 | `PUT` | `/api/v0/admin/playlists/{playlistId}` | Update a playlist. |
 | `GET/POST/PUT` | `/api/v0/admin/playlists/{playlistId}/items` | List/create/replace playlist items. |
@@ -262,6 +278,7 @@ All read/list routes return `200`. Admin queue, stream-control, and scan accepta
 
 - `PUT /api/v0/admin/donation-goal` accepts `{ "title": string, "goalStars": positive integer }`; `title` is trimmed to 1–120 characters and `goalStars` is `1..Int32.MaxValue`. It returns the updated canonical `DonationGoalDto`, preserves `raisedStars` during update, and creates it at zero only when no active goal exists. Invalid input is `400 donation.goal.request_invalid`, missing is `404 donation.goal.not_found`, and uniqueness/state conflict is `409 donation.goal.conflict`.
 - `GET /api/v0/admin/social-links` returns canonical non-null `SocialLinkDto[]`. `PUT /api/v0/admin/social-links` accepts a replace-all array of at most 50 `{ "id": uuid|null, "kind": "telegram|youtube|instagram|discord|external", "name": string, "handle": string|null, "url": string, "glyph": string|null, "color": string|null, "qrImageUrl": string|null, "isFeatured": boolean }`. Array order is `Position`; null IDs receive UUIDv7 and omitted old rows are soft-deleted. `name`/`handle` are trimmed, `url` must be absolute `http|https`, and `color` is `#RRGGBB` or null. Database-null optional strings project to `""` in the response. Invalid, missing, and conflict cases return `400 social-links.request_invalid`, `404 social-links.not_found`, and `409 social-links.conflict`.
+- `GET /api/v0/admin/banners` returns canonical `BannerDto[]`. `PUT /api/v0/admin/banners` accepts a replace-all array of at most 20 exact `{ "id": uuid|null, "type": "nowplaying|donation|social|superchat|custom", "title": string, "subtitle": string|null, "text": string|null, "style": "aero|win9x", "screenPosition": "top-left|top-center|top-right|bottom-left|bottom-center|bottom-right", "accent": string|null, "enabled": boolean, "rotationSeconds": integer|null }`. `rotationSeconds` is null or `2..120`; array order is `SortOrder`; null IDs receive UUIDv7; omitted old rows are soft-deleted. Invalid bodies return `400 banners.request_invalid`; missing active referenced IDs return `404 banners.not_found`; replacement conflicts return `409 banners.conflict`.
 - Playlist summaries are `{ "id": uuid, "name": string, "description": string|null, "isActive": boolean, "itemCount": nonnegative integer }`; playlist items are `{ "id": uuid, "trackId": uuid, "title": string, "artist": string, "position": nonnegative integer }`. `POST /api/v0/admin/playlists` and `PUT /api/v0/admin/playlists/{playlistId}` accept `{ "name": string, "description": string|null, "isActive": boolean }`, where name is trimmed 1–120 and description is null or at most 1000 characters. `POST /items` accepts `{ "trackId": uuid-v7 }`; `PUT /items` accepts `{ "items": [{ "id": uuid|null, "trackId": uuid-v7 }] }`. Item-array order determines position; null IDs are created and omitted rows are soft-deleted. Activating one playlist transactionally deactivates every other active playlist. Invalid, missing, and conflict cases return `400 playlist.request_invalid`, `404 playlist.not_found`, and `409 playlist.conflict`.
 - `GET /api/v0/admin/storage` returns `{ "defaultBackend": { "type": "local|s3", "localRoot": string|null, "s3Bucket": string|null, "s3Region": string|null, "s3ServiceUrl": string|null, "s3ForcePathStyle": boolean }, "additionalBackends": [{ "id": uuid, "name": string, "type": "local|s3", "localRoot": string|null, "s3Bucket": string|null, "isEnabled": boolean }] }`. `PUT /api/v0/admin/storage` accepts `{ "additionalBackends": [{ "id": uuid|null, "name": string, "type": "local|s3", "localRoot": string|null, "s3Bucket": string|null, "isEnabled": boolean }] }`, with at most 20 rows, and returns the same DTO. Local requires an absolute nonblank root and null bucket; S3 requires nonblank bucket and null root. This route manages only additional database rows and never writes environment configuration or credentials. Invalid, missing, and conflict cases return `400 storage.request_invalid`, `404 storage.not_found`, and `409 storage.conflict`.
 - `GET /api/v0/admin/storage/cache` returns `{ "s3CacheMaxBytes": integer, "presignTtlSeconds": integer }` (a durable singleton seeded to 10 GiB / 3600 s on first read). `PUT /api/v0/admin/storage/cache` accepts the same shape (`s3CacheMaxBytes` ≥ 100 MiB, `presignTtlSeconds` in `60..604800`) and returns it; invalid bodies return `400 storage.cache.request_invalid`. A background worker keeps the local S3 cache under `s3CacheMaxBytes` by evicting the least-recently-played default-backend S3 copies (never the currently `Playing`/on-deck items, never Local sources); evicted tracks keep playing via the pre-signed redirect. Library scans skip caching S3 objects that would exceed the budget, so the API host's disk cannot fill.

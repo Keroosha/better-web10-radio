@@ -6,7 +6,6 @@ export type AdminView =
   | 'library'
   | 'playlists'
   | 'banners'
-  | 'goals'
   | 'storage'
   | 'node';
 
@@ -30,8 +29,6 @@ export function breadcrumb(nav: AdminNav): string {
       return 'Плейлисты';
     case 'banners':
       return 'Настройки › Баннеры';
-    case 'goals':
-      return 'Настройки › Цели сбора';
     case 'storage':
       return 'Настройки › Хранилища';
     case 'node':

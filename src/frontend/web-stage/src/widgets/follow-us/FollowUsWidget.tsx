@@ -9,7 +9,7 @@ import type { StageTheme } from '../../shared/ui/theme';
 interface FollowUsWidgetProps {
   readonly socials: readonly SocialLink[];
   readonly theme: StageTheme;
-  /** `{...theme.win, ...layout.social}`. */
+  /** `{...theme.win, ...getBannerPositionStyle(banner.screenPosition)}`. */
   readonly windowStyle: CSSProperties;
   /** Title-bar caption; defaults to `FOLLOW US` when the banner omits it. */
   readonly title?: string;

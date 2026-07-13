@@ -6,10 +6,11 @@ import { OverlayWindow } from '../../shared/ui/OverlayWindow';
 import type { StageTheme } from '../../shared/ui/theme';
 
 interface SuperChatWidgetProps {
+  /** Admin-configured banner title; falls back for direct widget use. */
+  readonly title?: string;
   /** Already filtered to approved + capped to the layout limit (`selectApprovedMessages`). */
   readonly messages: readonly SuperChatMessage[];
   readonly theme: StageTheme;
-  /** `{...theme.win, ...layout.superChat}`. */
   readonly windowStyle: CSSProperties;
 }
 
@@ -18,9 +19,9 @@ interface SuperChatWidgetProps {
  * (header tinted by the message colour, then the text). Only approved messages reach
  * this widget (enforced upstream by `selectApprovedMessages`). Empty → a quiet placeholder.
  */
-export function SuperChatWidget({ messages, theme, windowStyle }: SuperChatWidgetProps): ReactElement {
+export function SuperChatWidget({ title, messages, theme, windowStyle }: SuperChatWidgetProps): ReactElement {
   return (
-    <OverlayWindow title="SUPER CHAT" theme={theme} windowStyle={windowStyle}>
+    <OverlayWindow title={title ?? 'SUPER CHAT'} theme={theme} windowStyle={windowStyle}>
       {messages.length === 0 ? (
         <div />
       ) : (

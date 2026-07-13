@@ -2,20 +2,20 @@ import { useCallback, useState, type ReactElement } from 'react';
 
 import { formatStars, getDonationGoal, updateDonationGoal, type DonationGoal } from '@web10/shared';
 
+import { errorMessage } from '../../shared/lib/errorMessage';
 import { useApiResource } from '../../shared/lib/useApiResource';
 import { ResourceView } from '../../shared/ui/ResourceView';
 import { useToast } from '../../shared/ui/toast';
 import { COLORS, formGrid, panel } from '../../shared/ui/tokens';
 
-/** Донат-цель (⭐): прогресс + редактирование текста и цели в звёздах. */
-export function GoalsPage(): ReactElement {
+/** Donation goal progress and editor embedded in the donation-banner type panel. */
+export function DonationGoalEditor(): ReactElement {
   const [reloadKey, setReloadKey] = useState(0);
-  const load = useCallback((): Promise<DonationGoal> => getDonationGoal(), [reloadKey]);
-  const resource = useApiResource(load);
+  const load = useCallback((): Promise<DonationGoal> => getDonationGoal(), []);
+  const resource = useApiResource(load, reloadKey);
 
   return (
-    <div style={{ maxWidth: '520px' }}>
-      <h2 style={{ marginTop: 0, fontSize: '19px' }}>Цели сбора</h2>
+    <div style={{ marginTop: '16px', borderTop: '1px solid #cddff0', paddingTop: '12px' }}>
       <ResourceView resource={resource}>
         {(goal) => <GoalEditor goal={goal} onSaved={() => setReloadKey((key) => key + 1)} />}
       </ResourceView>
@@ -33,17 +33,18 @@ function GoalEditor({ goal, onSaved }: { readonly goal: DonationGoal; readonly o
 
   const save = async (): Promise<void> => {
     const trimmed = title.trim();
-    if (trimmed.length < 1 || trimmed.length > 120 || target < 1) {
+    if (trimmed.length < 1 || trimmed.length > 120 || !Number.isInteger(target) || target < 1 || target > 2147483647) {
       showToast('Заполните текст и цель (≥1 ⭐)');
       return;
     }
+
     setSaving(true);
     try {
       await updateDonationGoal({ title: trimmed, goalStars: target });
       showToast('Цель сбора сохранена');
       onSaved();
     } catch (cause) {
-      showToast(cause instanceof Error ? cause.message : 'Не удалось сохранить');
+      showToast(errorMessage(cause, 'Не удалось сохранить'));
     } finally {
       setSaving(false);
     }
@@ -85,6 +86,7 @@ function GoalEditor({ goal, onSaved }: { readonly goal: DonationGoal; readonly o
           id="goal-target"
           type="number"
           min={1}
+          max={2147483647}
           value={target}
           onChange={(event) => setTarget(Number(event.target.value))}
         />

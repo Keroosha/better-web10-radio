@@ -6,7 +6,7 @@ import {
   selectApprovedMessages,
   selectDonationPercent,
 } from '../entities/player-state';
-import { getOverlayLayout } from '../shared/ui/layout';
+import { getBannerPositionStyle } from '../shared/ui/banner-position';
 import { getOverlayTheme } from '../shared/ui/theme';
 import { message, validPlayerState } from '../testing/fixtures';
 import { DonationGoalWidget } from './donation-goal';
@@ -17,7 +17,10 @@ import { SuperChatWidget } from './super-chat';
 afterEach(cleanup);
 
 const theme = getOverlayTheme('aero');
-const layout = getOverlayLayout('corners');
+const nowPlayingStyle = getBannerPositionStyle('top-center');
+const donationStyle = getBannerPositionStyle('top-left');
+const superChatStyle = getBannerPositionStyle('bottom-left');
+const socialStyle = getBannerPositionStyle('bottom-right');
 
 describe('NowPlayingWidget', () => {
   test('shows LIVE and the track when the stream is live', () => {
@@ -27,7 +30,7 @@ describe('NowPlayingWidget', () => {
         nowPlaying={state.nowPlaying}
         streamStatus="live"
         theme={theme}
-        windowStyle={layout.now}
+        windowStyle={nowPlayingStyle}
       />,
     );
     expect(screen.getByText('LIVE')).toBeTruthy();
@@ -41,7 +44,7 @@ describe('NowPlayingWidget', () => {
         nowPlaying={state.nowPlaying}
         streamStatus="live"
         theme={theme}
-        windowStyle={layout.now}
+        windowStyle={nowPlayingStyle}
       />,
     );
     expect(screen.getByAltText(`${state.nowPlaying.title} cover art`)).toBeTruthy();
@@ -56,7 +59,7 @@ describe('NowPlayingWidget', () => {
         nowPlaying={state.nowPlaying}
         streamStatus="live"
         theme={theme}
-        windowStyle={layout.now}
+        windowStyle={nowPlayingStyle}
       />,
     );
     fireEvent.error(screen.getByRole('img'));
@@ -70,7 +73,7 @@ describe('NowPlayingWidget', () => {
         nowPlaying={createEmptyPlayerState().nowPlaying}
         streamStatus="offline"
         theme={theme}
-        windowStyle={layout.now}
+        windowStyle={nowPlayingStyle}
       />,
     );
     expect(screen.getByText('OFFLINE')).toBeTruthy();
@@ -87,7 +90,7 @@ describe('DonationGoalWidget', () => {
         donationGoal={state.donationGoal}
         percent={selectDonationPercent(state)}
         theme={theme}
-        windowStyle={layout.donation}
+        windowStyle={donationStyle}
       />,
     );
     expect(screen.getByText('CyberDove')).toBeTruthy();
@@ -102,7 +105,7 @@ describe('DonationGoalWidget', () => {
         donationGoal={empty.donationGoal}
         percent={selectDonationPercent(empty)}
         theme={theme}
-        windowStyle={layout.donation}
+        windowStyle={donationStyle}
       />,
     );
     expect(screen.getByText('—')).toBeTruthy();
@@ -113,13 +116,13 @@ describe('DonationGoalWidget', () => {
 describe('SuperChatWidget', () => {
   test('renders approved messages', () => {
     const messages = [message('m1', 'vhs_wanderer', 'approved')];
-    render(<SuperChatWidget messages={messages} theme={theme} windowStyle={layout.superChat} />);
+    render(<SuperChatWidget messages={messages} theme={theme} windowStyle={superChatStyle} />);
     expect(screen.getByText('vhs_wanderer')).toBeTruthy();
   });
 
   test('empty: renders the titled block with no placeholder text', () => {
     const empty = selectApprovedMessages(createEmptyPlayerState(), 4);
-    render(<SuperChatWidget messages={empty} theme={theme} windowStyle={layout.superChat} />);
+    render(<SuperChatWidget messages={empty} theme={theme} windowStyle={superChatStyle} />);
     expect(screen.getByText('SUPER CHAT')).toBeTruthy();
     expect(screen.queryByText('Пока тихо…')).toBeNull();
   });
@@ -128,7 +131,7 @@ describe('SuperChatWidget', () => {
 describe('FollowUsWidget', () => {
   test('renders nothing when there are no socials', () => {
     const { container } = render(
-      <FollowUsWidget socials={[]} theme={theme} windowStyle={layout.social} />,
+      <FollowUsWidget socials={[]} theme={theme} windowStyle={socialStyle} />,
     );
     expect(container.firstChild).toBeNull();
   });
@@ -136,7 +139,7 @@ describe('FollowUsWidget', () => {
   test('featured chip is fully opaque, others dimmed', () => {
     const socials = validPlayerState().socials;
     const { container } = render(
-      <FollowUsWidget socials={socials} theme={theme} windowStyle={layout.social} />,
+      <FollowUsWidget socials={socials} theme={theme} windowStyle={socialStyle} />,
     );
     expect(screen.getByText(socials[0]?.name ?? '')).toBeTruthy();
     // The chip strip: first chip (featured index 0 initially) opaque, second dimmed.

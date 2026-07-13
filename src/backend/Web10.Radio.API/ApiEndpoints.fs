@@ -2002,7 +2002,7 @@ module ApiEndpoints =
                 return StatusCodes.Status400BadRequest
         }
 
-    let private bannerTypes = Set.ofList [ "nowplaying"; "donation"; "social"; "custom" ]
+    let private bannerTypes = Set.ofList [ "nowplaying"; "donation"; "social"; "superchat"; "custom" ]
     let private bannerStyles = Set.ofList [ "aero"; "win9x" ]
     let private bannerPositions = Set.ofList [ "top-left"; "top-center"; "top-right"; "bottom-left"; "bottom-center"; "bottom-right" ]
 

@@ -1,7 +1,7 @@
 // Typed test fixtures. Not part of the public surface (not re-exported from
 // index.ts) and excluded from the build. Typing the builders as domain types means
 // the fixtures fail to compile if they ever drift from the schemas.
-import type { PlayerState } from '../domain/player-state';
+import type { Banner, PlayerState } from '../domain/player-state';
 
 /** A fully-populated, valid player snapshot mirroring the SPEC §5 example. */
 export function validPlayerState(): PlayerState {
@@ -97,6 +97,23 @@ export function validPlayerState(): PlayerState {
       },
     ],
     playbackState: 'playing',
+  };
+}
+
+/** A valid superchat banner fixture for exact banner-type contract tests. */
+export function superChatBanner(): Banner {
+  return {
+    id: '01920000-0000-7000-8000-0000000000b2',
+    type: 'superchat',
+    title: 'SUPER CHAT',
+    subtitle: '',
+    text: '',
+    style: 'aero',
+    screenPosition: 'bottom-left',
+    accent: '#e0439a',
+    enabled: true,
+    sortOrder: 1,
+    rotationSeconds: 0,
   };
 }
 

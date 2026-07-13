@@ -13,7 +13,6 @@ import { AdminAuthGate, useAdminAuth } from '../features/admin-auth/AdminAuthGat
 import { useLiveQueue } from '../entities/live-queue';
 import { errorMessage } from '../shared/lib/errorMessage';
 import { BannersPage } from '../pages/banners/BannersPage';
-import { GoalsPage } from '../pages/goals/GoalsPage';
 import { LibraryPage } from '../pages/library/LibraryPage';
 import { NodePage } from '../pages/node/NodePage';
 import { PlayerPage } from '../pages/player/PlayerPage';
@@ -130,7 +129,6 @@ function AdminShell(): ReactElement {
               {nav.view === 'library' ? <LibraryPage groupBy={nav.groupBy} /> : null}
               {nav.view === 'playlists' ? <PlaylistsPage /> : null}
               {nav.view === 'banners' ? <BannersPage /> : null}
-              {nav.view === 'goals' ? <GoalsPage /> : null}
               {nav.view === 'storage' ? <StoragePage /> : null}
               {nav.view === 'node' ? <NodePage /> : null}
             </div>

@@ -324,6 +324,9 @@ module ApiEndpoints =
     let private writeOk context value =
         ApiJson.write context StatusCodes.Status200OK ApiJson.JsonContentType value
 
+    let private defaultStorageIsS3 (context: HttpContext) =
+        (context.RequestServices.GetRequiredService<StorageOptions>()).Type = StorageType.S3
+
     let private streamUnavailable context =
         ApiProblems.write
             context
@@ -1537,7 +1540,7 @@ module ApiEndpoints =
                     let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
                     let clock = context.RequestServices.GetRequiredService<TimeProvider>()
                     let queueItemId = Uuid.CreateVersion7().ToGuidBigEndian()
-                    let! result = PlaybackQueueRepository.forcePlayNow source queueItemId trackId (clock.GetUtcNow()) context.RequestAborted
+                    let! result = PlaybackQueueRepository.forcePlayNow source queueItemId trackId (defaultStorageIsS3 context) (clock.GetUtcNow()) context.RequestAborted
                     match result with
                     | Error _ ->
                         do! writeRepositoryFailure context
@@ -1640,56 +1643,117 @@ module ApiEndpoints =
                 return raise error
         }
 
+    let private assignmentDto (assignment: CurrentPlaybackAssignment) : CurrentPlaybackAssignmentDto =
+        { QueueItemId = assignment.QueueItemId.ToString("D")
+          ClaimOwner = assignment.ClaimOwner.ToString("D")
+          ClaimAttempt = assignment.ClaimAttempt
+          TrackId = assignment.TrackId.ToString("D")
+          ContentType = assignment.ContentType
+          Title = assignment.Title
+          Artist = assignment.Artist
+          DurationMs = max 0 assignment.DurationMs }
+
     let private currentPlaybackAssignment (context: HttpContext) =
         task {
             let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
-            let! result = PlaybackQueueRepository.getCurrentAssignment source context.RequestAborted
+            let! result = PlaybackQueueRepository.getCurrentAssignment source (defaultStorageIsS3 context) context.RequestAborted
             match result with
             | Error _ ->
                 do! repositoryReadFailed context
                 return StatusCodes.Status500InternalServerError
             | Ok None -> context.Response.StatusCode <- StatusCodes.Status204NoContent; return StatusCodes.Status204NoContent
             | Ok(Some assignment) ->
-                let dto: CurrentPlaybackAssignmentDto = { QueueItemId = assignment.QueueItemId.ToString("D"); ClaimOwner = assignment.ClaimOwner.ToString("D"); ClaimAttempt = assignment.ClaimAttempt; TrackId = assignment.TrackId.ToString("D"); ContentType = assignment.ContentType; Title = assignment.Title; Artist = assignment.Artist; DurationMs = max 0 assignment.DurationMs }
-                do! writeOk context dto
+                do! writeOk context (assignmentDto assignment)
                 return StatusCodes.Status200OK
+        }
+
+    let private upcomingPlaybackAssignments (context: HttpContext) =
+        task {
+            let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+            let! result = PlaybackQueueRepository.getUpcomingAssignments source (defaultStorageIsS3 context) context.RequestAborted
+            match result with
+            | Error _ ->
+                do! repositoryReadFailed context
+                return StatusCodes.Status500InternalServerError
+            | Ok upcoming ->
+                let asObject (assignment: CurrentPlaybackAssignment option) : obj =
+                    match assignment with
+                    | Some value -> box (assignmentDto value)
+                    | None -> null
+                let body = {| current = asObject upcoming.Current; next = asObject upcoming.Next |}
+                do! writeOk context body
+                return StatusCodes.Status200OK
+        }
+
+    let private playbackMediaNotFound (context: HttpContext) =
+        task {
+            do! writeDomainProblem context StatusCodes.Status404NotFound "playback.media_not_found" "Playback media not found" "The requested playback media is unavailable."
+            return StatusCodes.Status404NotFound
+        }
+
+    let private streamCacheFile (context: HttpContext) (cachePath: string) (contentType: string) =
+        task {
+            let openedStream =
+                try
+                    Ok(File.OpenRead(cachePath))
+                with
+                | :? FileNotFoundException
+                | :? DirectoryNotFoundException
+                | :? UnauthorizedAccessException
+                | :? IOException -> Error()
+
+            match openedStream with
+            | Error () -> return! playbackMediaNotFound context
+            | Ok stream ->
+                use stream = stream
+                let result = Results.Stream(stream, contentType = contentType, enableRangeProcessing = true)
+                do! result.ExecuteAsync(context)
+                return context.Response.StatusCode
         }
 
     let private streamNodeMedia (context: HttpContext) =
         task {
             match parseGuidRoute "queueItemId" context with
-            | None ->
-                do! writeDomainProblem context StatusCodes.Status404NotFound "playback.media_not_found" "Playback media not found" "The requested playback media is unavailable."
-                return StatusCodes.Status404NotFound
+            | None -> return! playbackMediaNotFound context
             | Some queueItemId ->
                 let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
-                let! result = PlaybackQueueRepository.getPlaybackMediaFile source queueItemId context.RequestAborted
+                let! result = PlaybackQueueRepository.getPlaybackMediaFile source queueItemId (defaultStorageIsS3 context) context.RequestAborted
                 match result with
                 | Error _ ->
                     do! repositoryReadFailed context
                     return StatusCodes.Status500InternalServerError
-                | Ok None ->
-                    do! writeDomainProblem context StatusCodes.Status404NotFound "playback.media_not_found" "Playback media not found" "The requested playback media is unavailable."
-                    return StatusCodes.Status404NotFound
-                | Ok(Some(cachePath, contentType)) ->
-                    let openedStream =
-                        try
-                            Ok(File.OpenRead(cachePath))
-                        with
-                        | :? FileNotFoundException
-                        | :? DirectoryNotFoundException
-                        | :? UnauthorizedAccessException
-                        | :? IOException -> Error()
-
-                    match openedStream with
-                    | Error () ->
-                        do! writeDomainProblem context StatusCodes.Status404NotFound "playback.media_not_found" "Playback media not found" "The requested playback media is unavailable."
-                        return StatusCodes.Status404NotFound
-                    | Ok stream ->
-                        use stream = stream
-                        let result = Results.Stream(stream, contentType = contentType, enableRangeProcessing = true)
-                        do! result.ExecuteAsync(context)
-                        return context.Response.StatusCode
+                | Ok None -> return! playbackMediaNotFound context
+                | Ok(Some media) ->
+                    if media.IsDefaultS3 then
+                        let options = context.RequestServices.GetRequiredService<StorageOptions>()
+                        let objectStorage = context.RequestServices.GetRequiredService<IS3ObjectStorage>()
+                        let clock = context.RequestServices.GetRequiredService<TimeProvider>()
+                        let! settings = StorageSettingsRepository.getOrCreate source (Uuid.CreateVersion7().ToGuidBigEndian()) StorageCachePolicy.defaultCacheMaxBytes StorageCachePolicy.presignTtlSeconds (clock.GetUtcNow()) context.RequestAborted
+                        let ttlSeconds =
+                            match settings with
+                            | Ok value -> value.PresignTtlSeconds
+                            | Error _ -> StorageCachePolicy.presignTtlSeconds
+                        let expiresAtUtc = clock.GetUtcNow().Add(TimeSpan.FromSeconds(float ttlSeconds))
+                        let! presignedUrl =
+                            task {
+                                try
+                                    let! url = objectStorage.GeneratePresignedGetUrlAsync(S3ClientScope.ConfiguredDefault, options.S3Bucket, media.StorageKey, expiresAtUtc, context.RequestAborted)
+                                    return Some url
+                                with _ -> return None
+                            }
+                        match presignedUrl with
+                        | Some url ->
+                            let redirect = Results.Redirect(url, false)
+                            do! redirect.ExecuteAsync(context)
+                            return context.Response.StatusCode
+                        | None ->
+                            match media.CachePath with
+                            | Some path -> return! streamCacheFile context path media.ContentType
+                            | None -> return! playbackMediaNotFound context
+                    else
+                        match media.CachePath with
+                        | Some path -> return! streamCacheFile context path media.ContentType
+                        | None -> return! playbackMediaNotFound context
         }
 
     let private streamNodeControl (context: HttpContext) =
@@ -1831,6 +1895,57 @@ module ApiEndpoints =
                     return StatusCodes.Status400BadRequest
             | _ ->
                 do! writeDomainProblem context StatusCodes.Status400BadRequest "donation.goal.request_invalid" "Invalid donation goal request" "The donation goal body is invalid."
+                return StatusCodes.Status400BadRequest
+        }
+
+    let private storageCacheSettingsDto (settings: StorageSettings) : StorageCacheSettingsDto =
+        { S3CacheMaxBytes = settings.S3CacheMaxBytes
+          PresignTtlSeconds = settings.PresignTtlSeconds }
+
+    let private adminStorageCacheSettings (context: HttpContext) =
+        task {
+            let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+            let clock = context.RequestServices.GetRequiredService<TimeProvider>()
+            let! result = StorageSettingsRepository.getOrCreate source (Uuid.CreateVersion7().ToGuidBigEndian()) StorageCachePolicy.defaultCacheMaxBytes StorageCachePolicy.presignTtlSeconds (clock.GetUtcNow()) context.RequestAborted
+            match result with
+            | Ok settings ->
+                do! writeOk context (storageCacheSettingsDto settings)
+                return StatusCodes.Status200OK
+            | Error _ ->
+                do! repositoryReadFailed context
+                return StatusCodes.Status500InternalServerError
+        }
+
+    let private adminStorageCacheSettingsUpdate (context: HttpContext) =
+        task {
+            match! readJsonBody (16 * 1024) context with
+            | BodyTooLarge ->
+                do! writeRequestTooLarge context
+                return StatusCodes.Status413PayloadTooLarge
+            | BodyParsed root when hasExactProperties (Set.ofList [ "s3CacheMaxBytes"; "presignTtlSeconds" ]) root ->
+                match tryProperty "s3CacheMaxBytes" root, tryProperty "presignTtlSeconds" root with
+                | Some cacheElement, Some ttlElement when cacheElement.ValueKind = JsonValueKind.Number && ttlElement.ValueKind = JsonValueKind.Number ->
+                    let mutable cacheBytes = 0L
+                    let mutable ttlSeconds = 0
+                    if not (cacheElement.TryGetInt64(&cacheBytes)) || not (ttlElement.TryGetInt32(&ttlSeconds)) || cacheBytes < StorageCachePolicy.minCacheMaxBytes || ttlSeconds < 60 || ttlSeconds > 604800 then
+                        do! writeDomainProblem context StatusCodes.Status400BadRequest "storage.cache.request_invalid" "Invalid storage cache settings" "The storage cache settings body is invalid."
+                        return StatusCodes.Status400BadRequest
+                    else
+                        let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+                        let clock = context.RequestServices.GetRequiredService<TimeProvider>()
+                        let! result = StorageSettingsRepository.update source (Uuid.CreateVersion7().ToGuidBigEndian()) StorageCachePolicy.defaultCacheMaxBytes StorageCachePolicy.presignTtlSeconds cacheBytes ttlSeconds (clock.GetUtcNow()) context.RequestAborted
+                        match result with
+                        | Ok settings ->
+                            do! writeOk context (storageCacheSettingsDto settings)
+                            return StatusCodes.Status200OK
+                        | Error _ ->
+                            do! writeRepositoryFailure context
+                            return StatusCodes.Status500InternalServerError
+                | _ ->
+                    do! writeDomainProblem context StatusCodes.Status400BadRequest "storage.cache.request_invalid" "Invalid storage cache settings" "The storage cache settings body is invalid."
+                    return StatusCodes.Status400BadRequest
+            | _ ->
+                do! writeDomainProblem context StatusCodes.Status400BadRequest "storage.cache.request_invalid" "Invalid storage cache settings" "The storage cache settings body is invalid."
                 return StatusCodes.Status400BadRequest
         }
 
@@ -2671,6 +2786,7 @@ module ApiEndpoints =
         streamNode.RequireAuthorization(StreamNodeAuthentication.PolicyName) |> ignore
         map streamNode logger "POST" "/heartbeat" "/api/v0/stream-node/heartbeat" streamHeartbeat
         map streamNode logger "GET" "/playback/current" "/api/v0/stream-node/playback/current" currentPlaybackAssignment
+        map streamNode logger "GET" "/playback/upcoming" "/api/v0/stream-node/playback/upcoming" upcomingPlaybackAssignments
         map streamNode logger "GET" "/playback/{queueItemId}/media" "/api/v0/stream-node/playback/{queueItemId}/media" streamNodeMedia
         map streamNode logger "GET" "/control" "/api/v0/stream-node/control" streamNodeControl
         map streamNode logger "POST" "/playback/{queueItemId}/lease" "/api/v0/stream-node/playback/{queueItemId}/lease" playbackLease
@@ -2717,6 +2833,8 @@ module ApiEndpoints =
         map admin logger "PUT" "/playlists/{playlistId}/items" "/api/v0/admin/playlists/{playlistId}/items" (csrfProtected replacePlaylistItems)
         map admin logger "GET" "/storage" "/api/v0/admin/storage" adminStorage
         map admin logger "PUT" "/storage" "/api/v0/admin/storage" (csrfProtected adminStorageUpdate)
+        map admin logger "GET" "/storage/cache" "/api/v0/admin/storage/cache" adminStorageCacheSettings
+        map admin logger "PUT" "/storage/cache" "/api/v0/admin/storage/cache" (csrfProtected adminStorageCacheSettingsUpdate)
         map admin logger "GET" "/storage/files" "/api/v0/admin/storage/files" storageList
         map admin logger "GET" "/storage/files/content" "/api/v0/admin/storage/files/content" storageContentRead
         map admin logger "HEAD" "/storage/files/content" "/api/v0/admin/storage/files/content" storageContentHead

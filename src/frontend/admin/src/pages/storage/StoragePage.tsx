@@ -4,8 +4,11 @@ import {
   createLibraryScan,
   getStorage,
   replaceStorage,
+  getStorageCacheSettings,
+  updateStorageCacheSettings,
   type Storage,
   type StorageAdditionalBackend,
+  type StorageCacheSettings,
   type StorageReplaceRequest,
 } from '@web10/shared';
 
@@ -127,6 +130,8 @@ export function StoragePage(): ReactElement {
                 />
               ))}
             </div>
+
+            {storage.defaultBackend.type === 's3' ? <CacheSettingsCard /> : null}
 
             {formOpen ? (
               <StorageForm
@@ -286,5 +291,83 @@ function StorageForm({ onClose, onCreate }: StorageFormProps): ReactElement {
         </div>
       </div>
     </Popup>
+  );
+}
+
+const GIB = 1024 * 1024 * 1024;
+
+function CacheSettingsCard(): ReactElement {
+  const { showToast } = useToast();
+  const [reloadKey, setReloadKey] = useState(0);
+  const load = useCallback((): Promise<StorageCacheSettings> => getStorageCacheSettings(), [reloadKey]);
+  const resource = useApiResource(load, reloadKey);
+
+  return (
+    <div style={{ border: '1px solid #cddff0', borderRadius: '8px', padding: '12px', background: '#fafcff', marginTop: '10px' }}>
+      <strong>Кэш S3</strong>
+      <p style={{ margin: '4px 0 10px', fontSize: '12px', color: COLORS.subtle, maxWidth: '60ch' }}>
+        Локальный кэш S3-треков ограничен по размеру: сверх лимита давно игравшие копии удаляются, а
+        воспроизведение продолжается по pre-signed ссылкам — диск сервера не забивается.
+      </p>
+      <ResourceView resource={resource}>
+        {(settings) => (
+          <CacheSettingsForm
+            settings={settings}
+            onSaved={() => {
+              showToast('Настройки кэша сохранены');
+              setReloadKey((key) => key + 1);
+            }}
+          />
+        )}
+      </ResourceView>
+    </div>
+  );
+}
+
+interface CacheSettingsFormProps {
+  readonly settings: StorageCacheSettings;
+  readonly onSaved: () => void;
+}
+
+function CacheSettingsForm({ settings, onSaved }: CacheSettingsFormProps): ReactElement {
+  const { showToast } = useToast();
+  const [maxGib, setMaxGib] = useState(String(Math.max(1, Math.round(settings.s3CacheMaxBytes / GIB))));
+  const [ttlSeconds, setTtlSeconds] = useState(String(settings.presignTtlSeconds));
+  const [saving, setSaving] = useState(false);
+
+  const save = async (): Promise<void> => {
+    const gib = Number(maxGib);
+    const ttl = Number(ttlSeconds);
+    if (!Number.isFinite(gib) || gib < 1 || !Number.isFinite(ttl) || ttl < 60 || ttl > 604800) {
+      showToast('Проверьте значения: кэш ≥ 1 ГиБ, TTL 60–604800 с');
+      return;
+    }
+    setSaving(true);
+    try {
+      await updateStorageCacheSettings({
+        s3CacheMaxBytes: Math.round(gib * GIB),
+        presignTtlSeconds: Math.round(ttl),
+      });
+      onSaved();
+    } catch (cause) {
+      showToast(cause instanceof Error ? cause.message : 'Не удалось сохранить настройки кэша');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div style={{ ...formGrid, gridTemplateColumns: 'auto 1fr', gap: '10px', maxWidth: '440px', alignItems: 'center' }}>
+      <label htmlFor="cache-max">Лимит кэша, ГиБ</label>
+      <input id="cache-max" type="number" min={1} value={maxGib} onChange={(event) => setMaxGib(event.target.value)} />
+      <label htmlFor="cache-ttl">TTL pre-signed, сек</label>
+      <input id="cache-ttl" type="number" min={60} max={604800} value={ttlSeconds} onChange={(event) => setTtlSeconds(event.target.value)} />
+      <div />
+      <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+        <button type="button" className="default" onClick={() => void save()} disabled={saving}>
+          {saving ? 'Сохранение…' : 'Сохранить'}
+        </button>
+      </div>
+    </div>
   );
 }

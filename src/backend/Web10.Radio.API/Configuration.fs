@@ -19,6 +19,17 @@ type StorageType =
     | Local
     | S3
 
+[<RequireQualifiedAccess>]
+module StorageCachePolicy =
+    [<Literal>]
+    let presignTtlSeconds = 3600
+
+    [<Literal>]
+    let defaultCacheMaxBytes = 10737418240L
+
+    [<Literal>]
+    let minCacheMaxBytes = 104857600L
+
 type StorageOptions =
     { Type: StorageType
       LocalRoot: string

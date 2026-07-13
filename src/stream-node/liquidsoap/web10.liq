@@ -66,7 +66,7 @@ captured_video = input.ffmpeg(
 )
 video = mksafe(captured_video)
 
-queue = request.queue(id="web10")
+queue = request.queue(id="web10", prefetch=1)
 audio = fallback(track_sensitive=false, [queue, blank()])
 stream = source.mux.video(video=video, audio)
 

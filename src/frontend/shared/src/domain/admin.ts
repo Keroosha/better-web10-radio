@@ -335,6 +335,19 @@ export const StorageReplaceRequestSchema = z.strictObject({
   additionalBackends: z.array(StorageAdditionalBackendReplaceSchema),
 });
 export type StorageReplaceRequest = z.infer<typeof StorageReplaceRequestSchema>;
+
+export const StorageCacheSettingsSchema = z.strictObject({
+  s3CacheMaxBytes: z.number().int().nonnegative(),
+  presignTtlSeconds: z.number().int().positive(),
+});
+export type StorageCacheSettings = z.infer<typeof StorageCacheSettingsSchema>;
+
+export const StorageCacheSettingsUpdateSchema = z.strictObject({
+  s3CacheMaxBytes: z.number().int().positive(),
+  presignTtlSeconds: z.number().int().positive(),
+});
+export type StorageCacheSettingsUpdate = z.infer<typeof StorageCacheSettingsUpdateSchema>;
+
 export const StorageEntryKindSchema = z.enum(['file', 'folder']);
 export type StorageEntryKind = z.infer<typeof StorageEntryKindSchema>;
 

@@ -254,7 +254,7 @@ WHERE "Id" = @QueueItemId;""",
                 command.Parameters.AddWithValue("TrackFileId", newId ()) |> ignore
                 let! _ = command.ExecuteNonQueryAsync()
                 use dataSource = NpgsqlDataSource.Create(connectionString)
-                let! result = PlaybackQueueRepository.findCachedTrackFile dataSource trackId CancellationToken.None
+                let! result = PlaybackQueueRepository.findCachedTrackFile dataSource trackId false CancellationToken.None
                 match result with
                 | Ok None -> ()
                 | actual -> Assert.Fail(sprintf "Expected an active file with a soft-deleted parent Track to be excluded, but got %A." actual)
@@ -339,6 +339,7 @@ VALUES (@PriorQueueItemId, @MiddleTrackId, @MiddlePlaylistItemId, @PlaylistId, '
                         dataSource
                         nextQueueItemId
                         (enqueuedAtUtc.AddSeconds(10.0))
+                        false
                         CancellationToken.None
 
                 assertInserted "the item after the last completed playlist item" next
@@ -381,6 +382,7 @@ WHERE "Id" = @QueueItemId;""",
                         dataSource
                         wrappedQueueItemId
                         (enqueuedAtUtc.AddSeconds(20.0))
+                        false
                         CancellationToken.None
 
                 assertInserted "the wrap from the largest playlist position" wrapped
@@ -420,6 +422,7 @@ WHERE "Id" = @QueueItemId;""",
                         dataSource
                         firstCandidateId
                         nowUtc
+                        false
                         CancellationToken.None
 
                 assertNoop "a database with no active playlist" absentPlaylist
@@ -440,6 +443,7 @@ VALUES (@PlaylistId, 'Empty active playlist', true, false);""",
                         dataSource
                         secondCandidateId
                         (nowUtc.AddSeconds(1.0))
+                        false
                         CancellationToken.None
 
                 assertNoop "an active playlist with no active items" emptyPlaylist
@@ -508,6 +512,7 @@ WHERE "Id" = @QueueItemId;""",
                             dataSource
                             (newId ())
                             (nowUtc.AddSeconds(10.0))
+                            false
                             CancellationToken.None
 
                     assertNoop (sprintf "an existing %s queue row" status) refill
@@ -561,6 +566,7 @@ VALUES (@AdminQueueItemId, @TrackId, 'admin', 'Queued', 100, @AdminRequestedAtUt
                         dataSource
                         (newId ())
                         (nowUtc.AddSeconds(2.0))
+                        false
                         CancellationToken.None
 
                 assertNoop "queued request and admin work" refill

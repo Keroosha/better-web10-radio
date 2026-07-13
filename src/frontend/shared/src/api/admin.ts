@@ -37,6 +37,9 @@ import {
   type Storage,
   type StorageReplaceRequest,
   StorageSchema,
+  type StorageCacheSettings,
+  type StorageCacheSettingsUpdate,
+  StorageCacheSettingsSchema,
   type StorageEntry,
   type StorageEntryPage,
   StorageEntrySchema,
@@ -446,6 +449,30 @@ export function replaceStorage(
     admin: true,
     ...opts,
   });
+}
+
+export function getStorageCacheSettings(opts: RequestOptions = {}): Promise<StorageCacheSettings> {
+  return apiFetch(`${API_V0_PREFIX}/admin/storage/cache`, {
+    schema: StorageCacheSettingsSchema,
+    admin: true,
+    ...opts,
+  });
+}
+
+export function updateStorageCacheSettings(
+  body: StorageCacheSettingsUpdate,
+  opts: RequestOptions = {},
+): Promise<StorageCacheSettings> {
+  return apiFetch<StorageCacheSettings, StorageCacheSettingsUpdate>(
+    `${API_V0_PREFIX}/admin/storage/cache`,
+    {
+      schema: StorageCacheSettingsSchema,
+      method: 'PUT',
+      body,
+      admin: true,
+      ...opts,
+    },
+  );
 }
 
 export interface StorageEntriesQuery {

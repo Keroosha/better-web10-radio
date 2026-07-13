@@ -124,6 +124,7 @@ VALUES (@ActiveId, 'Active title', 'Active artist', false),
               "TrackFiles"
               "TrackAssets"
               "StorageBackends"
+              "StorageSettings"
               "Playlists"
               "PlaylistItems"
               "PlaylistSchedules"
@@ -604,6 +605,9 @@ ORDER BY index_class.relname;""",
                           "Banners", "Banners_ScreenPosition_check"
                           "Banners", "Banners_SortOrder_check"
                           "StorageBackends", "StorageBackends_Type_check"
+                          "StorageSettings", "CK_StorageSettings_S3CacheMaxBytes_Positive"
+                          "StorageSettings", "CK_StorageSettings_PresignTtlSeconds_Positive"
+                          "StorageSettings", "CK_StorageSettings_SingletonKey_Primary"
                           "StreamNodeHeartbeats", "StreamNodeHeartbeats_Status_check"
                           "StreamNodeControlState", "CK_StreamNodeControlState_DesiredState"
                           "StreamNodeControlState", "CK_StreamNodeControlState_RestartGeneration_NonNegative"
@@ -656,6 +660,7 @@ ORDER BY index_class.relname;""",
                           "UX_LibraryScanJobs_Active_StorageBackend", "IsDeleted=falseANDStorageBackendIdISNOTNULLANDStatusIN'Queued','Running'"
                           "IX_OutboxEvents_Active_Status_NextAttemptAtUtc", "IsDeleted=false"
                           "UX_StreamNodeControlState_Active_Singleton", "IsDeleted=falseANDSingletonKey='primary'"
+                          "UX_StorageSettings_Active_Singleton", "IsDeleted=falseANDSingletonKey='primary'"
                           "IX_PlaybackControlCommands_Active_Generation", "IsDeleted=false"
                           "UX_Playlists_Active_System_AllStorage", "IsDeleted=falseANDIsActive=trueANDIsSystem=trueANDSource='AllStorage'"
                           "UX_TrackAssets_Active_Track_Kind", "IsDeleted=false"
@@ -824,7 +829,7 @@ VALUES ('00000000-0000-0000-0000-000000000302', '00000000-0000-0000-0000-0000000
 
                 Assert.That(
                     List.ofSeq versions,
-                    Is.EqualTo(([ 202607080001L; 202607100001L; 202607100002L; 202607100003L; 202607100004L; 202607110001L; 202607110002L; 202607110003L; 202607110004L; 202607120001L; 202607120002L; 202607120003L ] : int64 list) :> obj),
+                    Is.EqualTo(([ 202607080001L; 202607100001L; 202607100002L; 202607100003L; 202607100004L; 202607110001L; 202607110002L; 202607110003L; 202607110004L; 202607120001L; 202607120002L; 202607120003L; 202607130001L ] : int64 list) :> obj),
                     "A full down/up cycle must restore every migration in version order."
                 )
             })

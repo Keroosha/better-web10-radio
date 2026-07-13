@@ -56,6 +56,12 @@ module HealthOperabilityTests =
                 cancellationToken.ThrowIfCancellationRequested()
                 Task.CompletedTask
 
+            member _.GeneratePresignedGetUrlAsync(_, _, _, _, cancellationToken) =
+                task {
+                    cancellationToken.ThrowIfCancellationRequested()
+                    return "https://s3.example/presigned"
+                }
+
     let private storageOptions storageType localRoot bucket =
         { Type = storageType
           LocalRoot = localRoot

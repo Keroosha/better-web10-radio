@@ -61,6 +61,22 @@ type CurrentPlaybackAssignment =
       Artist: string
       DurationMs: int }
 
+type UpcomingPlaybackAssignments =
+    { Current: CurrentPlaybackAssignment option
+      Next: CurrentPlaybackAssignment option }
+
+type PromotableOnDeck =
+    { QueueItemId: Guid
+      TrackId: Guid option
+      ClaimOwner: Guid
+      ClaimAttempt: int }
+
+type PlaybackMediaSource =
+    { CachePath: string option
+      StorageKey: string
+      ContentType: string
+      IsDefaultS3: bool }
+
 module PlaybackQueueRepository =
     [<Literal>]
     let private claimPlaybackAdvisoryLockSql = """SELECT pg_advisory_xact_lock(hashtext('web10.radio.playback-claim'));"""
@@ -86,10 +102,16 @@ module PlaybackQueueRepository =
               q."Status" = 'Queued'
               AND NOT EXISTS (
                   SELECT 1
-                  FROM "PlaybackQueue" active
-                  WHERE active."IsDeleted" = false
-                    AND active."Status" IN ('Claimed', 'Playing')
+                  FROM "PlaybackQueue" claimed
+                  WHERE claimed."IsDeleted" = false
+                    AND claimed."Status" = 'Claimed'
               )
+              AND (
+                  SELECT count(*)
+                  FROM "PlaybackQueue" playing
+                  WHERE playing."IsDeleted" = false
+                    AND playing."Status" = 'Playing'
+              ) <= 1
           )
       )
     ORDER BY
@@ -126,13 +148,15 @@ WHERE "Id" = @QueueItemId
 FOR UPDATE;"""
 
     [<Literal>]
-    let private findCachedTrackFileSql = """SELECT tf."CachePath"
+    let private findCachedTrackFileSql = """SELECT COALESCE(tf."CachePath", tf."StoragePath")
 FROM "TrackFiles" AS tf
 INNER JOIN "Tracks" AS t ON t."Id" = tf."TrackId" AND t."IsDeleted" = false
 WHERE tf."TrackId" = @TrackId
-  AND tf."IsCached" = true
-  AND tf."CachePath" IS NOT NULL
   AND tf."IsDeleted" = false
+  AND (
+      (tf."IsCached" = true AND tf."CachePath" IS NOT NULL AND btrim(tf."CachePath") <> '')
+      OR (@DefaultStorageIsS3 AND tf."StorageBackendId" IS NULL AND tf."StoragePath" IS NOT NULL AND btrim(tf."StoragePath") <> '')
+  )
 ORDER BY tf."UpdatedAtUtc" DESC, tf."CreatedAtUtc" DESC
 LIMIT 1;"""
 
@@ -151,9 +175,10 @@ INNER JOIN LATERAL (
     FROM "TrackFiles" AS track_file
     WHERE track_file."TrackId" = t."Id"
       AND track_file."IsDeleted" = false
-      AND track_file."IsCached" = true
-      AND track_file."CachePath" IS NOT NULL
-      AND btrim(track_file."CachePath") <> ''
+      AND (
+          (track_file."IsCached" = true AND track_file."CachePath" IS NOT NULL AND btrim(track_file."CachePath") <> '')
+          OR (@DefaultStorageIsS3 AND track_file."StorageBackendId" IS NULL AND track_file."StoragePath" IS NOT NULL AND btrim(track_file."StoragePath") <> '')
+      )
     ORDER BY track_file."UpdatedAtUtc" DESC, track_file."CreatedAtUtc" DESC, track_file."Id" ASC
     LIMIT 1
 ) AS tf ON true
@@ -167,7 +192,36 @@ LIMIT 1;"""
 
     [<Literal>]
     let private getPlaybackMediaFileSql = """SELECT tf."CachePath",
-       COALESCE(tf."ContentType", 'audio/mpeg')
+       tf."StoragePath",
+       COALESCE(tf."ContentType", 'audio/mpeg'),
+       (tf."StorageBackendId" IS NULL AND @DefaultStorageIsS3)
+FROM "PlaybackQueue" AS q
+INNER JOIN "Tracks" AS t
+    ON t."Id" = q."TrackId"
+   AND t."IsDeleted" = false
+INNER JOIN LATERAL (
+    SELECT track_file."CachePath", track_file."StoragePath", track_file."ContentType", track_file."StorageBackendId"
+    FROM "TrackFiles" AS track_file
+    WHERE track_file."TrackId" = t."Id"
+      AND track_file."IsDeleted" = false
+      AND (
+          (track_file."IsCached" = true AND track_file."CachePath" IS NOT NULL AND btrim(track_file."CachePath") <> '')
+          OR (@DefaultStorageIsS3 AND track_file."StorageBackendId" IS NULL AND track_file."StoragePath" IS NOT NULL AND btrim(track_file."StoragePath") <> '')
+      )
+    ORDER BY track_file."UpdatedAtUtc" DESC, track_file."CreatedAtUtc" DESC, track_file."Id" ASC
+    LIMIT 1
+) AS tf ON true
+WHERE q."IsDeleted" = false
+  AND q."Id" = @QueueItemId
+  AND q."Status" IN ('Claimed', 'Playing')
+LIMIT 1;"""
+
+    [<Literal>]
+    let private getUpcomingAssignmentsSql = """SELECT q."Id", q."ClaimOwner", q."ClaimAttempt", q."Status", t."Id", tf."CachePath",
+       COALESCE(tf."ContentType", 'audio/mpeg'),
+       COALESCE(t."Title", ''),
+       COALESCE(t."Artist", ''),
+       COALESCE(t."DurationMs", 0)
 FROM "PlaybackQueue" AS q
 INNER JOIN "Tracks" AS t
     ON t."Id" = q."TrackId"
@@ -177,16 +231,60 @@ INNER JOIN LATERAL (
     FROM "TrackFiles" AS track_file
     WHERE track_file."TrackId" = t."Id"
       AND track_file."IsDeleted" = false
-      AND track_file."IsCached" = true
-      AND track_file."CachePath" IS NOT NULL
-      AND btrim(track_file."CachePath") <> ''
+      AND (
+          (track_file."IsCached" = true AND track_file."CachePath" IS NOT NULL AND btrim(track_file."CachePath") <> '')
+          OR (@DefaultStorageIsS3 AND track_file."StorageBackendId" IS NULL AND track_file."StoragePath" IS NOT NULL AND btrim(track_file."StoragePath") <> '')
+      )
     ORDER BY track_file."UpdatedAtUtc" DESC, track_file."CreatedAtUtc" DESC, track_file."Id" ASC
     LIMIT 1
 ) AS tf ON true
 WHERE q."IsDeleted" = false
-  AND q."Id" = @QueueItemId
-  AND q."Status" IN ('Claimed', 'Playing')
+  AND q."Status" IN ('Playing', 'Claimed')
+  AND q."ClaimOwner" IS NOT NULL
+  AND q."ClaimAttempt" > 0
+  AND q."ClaimLeaseExpiresAtUtc" IS NOT NULL
+ORDER BY CASE WHEN q."Status" = 'Playing' THEN 0 ELSE 1 END,
+         q."StartedAtUtc" DESC NULLS LAST, q."UpdatedAtUtc" DESC, q."CreatedAtUtc" DESC, q."Id" ASC
+LIMIT 2;"""
+
+    [<Literal>]
+    let private promotableOnDeckSql = """SELECT q."Id", q."TrackId", q."ClaimOwner", q."ClaimAttempt"
+FROM "PlaybackQueue" AS q
+WHERE q."IsDeleted" = false
+  AND q."Status" = 'Claimed'
+  AND q."ClaimOwner" IS NOT NULL
+  AND q."ClaimAttempt" > 0
+  AND NOT EXISTS (
+      SELECT 1 FROM "PlaybackQueue" AS playing
+      WHERE playing."IsDeleted" = false AND playing."Status" = 'Playing'
+  )
+ORDER BY q."ClaimedAtUtc" ASC NULLS FIRST, q."CreatedAtUtc" ASC, q."Id" ASC
+FOR UPDATE SKIP LOCKED
 LIMIT 1;"""
+
+    [<Literal>]
+    let private retireAllActivePlaybackSql = """UPDATE "PlaybackQueue"
+SET "Status" = 'Played',
+    "FinishedAtUtc" = @AtUtc,
+    "FailureReason" = NULL,
+    "ClaimOwner" = NULL,
+    "ClaimLeaseExpiresAtUtc" = NULL,
+    "UpdatedAtUtc" = @AtUtc
+WHERE "IsDeleted" = false
+  AND "Status" IN ('Playing', 'Claimed');"""
+
+    [<Literal>]
+    let private retireOnDeckForTracksSql = """UPDATE "PlaybackQueue"
+SET "Status" = 'Played',
+    "FinishedAtUtc" = @AtUtc,
+    "FailureReason" = NULL,
+    "ClaimOwner" = NULL,
+    "ClaimLeaseExpiresAtUtc" = NULL,
+    "UpdatedAtUtc" = @AtUtc
+WHERE "IsDeleted" = false
+  AND "Status" = 'Claimed'
+  AND "TrackId" = ANY(@AffectedTrackIds)
+  AND (@ExcludeQueueItemId IS NULL OR "Id" <> @ExcludeQueueItemId);"""
 
     [<Literal>]
     let private enqueueNextActivePlaylistItemIfIdleSql = """WITH active_playlists AS (
@@ -246,7 +344,10 @@ LIMIT 1;"""
           AND EXISTS (
               SELECT 1 FROM "TrackFiles" AS track_file
               WHERE track_file."TrackId" = candidate."TrackId" AND track_file."IsDeleted" = false
-                AND track_file."IsCached" = true AND track_file."CachePath" IS NOT NULL AND btrim(track_file."CachePath") <> ''
+                AND (
+                    (track_file."IsCached" = true AND track_file."CachePath" IS NOT NULL AND btrim(track_file."CachePath") <> '')
+                    OR (@DefaultStorageIsS3 AND track_file."StorageBackendId" IS NULL AND track_file."StoragePath" IS NOT NULL AND btrim(track_file."StoragePath") <> '')
+                )
           )
         ORDER BY CASE WHEN playlist."Order" = 'Sequential' AND (last_item."Position" IS NULL OR candidate."Position" > last_item."Position") THEN 0 WHEN playlist."Order" = 'Sequential' THEN 1 ELSE 0 END,
                  CASE WHEN playlist."AvoidDuplicates" AND EXISTS (
@@ -272,7 +373,10 @@ LIMIT 1;"""
           AND EXISTS (
               SELECT 1 FROM "TrackFiles" AS track_file
               WHERE track_file."TrackId" = track."Id" AND track_file."IsDeleted" = false
-                AND track_file."IsCached" = true AND track_file."CachePath" IS NOT NULL AND btrim(track_file."CachePath") <> ''
+                AND (
+                    (track_file."IsCached" = true AND track_file."CachePath" IS NOT NULL AND btrim(track_file."CachePath") <> '')
+                    OR (@DefaultStorageIsS3 AND track_file."StorageBackendId" IS NULL AND track_file."StoragePath" IS NOT NULL AND btrim(track_file."StoragePath") <> '')
+                )
           )
         ORDER BY CASE WHEN playlist."AvoidDuplicates" AND EXISTS (
                      SELECT 1 FROM "PlaybackQueue" AS recent
@@ -305,9 +409,13 @@ LIMIT 1;"""
            @EnqueuedAtUtc, false, @EnqueuedAtUtc, @EnqueuedAtUtc
     FROM next_item
     WHERE NOT EXISTS (
-        SELECT 1 FROM "PlaybackQueue" AS active_queue_item
-        WHERE active_queue_item."IsDeleted" = false AND active_queue_item."Status" IN ('Queued', 'Claimed', 'Playing')
+        SELECT 1 FROM "PlaybackQueue" AS blocking_queue_item
+        WHERE blocking_queue_item."IsDeleted" = false AND blocking_queue_item."Status" IN ('Queued', 'Claimed')
     )
+    AND (
+        SELECT count(*) FROM "PlaybackQueue" AS playing_queue_item
+        WHERE playing_queue_item."IsDeleted" = false AND playing_queue_item."Status" = 'Playing'
+    ) <= 1
     RETURNING "Id", "TrackId", "TrackRequestId", "PlaylistItemId", "PlaylistId", "Source", "Status", "Priority", "RequestedAtUtc"
 )
 SELECT "Id", "TrackId", "TrackRequestId", "PlaylistItemId", "PlaylistId", "Source", "Status", "Priority", "RequestedAtUtc"
@@ -358,9 +466,10 @@ LIMIT 1;"""
     WHERE track."Id" = @TrackId
       AND track."IsDeleted" = false
       AND track_file."IsDeleted" = false
-      AND track_file."IsCached" = true
-      AND track_file."CachePath" IS NOT NULL
-      AND btrim(track_file."CachePath") <> ''
+      AND (
+          (track_file."IsCached" = true AND track_file."CachePath" IS NOT NULL AND btrim(track_file."CachePath") <> '')
+          OR (@DefaultStorageIsS3 AND track_file."StorageBackendId" IS NULL AND track_file."StoragePath" IS NOT NULL AND btrim(track_file."StoragePath") <> '')
+      )
 );"""
 
     [<Literal>]
@@ -425,7 +534,7 @@ SET "ClaimLeaseExpiresAtUtc" = @LeaseExpiresAtUtc,
     "UpdatedAtUtc" = @RenewedAtUtc
 WHERE "Id" = @QueueItemId
   AND "IsDeleted" = false
-  AND "Status" = 'Playing'
+  AND "Status" IN ('Claimed', 'Playing')
   AND "ClaimOwner" = @ClaimOwner
   AND "ClaimAttempt" = @ClaimAttempt
   AND "ClaimLeaseExpiresAtUtc" > @RenewedAtUtc;"""
@@ -487,7 +596,7 @@ WHERE "Id" = @QueueItemId
           ClaimOwner = reader.GetGuid(1)
           ClaimAttempt = reader.GetInt32(2)
           TrackId = reader.GetGuid(3)
-          CachePath = reader.GetString(4)
+          CachePath = (if reader.IsDBNull(4) then "" else reader.GetString(4))
           ContentType = reader.GetString(5)
           Title = reader.GetString(6)
           Artist = reader.GetString(7)
@@ -559,12 +668,14 @@ WHERE "Id" = @QueueItemId
         (connection: NpgsqlConnection)
         (transaction: NpgsqlTransaction)
         (trackId: Guid)
+        (defaultStorageIsS3: bool)
         (cancellationToken: CancellationToken)
         : Task<Result<string option, RepositoryError>> =
         taskResult {
             try
                 use command = new NpgsqlCommand(findCachedTrackFileSql, connection, transaction)
                 command.Parameters.AddWithValue("TrackId", trackId) |> ignore
+                command.Parameters.AddWithValue("DefaultStorageIsS3", defaultStorageIsS3) |> ignore
                 let! result = command.ExecuteScalarAsync(cancellationToken)
 
                 match result with
@@ -579,15 +690,17 @@ WHERE "Id" = @QueueItemId
     let findCachedTrackFile
         (dataSource: NpgsqlDataSource)
         (trackId: Guid)
+        (defaultStorageIsS3: bool)
         (cancellationToken: CancellationToken)
         : Task<Result<string option, RepositoryError>> =
         DatabaseSession.withTransactionResult
             dataSource
-            (fun connection transaction cancellationToken -> findCachedTrackFileInTransaction connection transaction trackId cancellationToken)
+            (fun connection transaction cancellationToken -> findCachedTrackFileInTransaction connection transaction trackId defaultStorageIsS3 cancellationToken)
             cancellationToken
 
     let getCurrentAssignment
         (dataSource: NpgsqlDataSource)
+        (defaultStorageIsS3: bool)
         (cancellationToken: CancellationToken)
         : Task<Result<CurrentPlaybackAssignment option, RepositoryError>> =
         DatabaseSession.withTransactionResult
@@ -596,6 +709,7 @@ WHERE "Id" = @QueueItemId
                 taskResult {
                     try
                         use command = new NpgsqlCommand(getCurrentAssignmentSql, connection, transaction)
+                        command.Parameters.AddWithValue("DefaultStorageIsS3", defaultStorageIsS3) |> ignore
                         let! reader = command.ExecuteReaderAsync(cancellationToken)
                         use reader = reader
                         let! hasRow = reader.ReadAsync(cancellationToken)
@@ -605,11 +719,52 @@ WHERE "Id" = @QueueItemId
                 })
             cancellationToken
 
+    let getUpcomingAssignments
+        (dataSource: NpgsqlDataSource)
+        (defaultStorageIsS3: bool)
+        (cancellationToken: CancellationToken)
+        : Task<Result<UpcomingPlaybackAssignments, RepositoryError>> =
+        DatabaseSession.withTransactionResult
+            dataSource
+            (fun connection transaction cancellationToken ->
+                task {
+                    try
+                        use command = new NpgsqlCommand(getUpcomingAssignmentsSql, connection, transaction)
+                        command.Parameters.AddWithValue("DefaultStorageIsS3", defaultStorageIsS3) |> ignore
+                        use! reader = command.ExecuteReaderAsync(cancellationToken)
+                        let mutable current = None
+                        let mutable next = None
+                        let mutable reading = true
+                        while reading do
+                            let! found = reader.ReadAsync(cancellationToken)
+                            if found then
+                                let status = reader.GetString(3)
+                                let assignment =
+                                    { QueueItemId = reader.GetGuid(0)
+                                      ClaimOwner = reader.GetGuid(1)
+                                      ClaimAttempt = reader.GetInt32(2)
+                                      TrackId = reader.GetGuid(4)
+                                      CachePath = (if reader.IsDBNull(5) then "" else reader.GetString(5))
+                                      ContentType = reader.GetString(6)
+                                      Title = reader.GetString(7)
+                                      Artist = reader.GetString(8)
+                                      DurationMs = reader.GetInt32(9) }
+                                if status = "Playing" && Option.isNone current then current <- Some assignment
+                                elif status = "Claimed" && Option.isNone next then next <- Some assignment
+                            else
+                                reading <- false
+                        return Ok { Current = current; Next = next }
+                    with ex ->
+                        return Error(databaseError "PlaybackQueueRepository.getUpcomingAssignments" ex)
+                })
+            cancellationToken
+
     let getPlaybackMediaFile
         (dataSource: NpgsqlDataSource)
         (queueItemId: Guid)
+        (defaultStorageIsS3: bool)
         (cancellationToken: CancellationToken)
-        : Task<Result<(string * string) option, RepositoryError>> =
+        : Task<Result<PlaybackMediaSource option, RepositoryError>> =
         DatabaseSession.withTransactionResult
             dataSource
             (fun connection transaction cancellationToken ->
@@ -617,12 +772,19 @@ WHERE "Id" = @QueueItemId
                     try
                         use command = new NpgsqlCommand(getPlaybackMediaFileSql, connection, transaction)
                         command.Parameters.AddWithValue("QueueItemId", queueItemId) |> ignore
+                        command.Parameters.AddWithValue("DefaultStorageIsS3", defaultStorageIsS3) |> ignore
                         let! reader = command.ExecuteReaderAsync(cancellationToken)
                         use reader = reader
                         let! hasRow = reader.ReadAsync(cancellationToken)
                         return
-                            if hasRow then Some(reader.GetString(0), reader.GetString(1))
-                            else None
+                            if hasRow then
+                                Some
+                                    { CachePath = (if reader.IsDBNull(0) then None else Some(reader.GetString(0)))
+                                      StorageKey = reader.GetString(1)
+                                      ContentType = reader.GetString(2)
+                                      IsDefaultS3 = reader.GetBoolean(3) }
+                            else
+                                None
                     with ex ->
                         return! Error(databaseError "PlaybackQueueRepository.getPlaybackMediaFile" ex)
                 })
@@ -805,6 +967,7 @@ WHERE state."IsDeleted" = false;""", connection, transaction)
         (transaction: NpgsqlTransaction)
         (candidateQueueItemId: Guid)
         (enqueuedAtUtc: DateTimeOffset)
+        (defaultStorageIsS3: bool)
         (cancellationToken: CancellationToken)
         : Task<Result<PlaybackQueueItem option, RepositoryError>> =
         taskResult {
@@ -823,6 +986,7 @@ ON CONFLICT ("PlaylistId") DO NOTHING;""", connection, transaction)
                 use command = new NpgsqlCommand(enqueueNextActivePlaylistItemIfIdleSql, connection, transaction)
                 command.Parameters.AddWithValue("QueueItemId", candidateQueueItemId) |> ignore
                 command.Parameters.AddWithValue("EnqueuedAtUtc", enqueuedAtUtc) |> ignore
+                command.Parameters.AddWithValue("DefaultStorageIsS3", defaultStorageIsS3) |> ignore
                 use! reader = command.ExecuteReaderAsync(cancellationToken)
                 let! hasRow = reader.ReadAsync(cancellationToken)
                 let item = if hasRow then Some(readPlaybackQueueItem reader) else None
@@ -850,6 +1014,7 @@ WHERE "PlaylistId" = @PlaylistId AND "IsDeleted" = false;""", connection, transa
         (dataSource: NpgsqlDataSource)
         (candidateQueueItemId: Guid)
         (enqueuedAtUtc: DateTimeOffset)
+        (defaultStorageIsS3: bool)
         (cancellationToken: CancellationToken)
         : Task<Result<PlaybackQueueItem option, RepositoryError>> =
         DatabaseSession.withTransactionResult
@@ -860,6 +1025,7 @@ WHERE "PlaylistId" = @PlaylistId AND "IsDeleted" = false;""", connection, transa
                     transaction
                     candidateQueueItemId
                     enqueuedAtUtc
+                    defaultStorageIsS3
                     cancellationToken)
             cancellationToken
 
@@ -919,11 +1085,13 @@ WHERE "PlaylistId" = @PlaylistId AND "IsDeleted" = false;""", connection, transa
         (connection: NpgsqlConnection)
         (transaction: NpgsqlTransaction)
         (trackId: Guid)
+        (defaultStorageIsS3: bool)
         (cancellationToken: CancellationToken)
         : Task<bool> =
         task {
             use command = new NpgsqlCommand(playableTrackSql, connection, transaction)
             command.Parameters.AddWithValue("TrackId", trackId) |> ignore
+            command.Parameters.AddWithValue("DefaultStorageIsS3", defaultStorageIsS3) |> ignore
             let! result = command.ExecuteScalarAsync(cancellationToken)
             return Convert.ToBoolean(result)
         }
@@ -960,6 +1128,65 @@ WHERE "PlaylistId" = @PlaylistId AND "IsDeleted" = false;""", connection, transa
             command.Parameters.AddWithValue("QueueItemId", fence.QueueItemId) |> ignore
             command.Parameters.AddWithValue("ClaimOwner", fence.ClaimOwner) |> ignore
             command.Parameters.AddWithValue("ClaimAttempt", fence.ClaimAttempt) |> ignore
+            command.Parameters.AddWithValue("AtUtc", atUtc) |> ignore
+            return! command.ExecuteNonQueryAsync(cancellationToken)
+        }
+
+    let tryGetPromotableOnDeckInTransaction
+        (connection: NpgsqlConnection)
+        (transaction: NpgsqlTransaction)
+        (cancellationToken: CancellationToken)
+        : Task<Result<PromotableOnDeck option, RepositoryError>> =
+        taskResult {
+            try
+                use lockCommand = new NpgsqlCommand(claimPlaybackAdvisoryLockSql, connection, transaction)
+                let! _ = lockCommand.ExecuteNonQueryAsync(cancellationToken)
+
+                use command = new NpgsqlCommand(promotableOnDeckSql, connection, transaction)
+                let! reader = command.ExecuteReaderAsync(cancellationToken)
+                use reader = reader
+                let! hasRow = reader.ReadAsync(cancellationToken)
+                return
+                    if hasRow then
+                        Some
+                            { QueueItemId = reader.GetGuid(0)
+                              TrackId = readNullableGuid reader 1
+                              ClaimOwner = reader.GetGuid(2)
+                              ClaimAttempt = reader.GetInt32(3) }
+                    else
+                        None
+            with ex ->
+                return! Error(databaseError "PlaybackQueueRepository.tryGetPromotableOnDeckInTransaction" ex)
+        }
+
+    let private retireAllActivePlaybackInTransaction
+        (connection: NpgsqlConnection)
+        (transaction: NpgsqlTransaction)
+        (atUtc: DateTimeOffset)
+        (cancellationToken: CancellationToken)
+        : Task<int> =
+        task {
+            use command = new NpgsqlCommand(retireAllActivePlaybackSql, connection, transaction)
+            command.Parameters.AddWithValue("AtUtc", atUtc) |> ignore
+            return! command.ExecuteNonQueryAsync(cancellationToken)
+        }
+
+    let private retireOnDeckForTracksInTransaction
+        (connection: NpgsqlConnection)
+        (transaction: NpgsqlTransaction)
+        (affectedTrackIds: Guid list)
+        (excludeQueueItemId: Guid option)
+        (atUtc: DateTimeOffset)
+        (cancellationToken: CancellationToken)
+        : Task<int> =
+        task {
+            use command = new NpgsqlCommand(retireOnDeckForTracksSql, connection, transaction)
+            let affectedParam = command.Parameters.Add("AffectedTrackIds", NpgsqlDbType.Array ||| NpgsqlDbType.Uuid)
+            affectedParam.Value <- (affectedTrackIds |> List.toArray)
+            let excludeParam = command.Parameters.Add("ExcludeQueueItemId", NpgsqlDbType.Uuid)
+            excludeParam.Value <- (match excludeQueueItemId with
+                                   | Some id -> box id
+                                   | None -> box DBNull.Value)
             command.Parameters.AddWithValue("AtUtc", atUtc) |> ignore
             return! command.ExecuteNonQueryAsync(cancellationToken)
         }
@@ -1055,6 +1282,7 @@ WHERE "Id" = @QueueItemId AND "IsDeleted" = false AND "Status" = 'Queued';""", c
                 match current with
                 | None -> return None
                 | Some fence ->
+                    let! _ = retireOnDeckForTracksInTransaction connection transaction affectedTrackIds (Some fence.QueueItemId) nowUtc cancellationToken
                     use trackCommand = new NpgsqlCommand("SELECT \"TrackId\" FROM \"PlaybackQueue\" WHERE \"Id\" = @QueueItemId AND \"IsDeleted\" = false;", connection, transaction)
                     trackCommand.Parameters.AddWithValue("QueueItemId", fence.QueueItemId) |> ignore
                     let! value = trackCommand.ExecuteScalarAsync(cancellationToken)
@@ -1100,13 +1328,14 @@ WHERE "Id" = @QueueItemId AND "IsDeleted" = false AND "Status" = 'Queued';""", c
         (transaction: NpgsqlTransaction)
         (queueItemId: Guid)
         (trackId: Guid)
+        (defaultStorageIsS3: bool)
         (nowUtc: DateTimeOffset)
         (cancellationToken: CancellationToken)
         : Task<Result<PlaybackControlOutcome<ForcePlayNowApplied>, RepositoryError>> =
         taskResult {
             try
                 do! lockPlaybackControl connection transaction cancellationToken
-                let! playable = isPlayableTrack connection transaction trackId cancellationToken
+                let! playable = isPlayableTrack connection transaction trackId defaultStorageIsS3 cancellationToken
                 if not playable then
                     return PlaybackControlOutcome.NotFound
                 else
@@ -1135,6 +1364,7 @@ WHERE "Id" = @QueueItemId AND "IsDeleted" = false AND "Status" = 'Queued';""", c
                         match insertedItem with
                         | None -> return PlaybackControlOutcome.Conflict
                         | Some item ->
+                            let! _ = retireAllActivePlaybackInTransaction connection transaction nowUtc cancellationToken
                             match current with
                             | None ->
                                 return
@@ -1143,16 +1373,12 @@ WHERE "Id" = @QueueItemId AND "IsDeleted" = false AND "Status" = 'Queued';""", c
                                           TrackId = trackId
                                           Interrupted = None }
                             | Some fence ->
-                                let! affected = markSkippedByFence connection transaction fence nowUtc cancellationToken
-                                if affected <> 1 then
-                                    return PlaybackControlOutcome.Conflict
-                                else
-                                    let! _ = insertControlCommand connection transaction "Skip" fence nowUtc cancellationToken
-                                    return
-                                        PlaybackControlOutcome.Applied
-                                            { QueueItemId = item.QueueItemId
-                                              TrackId = trackId
-                                              Interrupted = Some fence }
+                                let! _ = insertControlCommand connection transaction "Skip" fence nowUtc cancellationToken
+                                return
+                                    PlaybackControlOutcome.Applied
+                                        { QueueItemId = item.QueueItemId
+                                          TrackId = trackId
+                                          Interrupted = Some fence }
             with ex ->
                 return! Error(databaseError "PlaybackQueueRepository.forcePlayNowInTransaction" ex)
         }
@@ -1231,10 +1457,11 @@ WHERE "Id" = @QueueItemId AND "IsDeleted" = false AND "Status" = 'Queued';""", c
         (dataSource: NpgsqlDataSource)
         (queueItemId: Guid)
         (trackId: Guid)
+        (defaultStorageIsS3: bool)
         (nowUtc: DateTimeOffset)
         (cancellationToken: CancellationToken)
         : Task<Result<PlaybackControlOutcome<ForcePlayNowApplied>, RepositoryError>> =
         DatabaseSession.withTransactionResult
             dataSource
-            (fun connection transaction cancellationToken -> forcePlayNowInTransaction connection transaction queueItemId trackId nowUtc cancellationToken)
+            (fun connection transaction cancellationToken -> forcePlayNowInTransaction connection transaction queueItemId trackId defaultStorageIsS3 nowUtc cancellationToken)
             cancellationToken

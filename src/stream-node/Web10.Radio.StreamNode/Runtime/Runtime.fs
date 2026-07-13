@@ -102,6 +102,11 @@ type RuntimeSupervisor(
     let mutable callbackEnded = false
     let mutable outputFailed = false
     let mutable pushedAt: int64 option = None
+    let mutable onDeck: Assignment option = None
+    let mutable onDeckPath: string option = None
+    let mutable onDeckPushed = false
+    let mutable onDeckStarted = false
+    let mutable nextOnDeckLeaseAt = 0L
     let mutable completionPending: (Assignment * PlaybackCompletion) option = None
     let mutable nextCompletionAt = 0L
     let mutable restartAt: (int64 * bool) option = None
@@ -154,7 +159,13 @@ type RuntimeSupervisor(
             do! this.StopVisualAsync(token)
         }
 
-    member private _.ClearAssignment() =
+    member private _.ClearOnDeck() =
+        onDeck <- None
+        onDeckPath <- None
+        onDeckPushed <- false
+        onDeckStarted <- false
+
+    member private this.ClearAssignment() =
         assignment <- None
         assignmentPath <- None
         pushedAt <- None
@@ -162,6 +173,26 @@ type RuntimeSupervisor(
         callbackStarted <- false
         callbackEnded <- false
         outputFailed <- false
+        this.ClearOnDeck()
+
+    member private _.PromoteOnDeck() : bool =
+        match onDeck, onDeckPath with
+        | Some value, Some path ->
+            let now = timeProvider.GetTimestamp()
+            assignment <- Some value
+            assignmentPath <- Some path
+            pushedAt <- Some now
+            callbackIdentity <- Some(Assignment.identity value)
+            callbackStarted <- onDeckStarted
+            callbackEnded <- false
+            outputFailed <- false
+            nextLeaseAt <- now
+            onDeck <- None
+            onDeckPath <- None
+            onDeckPushed <- false
+            onDeckStarted <- false
+            true
+        | _ -> false
 
     member private this.StartVisualAsync(token) =
         task {
@@ -249,15 +280,9 @@ type RuntimeSupervisor(
                                     this.ClearAssignment()
                                     nextAssignmentAt <- timeProvider.GetTimestamp()
                                 elif command.Action = "restart" && completionPending.IsNone then
-                                    callbackStarted <- false; callbackEnded <- false; outputFailed <- false
-                                    pushedAt <- None
-                                    match assignmentPath, media with
-                                    | Some path, Some _ ->
-                                        let! ready = liquidsoap.IsReadyAsync(cancellation.Token)
-                                        if ready then
-                                            let! _ = liquidsoap.PushAsync(current, path, cancellation.Token)
-                                            pushedAt <- Some(timeProvider.GetTimestamp())
-                                    | _ -> ()
+                                    do! this.StopMediaAsync(cancellation.Token)
+                                    this.ClearAssignment()
+                                    nextAssignmentAt <- timeProvider.GetTimestamp()
                             | _ -> ()
                     playbackGeneration <- max playbackGeneration nextGeneration
             with
@@ -265,26 +290,32 @@ type RuntimeSupervisor(
             | _ -> this.SetDegraded("Backend control request failed")
         }
 
-    member private this.PollAssignmentAsync() =
+    member private this.PollUpcomingAsync() =
         task {
-            if desiredState <> "running" || terminalFailure || completionPending.IsSome then ()
+            if desiredState <> "running" || terminalFailure then ()
             else
                 try
-                    let! result = backend.GetAssignmentAsync cancellation.Token
+                    let! result = backend.GetUpcomingAsync cancellation.Token
                     match result with
                     | Error(BackendError.UnauthorizedResponse _) -> this.SetTerminal("Backend authorization failed")
                     | Error _ -> this.SetDegraded("Backend playback request failed")
-                    | Ok None -> ()
-                    | Ok(Some value) ->
-                        match assignment with
-                        | Some current when Assignment.identity current = Assignment.identity value -> ()
-                        | Some _ ->
-                            do! this.StopMediaAsync(cancellation.Token)
-                            this.ClearAssignment()
-                            this.StartMedia()
+                    | Ok(currentOpt, nextOpt) ->
+                        match currentOpt, assignment with
+                        | Some value, None ->
+                            assignment <- Some value
+                            assignmentPath <- Some(Liquidsoap.mediaProtocolUri value)
+                        | _ -> ()
+                        match nextOpt with
+                        | Some value ->
+                            let alreadyCurrent = assignment |> Option.exists (fun c -> Assignment.identity c = Assignment.identity value)
+                            if not alreadyCurrent && not onDeckPushed then
+                                match onDeck with
+                                | Some existing when Assignment.identity existing = Assignment.identity value -> ()
+                                | _ ->
+                                    onDeck <- Some value
+                                    onDeckPath <- Some(Liquidsoap.mediaProtocolUri value)
+                                    onDeckStarted <- false
                         | None -> ()
-                        assignment <- Some value
-                        assignmentPath <- Some(Liquidsoap.mediaProtocolUri value)
                 with
                 | :? OperationCanceledException -> ()
                 | _ -> this.SetDegraded("Backend playback request failed")
@@ -307,6 +338,21 @@ type RuntimeSupervisor(
             | _ -> ()
         }
 
+    member private this.PushOnDeckAsync() =
+        task {
+            match onDeck, onDeckPath, onDeckPushed, assignment, pushedAt, completionPending, media with
+            | Some value, Some path, false, Some _, Some _, None, Some process when process.IsAlive && callbackStarted && not callbackEnded ->
+                let! ready = liquidsoap.IsReadyAsync(cancellation.Token)
+                if ready then
+                    try
+                        let! response = liquidsoap.PushAsync(value, path, cancellation.Token)
+                        if response.IndexOf("error", StringComparison.OrdinalIgnoreCase) >= 0 then raise (InvalidOperationException("Liquidsoap rejected on-deck media"))
+                        onDeckPushed <- true
+                        nextOnDeckLeaseAt <- timeProvider.GetTimestamp()
+                    with _ -> this.ClearOnDeck()
+            | _ -> ()
+        }
+
     member private this.BeginCompletionAsync(value: Assignment, completion: PlaybackCompletion) =
         task {
             if completionPending.IsNone then
@@ -316,8 +362,8 @@ type RuntimeSupervisor(
                 | PlaybackCompletion.Failed reason ->
                     this.SetDegraded reason
                     do! this.StopMediaAsync(cancellation.Token)
+                    this.ClearOnDeck()
                 | PlaybackCompletion.Played -> ()
-                callbackIdentity <- None
                 do! this.ServiceCompletionAsync()
         }
 
@@ -330,7 +376,12 @@ type RuntimeSupervisor(
                     let! result = backend.CompleteAsync(value, completion, cancellation.Token)
                     match result with
                     | CallbackResult.Accepted
-                    | CallbackResult.Stale -> completionPending <- None; this.ClearAssignment(); nextAssignmentAt <- timeProvider.GetTimestamp()
+                    | CallbackResult.Stale ->
+                        completionPending <- None
+                        match assignment with
+                        | Some current when Assignment.identity current = Assignment.identity value ->
+                            this.ClearAssignment(); nextAssignmentAt <- timeProvider.GetTimestamp()
+                        | _ -> ()
                     | CallbackResult.Unauthorized -> completionPending <- None; this.SetTerminal("Backend authorization failed")
                     | CallbackResult.TransientError -> nextCompletionAt <- timeProvider.GetTimestamp() + int64 (float Runtime.heartbeatCadence.TotalSeconds * float timeProvider.TimestampFrequency)
         }
@@ -349,6 +400,16 @@ type RuntimeSupervisor(
                 | CallbackResult.Unauthorized -> this.SetTerminal("Backend authorization failed")
                 | CallbackResult.TransientError -> this.SetDegraded("Playback lease renewal failed")
             | _ -> ()
+
+            match onDeck, onDeckPushed with
+            | Some value, true when desiredState = "running" && not terminalFailure && timeProvider.GetTimestamp() >= nextOnDeckLeaseAt ->
+                nextOnDeckLeaseAt <- timeProvider.GetTimestamp() + int64 (float Runtime.leaseCadence.TotalSeconds * float timeProvider.TimestampFrequency)
+                match! backend.RenewLeaseAsync(value, cancellation.Token) with
+                | CallbackResult.Accepted -> ()
+                | CallbackResult.Stale -> this.ClearOnDeck()
+                | CallbackResult.Unauthorized -> this.SetTerminal("Backend authorization failed")
+                | CallbackResult.TransientError -> ()
+            | _ -> ()
         }
 
     member private this.DrainCallbacksAsync() =
@@ -356,17 +417,27 @@ type RuntimeSupervisor(
             let mutable item = Unchecked.defaultof<CallbackName * Assignment>
             while callbackEvents.TryDequeue(&item) do
                 let callback, value = item
-                match assignment with
-                | Some current when Assignment.identity current = Assignment.identity value ->
+                let fenceId = Assignment.identity value
+                let isCurrent = assignment |> Option.exists (fun current -> Assignment.identity current = fenceId)
+                let isOnDeck = onDeck |> Option.exists (fun deck -> Assignment.identity deck = fenceId)
+                if isCurrent then
                     match callback with
                     | CallbackName.Started -> callbackStarted <- true
-                    | CallbackName.Ended -> do! this.BeginCompletionAsync(value, PlaybackCompletion.Played)
+                    | CallbackName.Ended ->
+                        this.PromoteOnDeck() |> ignore
+                        do! this.BeginCompletionAsync(value, PlaybackCompletion.Played)
                     | CallbackName.OutputFailed ->
                         do! this.BeginCompletionAsync(value, PlaybackCompletion.Failed "RTMP output failed")
                         this.SetTerminal("RTMP output failed")
                     | CallbackName.StartTimeout
                     | CallbackName.ProtocolError -> do! this.BeginCompletionAsync(value, PlaybackCompletion.Failed "Playback callback protocol error")
-                | _ -> ()
+                elif isOnDeck then
+                    match callback with
+                    | CallbackName.Started -> onDeckStarted <- true
+                    | CallbackName.Ended ->
+                        do! this.BeginCompletionAsync(value, PlaybackCompletion.Played)
+                        this.ClearOnDeck()
+                    | _ -> ()
         }
 
     member private this.CheckStartDeadlineAsync() =
@@ -462,8 +533,9 @@ type RuntimeSupervisor(
                     do! this.ObserveChildrenAsync()
                     if now >= nextAssignmentAt then
                         nextAssignmentAt <- now + int64 (float Runtime.pollCadence.TotalSeconds * float timeProvider.TimestampFrequency)
-                        do! this.PollAssignmentAsync()
+                        do! this.PollUpcomingAsync()
                     do! this.PushAssignmentAsync()
+                    do! this.PushOnDeckAsync()
                 do! this.DrainCallbacksAsync()
                 do! this.ServiceCompletionAsync()
                 do! this.RenewLeaseAsync()
@@ -475,24 +547,38 @@ type RuntimeSupervisor(
 
     member private this.AcceptCallback(payload: CallbackPayload) =
         lock syncRoot (fun () ->
-            let current = assignment
             match payload with
             | CallbackPayload.OutputFailed ->
-                match current, callbackIdentity with
+                match assignment, callbackIdentity with
                 | Some value, Some identity when Assignment.identity value = identity && not outputFailed -> outputFailed <- true; callbackEvents.Enqueue(CallbackName.OutputFailed, value); true
                 | _ -> false
             | CallbackPayload.Started fence
             | CallbackPayload.Ended fence ->
-                match current, callbackIdentity with
-                | Some value, Some identity when Assignment.identity value = identity && identity = (fence.QueueItemId, fence.ClaimOwner, fence.ClaimAttempt) ->
-                    let callback = match payload with | CallbackPayload.Started _ -> CallbackName.Started | _ -> CallbackName.Ended
-                    if callback = CallbackName.Started && callbackStarted then false
-                    elif callback = CallbackName.Ended && callbackEnded then false
-                    else
-                        callbackEvents.Enqueue(callback, value)
-                        if callback = CallbackName.Started then callbackStarted <- true else callbackEnded <- true
-                        true
-                | _ -> false)
+                let fenceId = (fence.QueueItemId, fence.ClaimOwner, fence.ClaimAttempt)
+                let callback = match payload with | CallbackPayload.Started _ -> CallbackName.Started | _ -> CallbackName.Ended
+                let matchesCurrent =
+                    match callbackIdentity, assignment with
+                    | Some identity, Some value -> identity = fenceId && Assignment.identity value = fenceId
+                    | _ -> false
+                if matchesCurrent then
+                    match assignment with
+                    | Some value ->
+                        if callback = CallbackName.Started && callbackStarted then false
+                        elif callback = CallbackName.Ended && callbackEnded then false
+                        else
+                            callbackEvents.Enqueue(callback, value)
+                            (if callback = CallbackName.Started then callbackStarted <- true else callbackEnded <- true)
+                            true
+                    | None -> false
+                else
+                    match onDeck with
+                    | Some value when Assignment.identity value = fenceId ->
+                        if callback = CallbackName.Started && onDeckStarted then false
+                        else
+                            callbackEvents.Enqueue(callback, value)
+                            (if callback = CallbackName.Started then onDeckStarted <- true)
+                            true
+                    | _ -> false)
 
     member this.Snapshot() =
         let status, reason =

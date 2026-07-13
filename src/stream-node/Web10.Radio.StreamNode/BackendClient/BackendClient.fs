@@ -84,6 +84,7 @@ type IBackendClient =
     abstract GetControlPageAsync: afterGeneration: int64 * limit: int * cancellationToken: CancellationToken -> Task<Result<ControlPage, BackendError>>
     abstract PollControlAsync: afterGeneration: int64 * cancellationToken: CancellationToken -> Task<Result<ControlState * PlaybackCommand list * int64, BackendError>>
     abstract GetAssignmentAsync: cancellationToken: CancellationToken -> Task<Result<Assignment option, BackendError>>
+    abstract GetUpcomingAsync: cancellationToken: CancellationToken -> Task<Result<Assignment option * Assignment option, BackendError>>
     abstract PostHeartbeatAsync: Heartbeat * cancellationToken: CancellationToken -> Task<Result<unit, BackendError>>
     abstract RenewLeaseAsync: Assignment * cancellationToken: CancellationToken -> Task<CallbackResult>
     abstract CompleteAsync: Assignment * PlaybackCompletion * cancellationToken: CancellationToken -> Task<CallbackResult>
@@ -161,10 +162,8 @@ type BackendClient(config: RuntimeConfig, ?httpClient: HttpClient) =
             return { DesiredState = desired; RestartGeneration = restartGeneration; PlaybackCommands = commands |> List.toArray; NextPlaybackGeneration = next }
         }
 
-    member private this.ParseAssignment(bytes: byte array) =
-        let operation = "stream-node.playback.current"
+    member private _.ParseAssignmentElement(operation: string, root: JsonElement) =
         result {
-            let! root = Json.objectRoot bytes operation
             let! queueItemId = Json.guid "queueItemId" operation root
             let! claimOwner = Json.guid "claimOwner" operation root
             let! claimAttempt = Json.int32Positive "claimAttempt" operation root
@@ -185,6 +184,26 @@ type BackendClient(config: RuntimeConfig, ?httpClient: HttpClient) =
                     if value.TryGetInt32(&parsed) && parsed >= 0 then Ok parsed else Error(BackendError.InvalidResponse operation)
                 | _ -> Ok 0
             return { QueueItemId = queueItemId; ClaimOwner = claimOwner; ClaimAttempt = claimAttempt; TrackId = trackId; ContentType = contentType; Title = title; Artist = artist; DurationMs = duration }
+        }
+
+    member private this.ParseAssignment(bytes: byte array) =
+        let operation = "stream-node.playback.current"
+        result {
+            let! root = Json.objectRoot bytes operation
+            return! this.ParseAssignmentElement(operation, root)
+        }
+
+    member private this.ParseUpcoming(bytes: byte array) =
+        let operation = "stream-node.playback.upcoming"
+        result {
+            let! root = Json.objectRoot bytes operation
+            let parseSlot name =
+                match Json.tryProperty name root with
+                | Some value when value.ValueKind = JsonValueKind.Object -> this.ParseAssignmentElement(operation, value) |> Result.map Some
+                | _ -> Ok None
+            let! current = parseSlot "current"
+            let! next = parseSlot "next"
+            return (current, next)
         }
 
     member private this.MapResponse operation status =
@@ -233,6 +252,15 @@ type BackendClient(config: RuntimeConfig, ?httpClient: HttpClient) =
                 | Ok(status, _) when status = HttpStatusCode.NoContent -> return Ok None
                 | Ok(status, bytes) when status = HttpStatusCode.OK -> return this.ParseAssignment bytes |> Result.map Some
                 | Ok(status, _) -> return this.MapResponse "stream-node.playback.current" status
+            }
+
+        member this.GetUpcomingAsync token =
+            task {
+                let! response = this.GetAsync "/api/v0/stream-node/playback/upcoming" token
+                match response with
+                | Error error -> return Error error
+                | Ok(status, bytes) when status = HttpStatusCode.OK -> return this.ParseUpcoming bytes
+                | Ok(status, _) -> return this.MapResponse "stream-node.playback.upcoming" status
             }
 
         member this.PostHeartbeatAsync(heartbeat, token) =
@@ -296,6 +324,9 @@ type BackendClient(config: RuntimeConfig, ?httpClient: HttpClient) =
 
     member this.GetAssignmentAsync(token: CancellationToken) =
         (this :> IBackendClient).GetAssignmentAsync(token)
+
+    member this.GetUpcomingAsync(token: CancellationToken) =
+        (this :> IBackendClient).GetUpcomingAsync(token)
 
     member this.PostHeartbeatAsync(heartbeat: Heartbeat, token: CancellationToken) =
         (this :> IBackendClient).PostHeartbeatAsync(heartbeat, token)

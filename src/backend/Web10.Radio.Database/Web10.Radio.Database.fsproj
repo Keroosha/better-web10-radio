@@ -18,6 +18,7 @@
     <Compile Include="Migrations\PlaylistPolicies.fs" />
     <Compile Include="Migrations\TelegramServiceOutboxPartition.fs" />
     <Compile Include="Migrations\AdminBannersAndPlaybackPause.fs" />
+    <Compile Include="Migrations\StorageCacheSettings.fs" />
     <Compile Include="Repositories\RepositoryError.fs" />
     <Compile Include="Repositories\AdminIdentityRepository.fs" />
     <Compile Include="Repositories\OutboxEventRepository.fs" />
@@ -32,6 +33,7 @@
     <Compile Include="Repositories\StreamNodeHeartbeatRepository.fs" />
     <Compile Include="Repositories\PlaybackQueueRepository.fs" />
     <Compile Include="Repositories\StorageContentRepository.fs" />
+    <Compile Include="Repositories\StorageSettingsRepository.fs" />
     <Compile Include="Composition.fs" />
   </ItemGroup>
 

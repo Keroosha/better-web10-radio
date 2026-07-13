@@ -23,6 +23,6 @@ module MigrationMetadataTests =
 
         Assert.That(
             versions,
-            Is.EqualTo(([| 202607080001L; 202607100001L; 202607100002L; 202607100003L; 202607100004L; 202607110001L; 202607110002L; 202607110003L; 202607110004L; 202607120001L; 202607120002L; 202607120003L |] : int64 array) :> obj),
-            "The ordered schema sequence must include all 20260711 and 20260712 migrations after the existing schema migrations."
+            Is.EqualTo(([| 202607080001L; 202607100001L; 202607100002L; 202607100003L; 202607100004L; 202607110001L; 202607110002L; 202607110003L; 202607110004L; 202607120001L; 202607120002L; 202607120003L; 202607130001L |] : int64 array) :> obj),
+            "The ordered schema sequence must include all 20260711 and 20260712 migrations after the existing schema migrations, plus the 20260713 storage cache settings migration."
         )

@@ -813,6 +813,18 @@ type LibraryScanHostedService
                 | None -> S3ClientScope.ConfiguredDefault
                 | Some _ -> S3ClientScope.AwsDefaultChain
 
+            let budgetAware = backend.Id.IsNone
+            let mutable available = Int64.MaxValue
+            if budgetAware then
+                let candidateId = Uuid.CreateVersion7().ToGuidBigEndian()
+                let! settings =
+                    StorageSettingsRepository.getOrCreate dataSource candidateId StorageCachePolicy.defaultCacheMaxBytes StorageCachePolicy.presignTtlSeconds (timeProvider.GetUtcNow()) cancellationToken
+                    |> TaskResult.mapError RepositoryError
+                let! currentBytes =
+                    StorageSettingsRepository.totalS3CacheBytes dataSource cancellationToken
+                    |> TaskResult.mapError RepositoryError
+                available <- max 0L (settings.S3CacheMaxBytes - currentBytes)
+
             let visitPage (items: System.Collections.Generic.IReadOnlyList<S3ObjectDescriptor>) (pageCancellationToken: CancellationToken) =
                 task {
                     let! pageResult =
@@ -829,21 +841,40 @@ type LibraryScanHostedService
 
                                     try
                                         do! s3ObjectStorage.DownloadToFileAsync(scope, bucketName, item.Key, temporary, pageCancellationToken)
-                                        File.Move(temporary, audioPath, true)
                                         let! existing = tryGetExistingTrackFile backend item.Key pageCancellationToken
-                                        let emitMaterialized = existing |> Option.exists (fun value -> not value.IsCached)
-                                        do!
-                                            insertDiscoveredFile
-                                                job
-                                                backend
-                                                item.Key
-                                                audioPath
-                                                (Some audioPath)
-                                                true
-                                                (Some item.SizeBytes)
-                                                emitMaterialized
-                                                existing
-                                                pageCancellationToken
+                                        let keepCached = (not budgetAware) || available >= item.SizeBytes
+                                        if keepCached then
+                                            File.Move(temporary, audioPath, true)
+                                            let emitMaterialized = existing |> Option.exists (fun value -> not value.IsCached)
+                                            do!
+                                                insertDiscoveredFile
+                                                    job
+                                                    backend
+                                                    item.Key
+                                                    audioPath
+                                                    (Some audioPath)
+                                                    true
+                                                    (Some item.SizeBytes)
+                                                    emitMaterialized
+                                                    existing
+                                                    pageCancellationToken
+                                            if budgetAware then available <- available - item.SizeBytes
+                                        else
+                                            do!
+                                                insertDiscoveredFile
+                                                    job
+                                                    backend
+                                                    item.Key
+                                                    temporary
+                                                    None
+                                                    false
+                                                    (Some item.SizeBytes)
+                                                    false
+                                                    existing
+                                                    pageCancellationToken
+                                            try
+                                                if File.Exists temporary then File.Delete temporary
+                                            with _ -> ()
                                     with ex ->
                                         logger.LogWarning(ex, "S3 object {ObjectKey} could not be materialized; retrying on next scan", item.Key)
 
@@ -1187,12 +1218,14 @@ type PlaybackProgramHostedService
     (
         dataSource: NpgsqlDataSource,
         timeProvider: TimeProvider,
+        storageOptions: StorageOptions,
         logger: ILogger<PlaybackProgramHostedService>
     ) as this =
     inherit BackgroundService()
 
     let claimOwner = Uuid.CreateVersion7().ToGuidBigEndian()
     let claimLease = TimeSpan.FromSeconds(30.0)
+    let defaultStorageIsS3 = storageOptions.Type = StorageType.S3
 
     let createPlaybackEnvelope eventType payloadJson =
         DomainEventEnvelope.create timeProvider eventType "Web10.Radio.API.PlaybackProgram" None None payloadJson
@@ -1344,76 +1377,88 @@ type PlaybackProgramHostedService
                 do! appendFailureEvents connection transaction queueItemId owner attempt failureReason cancellationToken
         }
 
-    let handleClaimedEvent queueItemId owner attempt cancellationToken =
-        DatabaseSession.withTransactionResult
-            dataSource
-            (fun connection transaction cancellationToken ->
-                taskResult {
-                    let nowUtc = timeProvider.GetUtcNow()
-                    let! claimed =
-                        PlaybackQueueRepository.getOwnedClaimInTransaction
+    let promoteOwnedClaim connection transaction queueItemId owner attempt (trackId: Guid option) cancellationToken =
+        taskResult {
+            let nowUtc = timeProvider.GetUtcNow()
+            match trackId with
+            | None ->
+                do!
+                    failOwnedClaim
+                        connection
+                        transaction
+                        queueItemId
+                        owner
+                        attempt
+                        "playback queue item has no track"
+                        cancellationToken
+            | Some trackId ->
+                let! cachePath =
+                    PlaybackQueueRepository.findCachedTrackFileInTransaction
+                        connection
+                        transaction
+                        trackId
+                        defaultStorageIsS3
+                        cancellationToken
+                    |> TaskResult.mapError RepositoryError
+
+                match cachePath with
+                | None ->
+                    do!
+                        failOwnedClaim
+                            connection
+                            transaction
+                            queueItemId
+                            owner
+                            attempt
+                            "cache path unavailable"
+                            cancellationToken
+                | Some cachePath ->
+                    let! playing =
+                        PlaybackQueueRepository.markPlayingInTransaction
                             connection
                             transaction
                             queueItemId
                             owner
                             attempt
                             nowUtc
+                            (nowUtc + claimLease)
                             cancellationToken
                         |> TaskResult.mapError RepositoryError
 
-                    match claimed with
-                    | None -> return ()
-                    | Some claimed ->
-                        match claimed.TrackId with
-                        | None ->
-                            do!
-                                failOwnedClaim
-                                    connection
-                                    transaction
-                                    queueItemId
-                                    owner
-                                    attempt
-                                    "playback queue item has no track"
-                                    cancellationToken
-                        | Some trackId ->
-                            let! cachePath =
-                                PlaybackQueueRepository.findCachedTrackFileInTransaction
-                                    connection
-                                    transaction
-                                    trackId
-                                    cancellationToken
-                                |> TaskResult.mapError RepositoryError
+                    if playing then
+                        let! envelope =
+                            playbackStartedPayload queueItemId owner attempt trackId cachePath
+                            |> createPlaybackEnvelope PlaybackStarted
 
-                            match cachePath with
-                            | None ->
-                                do!
-                                    failOwnedClaim
-                                        connection
-                                        transaction
-                                        queueItemId
-                                        owner
-                                        attempt
-                                        "cache path unavailable"
-                                        cancellationToken
-                            | Some cachePath ->
-                                let! playing =
-                                    PlaybackQueueRepository.markPlayingInTransaction
-                                        connection
-                                        transaction
-                                        queueItemId
-                                        owner
-                                        attempt
-                                        nowUtc
-                                        (nowUtc + claimLease)
-                                        cancellationToken
-                                    |> TaskResult.mapError RepositoryError
+                        do! appendEnvelope connection transaction envelope cancellationToken
+        }
 
-                                if playing then
-                                    let! envelope =
-                                        playbackStartedPayload queueItemId owner attempt trackId cachePath
-                                        |> createPlaybackEnvelope PlaybackStarted
+    let promoteOnDeck cancellationToken =
+        DatabaseSession.withTransactionResult
+            dataSource
+            (fun connection transaction cancellationToken ->
+                taskResult {
+                    let! onDeck =
+                        PlaybackQueueRepository.tryGetPromotableOnDeckInTransaction
+                            connection
+                            transaction
+                            cancellationToken
+                        |> TaskResult.mapError RepositoryError
 
-                                    do! appendEnvelope connection transaction envelope cancellationToken
+                    match onDeck with
+                    | None -> return false
+                    | Some claim ->
+                        do!
+                            promoteOwnedClaim
+                                connection
+                                transaction
+                                claim.QueueItemId
+                                claim.ClaimOwner
+                                claim.ClaimAttempt
+                                claim.TrackId
+                                cancellationToken
+
+                        return true
                 })
             cancellationToken
 
@@ -1475,6 +1520,12 @@ type PlaybackProgramHostedService
             | StreamNodeDesiredState.Paused
             | StreamNodeDesiredState.Stopped -> return false
             | StreamNodeDesiredState.Running ->
+                let! promoted = promoteOnDeck cancellationToken
+
+                if promoted then
+                    return true
+                else
+
                 let! initiallyClaimed = claimNextQueueItem cancellationToken
 
                 if initiallyClaimed then
@@ -1485,6 +1536,7 @@ type PlaybackProgramHostedService
                             dataSource
                             (Uuid.CreateVersion7().ToGuidBigEndian())
                             (timeProvider.GetUtcNow())
+                            defaultStorageIsS3
                             cancellationToken
                         |> TaskResult.mapError RepositoryError
 
@@ -1503,7 +1555,7 @@ type PlaybackProgramHostedService
 
             match envelope.EventType with
             | PlaybackQueueItemClaimed ->
-                do! handleClaimedEvent queueItemId owner attempt cancellationToken
+                return ()
             | PlaybackStarted ->
                 let! _ = PayloadValidation.requireUuid eventType "trackId" root
                 let! _ = PayloadValidation.requireString eventType "cachePath" root
@@ -1553,6 +1605,72 @@ type PlaybackProgramHostedService
     interface IPlaybackQueueWorkflow with
         member _.HandleAsync envelope cancellationToken = this.HandleEventAsync(envelope, cancellationToken)
 
+type CacheEvictionHostedService
+    (
+        dataSource: NpgsqlDataSource,
+        timeProvider: TimeProvider,
+        options: Web10Options,
+        logger: ILogger<CacheEvictionHostedService>
+    ) as this =
+    inherit BackgroundService()
+
+    let evictionInterval = TimeSpan.FromSeconds 60.0
+
+    member private _.RunPassAsync(cancellationToken: CancellationToken) =
+        task {
+            let candidateId = Uuid.CreateVersion7().ToGuidBigEndian()
+            let! settingsResult =
+                StorageSettingsRepository.getOrCreate
+                    dataSource
+                    candidateId
+                    StorageCachePolicy.defaultCacheMaxBytes
+                    StorageCachePolicy.presignTtlSeconds
+                    (timeProvider.GetUtcNow())
+                    cancellationToken
+
+            match settingsResult with
+            | Error error -> BackgroundWorkerLog.operationFailed logger "Cache eviction settings" (RepositoryError error)
+            | Ok settings ->
+                let budget = settings.S3CacheMaxBytes
+                let! totalResult = StorageSettingsRepository.totalS3CacheBytes dataSource cancellationToken
+                match totalResult with
+                | Error error -> BackgroundWorkerLog.operationFailed logger "Cache size" (RepositoryError error)
+                | Ok total when total <= budget -> ()
+                | Ok total ->
+                    let! candidatesResult = StorageSettingsRepository.listEvictionCandidates dataSource cancellationToken
+                    match candidatesResult with
+                    | Error error -> BackgroundWorkerLog.operationFailed logger "Cache eviction candidates" (RepositoryError error)
+                    | Ok candidates ->
+                        let mutable remaining = total
+                        let mutable pending = candidates
+                        let mutable evicted = 0
+                        while remaining > budget && not (List.isEmpty pending) do
+                            let candidate = List.head pending
+                            pending <- List.tail pending
+                            let _ = (try File.Delete(candidate.CachePath) with _ -> ())
+                            let! markResult = StorageSettingsRepository.markCacheEvicted dataSource candidate.TrackFileId (timeProvider.GetUtcNow()) cancellationToken
+                            match markResult with
+                            | Error error -> BackgroundWorkerLog.operationFailed logger "Cache eviction mark" (RepositoryError error)
+                            | Ok _ -> evicted <- evicted + 1
+                            remaining <- remaining - candidate.SizeBytes
+                        if evicted > 0 then
+                            logger.LogInformation("Cache eviction removed {Evicted} S3 cache copies to enforce the {Budget}-byte budget.", evicted, budget)
+        }
+
+    override _.ExecuteAsync(stoppingToken: CancellationToken) =
+        task {
+            try
+                while not stoppingToken.IsCancellationRequested do
+                    try
+                        if options.Storage.Type = StorageType.S3 then do! this.RunPassAsync(stoppingToken)
+                    with
+                    | :? OperationCanceledException when stoppingToken.IsCancellationRequested -> ()
+                    | ex -> logger.LogError(ex, "Cache eviction pass failed.")
+                    do! Task.Delay(evictionInterval, stoppingToken)
+            with :? OperationCanceledException when stoppingToken.IsCancellationRequested -> ()
+        }
+        :> Task
+
 module BackgroundWorkerComposition =
     let addBackgroundWorkers (options: Web10Options) (services: IServiceCollection) : IServiceCollection =
         services.AddSingleton<Web10Options>(options) |> ignore
@@ -1578,4 +1696,12 @@ module BackgroundWorkerComposition =
         |> ignore
         services.AddHostedService(fun provider -> provider.GetRequiredService<LibraryScanHostedService>()) |> ignore
         services.AddHostedService(fun provider -> provider.GetRequiredService<PlaybackProgramHostedService>()) |> ignore
+        services.AddHostedService(fun provider ->
+            CacheEvictionHostedService(
+                provider.GetRequiredService<NpgsqlDataSource>(),
+                provider.GetRequiredService<TimeProvider>(),
+                provider.GetRequiredService<Web10Options>(),
+                provider.GetRequiredService<ILogger<CacheEvictionHostedService>>()
+            ))
+        |> ignore
         services

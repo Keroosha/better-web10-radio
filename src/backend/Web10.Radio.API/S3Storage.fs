@@ -67,6 +67,8 @@ type IS3ObjectStorage =
     abstract member ProbeBucketAsync: scope: S3ClientScope * bucketName: string * cancellationToken: CancellationToken -> Task
     abstract member DownloadToFileAsync:
         scope: S3ClientScope * bucketName: string * key: string * destination: string * cancellationToken: CancellationToken -> Task
+    abstract member GeneratePresignedGetUrlAsync:
+        scope: S3ClientScope * bucketName: string * key: string * expiresAtUtc: DateTimeOffset * cancellationToken: CancellationToken -> Task<string>
 
 module S3KeyValidation =
     let isCanonical (key: string) =
@@ -222,6 +224,16 @@ type S3ObjectEnumerator(client: IAmazonS3) as this =
             }
             :> Task
 
+        member _.GeneratePresignedGetUrlAsync(_, bucketName, key, expiresAtUtc, cancellationToken) =
+            task {
+                ArgumentException.ThrowIfNullOrWhiteSpace bucketName
+                S3KeyValidation.requireCanonical key
+                cancellationToken.ThrowIfCancellationRequested()
+                let request = GetPreSignedUrlRequest(BucketName = bucketName, Key = key, Verb = HttpVerb.GET, Expires = expiresAtUtc.UtcDateTime)
+                return! client.GetPreSignedURLAsync(request)
+            }
+            :> Task<string>
+
 
 type private DeferredS3ObjectStorage(options: StorageOptions) =
     let configuredClient =
@@ -256,6 +268,7 @@ type private DeferredS3ObjectStorage(options: StorageOptions) =
         member _.DeleteManyAsync(scope, bucket, descriptors, ct) = (implementation scope).DeleteManyAsync(scope, bucket, descriptors, ct)
         member _.ProbeBucketAsync(scope, bucket, ct) = (implementation scope).ProbeBucketAsync(scope, bucket, ct)
         member _.DownloadToFileAsync(scope, bucket, key, destination, ct) = (implementation scope).DownloadToFileAsync(scope, bucket, key, destination, ct)
+        member _.GeneratePresignedGetUrlAsync(scope, bucket, key, expiresAtUtc, ct) = (implementation scope).GeneratePresignedGetUrlAsync(scope, bucket, key, expiresAtUtc, ct)
 
     interface IDisposable with
         member _.Dispose() =

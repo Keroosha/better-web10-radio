@@ -318,6 +318,10 @@ type AdminStorageDto =
     { DefaultBackend: DefaultStorageBackendDto
       AdditionalBackends: AdditionalStorageBackendDto list }
 
+type StorageCacheSettingsDto =
+    { S3CacheMaxBytes: int64
+      PresignTtlSeconds: int }
+
 type StorageEntryDto =
     { Path: string
       Name: string

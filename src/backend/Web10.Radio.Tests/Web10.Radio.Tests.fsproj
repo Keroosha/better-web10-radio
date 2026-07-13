@@ -14,6 +14,7 @@
     <Compile Include="MigrationMetadataTests.fs" />
     <Compile Include="DatabaseMigrationTests.fs" />
     <Compile Include="PlaybackQueueRepositoryTests.fs" />
+    <Compile Include="StorageCacheSettingsTests.fs" />
     <Compile Include="DatabaseSessionResultTests.fs" />
     <Compile Include="RepositoryErrorTests.fs" />
     <Compile Include="AuditRegressionTests.fs" />

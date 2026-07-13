@@ -7,6 +7,7 @@ TestResults/
 .env
 .env.*
 !.defaults.env
+!.env.prod.example
 # Created by https://www.toptal.com/developers/gitignore/api/node,aspnetcore,rider
 # Edit at https://www.toptal.com/developers/gitignore?templates=node,aspnetcore,rider
 
@@ -498,4 +499,7 @@ fabric.properties
 .idea/caches/build_file_checksums.ser
 
 # End of https://www.toptal.com/developers/gitignore/api/node,aspnetcore,rider
-.storage/
+# Keep the dev bind-mount dir tracked (checkout-user-owned) so the non-root API can
+# write it without a storage-init one-shot; ignore any media dropped inside.
+.storage/*
+!.storage/.gitkeep

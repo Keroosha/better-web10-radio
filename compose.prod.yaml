@@ -1,0 +1,106 @@
+# Web10.Radio — production topology (pulls published GHCR images; does NOT build).
+#
+# This file defines the prod service graph. Actual server provisioning (TLS ingress,
+# secrets store, managed Postgres, backups) is a separate, deferred step. To use:
+#
+#   cp .env.prod.example .env.prod   # fill in real secrets (gitignored)
+#   WEB10_IMAGE_TAG=<sha-or-version> docker compose -f compose.prod.yaml --env-file .env.prod up -d --wait
+#
+# Differences from the dev compose.yaml:
+#   • no nginx `frontend` — the all-in-one `api` image serves both SPAs + /api/v0/*
+#   • no `rtmp-sink` / `storage-init` / seaweedfs (dev/smoke only)
+#   • `telegram` runs LongPolling (no inbound route)
+#   • `stream-node` loads the stage from the API and streams to the real RTMP target
+#   • images come from ghcr.io/keroosha/better-web10-radio/* at ${WEB10_IMAGE_TAG}
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-web10}"
+      POSTGRES_USER: "${POSTGRES_USER:-web10}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required in prod}"
+    volumes:
+      - web10-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-web10} -d $${POSTGRES_DB:-web10}"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+    restart: unless-stopped
+
+  migrator:
+    image: "ghcr.io/keroosha/better-web10-radio/migrator:${WEB10_IMAGE_TAG:-latest}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - path: .env.prod
+        required: true
+    restart: "no"
+
+  api:
+    image: "ghcr.io/keroosha/better-web10-radio/api:${WEB10_IMAGE_TAG:-latest}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+    ports:
+      # The single public origin: public stage at '/', admin at '/admin/', API at '/api/v0/'.
+      - "8080:8080"
+    env_file:
+      - path: .env.prod
+        required: true
+    volumes:
+      - web10-storage:/var/lib/web10/storage
+      - web10-storage-cache:/var/lib/web10/cache
+      - web10-data-protection:/var/lib/web10/data-protection
+    healthcheck:
+      test: ["CMD", "dotnet", "Web10.Radio.API.dll", "--health-check", "http://127.0.0.1:8080/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+
+  telegram:
+    image: "ghcr.io/keroosha/better-web10-radio/telegram:${WEB10_IMAGE_TAG:-latest}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+    env_file:
+      - path: .env.prod
+        required: true
+    healthcheck:
+      test: ["CMD", "dotnet", "Web10.Radio.Telegram.dll", "--health-check", "http://127.0.0.1:8080/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  stream-node:
+    image: "ghcr.io/keroosha/better-web10-radio/stream-node:${WEB10_IMAGE_TAG:-latest}"
+    depends_on:
+      api:
+        condition: service_healthy
+    env_file:
+      - path: .env.prod
+        required: true
+    healthcheck:
+      test: ["CMD", "./Web10.Radio.StreamNode", "--health-check", "http://127.0.0.1:18080/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  web10-postgres-data:
+  web10-storage:
+  web10-storage-cache:
+  web10-data-protection:

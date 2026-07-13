@@ -32,77 +32,6 @@ services:
         required: false
     restart: "no"
 
-  # The API and stream node run as non-root UID 1654. Keep source media in the
-  # host-backed storage mount, while materialized audio/artwork uses this named
-  # volume so the chiseled API can write without changing host file ownership.
-  storage-init:
-    image: web10-radio-stream-node:local
-    user: "0:0"
-    build:
-      context: ./src/stream-node
-      dockerfile: Dockerfile
-    depends_on:
-      migrator:
-        condition: service_completed_successfully
-    volumes:
-      - ./.storage:/var/lib/web10/storage
-      - web10-storage-cache:/var/lib/web10/cache
-    command:
-      - sh
-      - -ec
-      - |
-        install -d -o 1654 -g 1654 -m 0775 /var/lib/web10/cache /var/lib/web10/cache/audio /var/lib/web10/cache/covers /var/lib/web10/cache/tmp
-        track=/var/lib/web10/storage/web10-compose-tagged.mp3
-        if [ ! -e "$$track" ] && [ ! -L "$$track" ]; then
-          tmp="$${track}.tmp.mp3"
-          ffmpeg -hide_banner -loglevel error \
-            -f lavfi -i "anullsrc=r=48000:cl=stereo" \
-            -f lavfi -i "color=c=black:s=16x16:r=1:d=1" \
-            -map 0:a:0 -map 1:v:0 -t 120 \
-            -c:a libmp3lame -ar 48000 -ac 2 -b:a 128k \
-            -c:v mjpeg -disposition:v attached_pic \
-            -metadata title="Web10 Compose Smoke" \
-            -metadata artist="Web10.Radio" \
-            -metadata album="Compose" \
-            -y "$$tmp"
-          mv -f "$$tmp" "$$track"
-        fi
-        cue_source=/var/lib/web10/storage/web10-compose-cue-source.flac
-        cue_sheet=/var/lib/web10/storage/web10-compose-cue.cue
-        if [ ! -e "$$cue_source" ] && [ ! -L "$$cue_source" ]; then
-          tmp="$${cue_source}.tmp.flac"
-          ffmpeg -hide_banner -loglevel error \
-            -f lavfi -i "sine=frequency=1000:sample_rate=48000" \
-            -t 6 -map 0:a:0 -vn -sn -dn -c:a flac -y "$$tmp"
-          mv -f "$$tmp" "$$cue_source"
-        fi
-        if [ ! -e "$$cue_sheet" ] && [ ! -L "$$cue_sheet" ]; then
-        cat > "$$cue_sheet" <<'EOF'
-        PERFORMER "Web10.Radio"
-        TITLE "web10-compose-cue-album"
-        FILE "web10-compose-cue-source.wav" WAVE
-          TRACK 01 AUDIO
-            TITLE "web10-compose-cue-track-01"
-            INDEX 01 00:00:00
-          TRACK 02 AUDIO
-            TITLE "web10-compose-cue-track-02"
-            INDEX 01 00:03:00
-        EOF
-        fi
-        chmod -R a+rX /var/lib/web10/storage
-        chmod a+rwx /var/lib/web10/storage
-        if command -v setpriv >/dev/null 2>&1; then
-          setpriv --reuid=1654 --regid=1654 --clear-groups sh -c 'touch /var/lib/web10/cache/tmp/.storage-init-write-probe && rm -f /var/lib/web10/cache/tmp/.storage-init-write-probe'
-        else
-          if ! grep -q ':1654:' /etc/group; then
-            printf '%s\n' 'web10uid1654:x:1654:' >> /etc/group
-          fi
-          if ! grep -q ':1654:' /etc/passwd; then
-            printf '%s\n' 'web10uid1654:x:1654:1654::/nonexistent:/bin/sh' >> /etc/passwd
-          fi
-          su -s /bin/sh -c 'touch /var/lib/web10/cache/tmp/.storage-init-write-probe && rm -f /var/lib/web10/cache/tmp/.storage-init-write-probe' web10uid1654
-        fi
-    restart: "no"
 
   api:
     image: web10-radio-api:local
@@ -113,8 +42,6 @@ services:
       postgres:
         condition: service_healthy
       migrator:
-        condition: service_completed_successfully
-      storage-init:
         condition: service_completed_successfully
     ports:
       - "8080:8080"

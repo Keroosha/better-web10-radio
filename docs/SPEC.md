@@ -472,7 +472,7 @@ Startup validation rules:
 - .NET final/runtime images используют Microsoft .NET chiseled variants. Текущие backend runtime tags используют `10.0-noble-chiseled`; SDK build stages остаются на официальных non-Alpine SDK images, потому что Microsoft не публикует chiseled SDK images.
 - Compose vertical-slice environment supplies Development mode, `WEB10_DEV__FIXTURES_ENABLED=true`, username/password bootstrap credentials, callback token, shared storage, frontend, stream-node, and RTMP sink. Production overrides these local values and never gains fixture access merely from the flag.
 - Compose smoke explicitly supplies request/say prices `100`/`50`; production также обязана задать оба keys и не получает runtime default.
-- Compose startup order: PostgreSQL healthcheck → migrator successful completion → storage-init successful completion → API/frontend/stream-node/RTMP sink health. Bounded `docker compose up --wait --wait-timeout` возвращает success только после healthy declared services; ad hoc `sleep` не входит в smoke contract.
+- Compose startup order: PostgreSQL healthcheck → migrator successful completion → API/frontend/stream-node/RTMP sink health. Bounded `docker compose up --wait --wait-timeout` возвращает success только после healthy declared services; ad hoc `sleep` не входит в smoke contract.
 - В chiseled API container healthcheck выполняет exact managed command `dotnet Web10.Radio.API.dll --health-check http://127.0.0.1:8080/health/live`; image не предполагает наличие shell, `curl` или `wget`, а probe exit code отражает HTTP success.
 
 DI rules aligned with ASP.NET lifecycle:

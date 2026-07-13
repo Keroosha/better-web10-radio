@@ -3,6 +3,7 @@ namespace Web10.Radio.API
 open System
 open System.Net.Http
 open Microsoft.AspNetCore.Builder
+open Microsoft.AspNetCore.Http
 open Microsoft.AspNetCore.Hosting
 open Microsoft.AspNetCore.Server.Kestrel.Core
 open Microsoft.Extensions.Configuration
@@ -71,9 +72,23 @@ module Program =
             |> ignore
 
             let app = builder.Build()
+
+            if options.ServeFrontend then
+                app.UseStaticFiles() |> ignore
+
             app.UseAuthentication() |> ignore
             app.UseAuthorization() |> ignore
             HealthEndpoints.mapHealthEndpoints app
             ApiEndpoints.mapApiV0Endpoints app
+
+            if options.ServeFrontend then
+                // Keep the SPA fallbacks from swallowing unmapped API/health paths: these
+                // literal-prefixed fallbacks outrank the catch-all and preserve real 404s.
+                let notFound = Func<IResult>(fun () -> Results.NotFound())
+                app.MapFallback("/api/{**rest}", notFound) |> ignore
+                app.MapFallback("/health/{**rest}", notFound) |> ignore
+                app.MapFallbackToFile("/admin/{*path:nonfile}", "admin/index.html") |> ignore
+                app.MapFallbackToFile("index.html") |> ignore
+
             app.Run()
             0

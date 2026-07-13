@@ -57,6 +57,7 @@ type Web10Options =
       Admin: AdminOptions
       Otel: OtelOptions
       DevelopmentFixturesEnabled: bool
+      ServeFrontend: bool
       DataProtection: DataProtectionOptions }
 
 [<RequireQualifiedAccess>]
@@ -317,6 +318,7 @@ module Configuration =
         let stageUrl = parseAbsoluteUri errors "WEB10_STREAM__STAGE_URL" (Set.ofList [ "http"; "https" ]) (requiredValue "STREAM:STAGE_URL")
         let otlpEndpoint = parseAbsoluteUri errors "WEB10_OTEL__EXPORTER_OTLP_ENDPOINT" (Set.ofList [ "http"; "https" ]) (requiredValue "OTEL:EXPORTER_OTLP_ENDPOINT")
         let developmentFixturesEnabled = parseBoolean errors "WEB10_DEV__FIXTURES_ENABLED" (readOptionalExact configuration "DEV:FIXTURES_ENABLED")
+        let serveFrontend = parseBoolean errors "WEB10_API__SERVE_FRONTEND" (readOptionalExact configuration "API:SERVE_FRONTEND")
         let s3ServiceUrl = parseAbsoluteUri errors "WEB10_STORAGE__S3_SERVICE_URL" (Set.ofList [ "http"; "https" ]) s3ServiceUrlRaw
         validateConnectionString errors connectionString
         validateSecret errors "WEB10_STREAM__RTMP_KEY" 16 rtmpKey
@@ -352,5 +354,6 @@ module Configuration =
                       Password = getRequired "ADMIN:PASSWORD" }
                   Otel = { ExporterOtlpEndpoint = Option.get otlpEndpoint }
                   DataProtection = { KeyRingPath = getRequired "DATA_PROTECTION:KEY_RING_PATH" }
-                  DevelopmentFixturesEnabled = developmentFixturesEnabled }
+                  DevelopmentFixturesEnabled = developmentFixturesEnabled
+                  ServeFrontend = serveFrontend }
 

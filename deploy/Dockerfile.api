@@ -1,0 +1,58 @@
+# syntax=docker/dockerfile:1
+# All-in-one production API image: the F# API also serves both frontend SPAs
+# (web-stage at '/', admin at '/admin/') from wwwroot, so no separate nginx origin
+# is needed in production. Telegram runs in LongPolling mode and needs no inbound
+# route. Build context is the repository root. Debian/chiseled images only
+# (SPEC §9 forbids Alpine/musl).
+
+# ---- Stage 1: build both frontend SPAs ----
+FROM oven/bun:1-debian AS frontend
+WORKDIR /app
+
+# Install with only manifests first for layer caching.
+COPY src/frontend/package.json src/frontend/bun.lock ./
+COPY src/frontend/shared/package.json ./shared/package.json
+COPY src/frontend/web-stage/package.json ./web-stage/package.json
+COPY src/frontend/admin/package.json ./admin/package.json
+RUN bun install --frozen-lockfile
+
+COPY src/frontend/ ./
+# web-stage is served from '/'; admin under '/admin/'. admin's tsc gate runs in CI;
+# here we only need its Vite bundle built with the right base path.
+RUN bun run --filter @web10/web-stage build \
+    && (cd admin && bunx vite build --base=/admin/)
+
+# ---- Stage 2: publish the F# API ----
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS backend
+WORKDIR /src
+
+# Restore only the API graph (API -> Application -> Database); avoids pulling the
+# test project's stream-node reference into the image build.
+COPY global.json ./
+COPY src/backend/Web10.Radio.API/Web10.Radio.API.fsproj Web10.Radio.API/
+COPY src/backend/Web10.Radio.Application/Web10.Radio.Application.fsproj Web10.Radio.Application/
+COPY src/backend/Web10.Radio.Database/Web10.Radio.Database.fsproj Web10.Radio.Database/
+RUN dotnet restore Web10.Radio.API/Web10.Radio.API.fsproj
+
+COPY src/backend/ ./
+RUN dotnet publish Web10.Radio.API/Web10.Radio.API.fsproj -c Release -o /app/publish --no-restore
+# Empty writable dirs owned by uid 1000 so fresh named volumes mounted over them
+# inherit that ownership (prod drops the dev storage-init that used to prepare cache).
+RUN mkdir -p /runtime-data/storage /runtime-data/data-protection \
+        /runtime-data/cache/audio /runtime-data/cache/covers /runtime-data/cache/tmp
+
+# ---- Stage 3: chiseled runtime serving API + both SPAs ----
+FROM mcr.microsoft.com/dotnet/aspnet:10.0-noble-chiseled AS runtime
+WORKDIR /app
+ENV ASPNETCORE_URLS=http://+:8080
+ENV WEB10_API__SERVE_FRONTEND=true
+EXPOSE 8080
+USER 1000:1000
+COPY --from=backend /app/publish .
+COPY --from=backend --chown=1000:1000 /runtime-data/storage /var/lib/web10/storage
+COPY --from=backend --chown=1000:1000 /runtime-data/cache /var/lib/web10/cache
+COPY --from=backend --chown=1000:1000 /runtime-data/data-protection /var/lib/web10/data-protection
+COPY --from=frontend /app/web-stage/dist ./wwwroot
+COPY --from=frontend /app/admin/dist ./wwwroot/admin
+HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=5 CMD ["dotnet", "Web10.Radio.API.dll", "--health-check", "http://127.0.0.1:8080/health/live"]
+ENTRYPOINT ["dotnet", "Web10.Radio.API.dll"]

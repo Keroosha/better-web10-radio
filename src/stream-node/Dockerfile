@@ -48,8 +48,8 @@ RUN set -eu; \
     printf '%s  %s\n' "${LIQUIDSOAP_DEB_SHA256}" "${liquidsoap_deb}" | sha256sum --check --status -; \
     apt-get install -y --no-install-recommends "${liquidsoap_deb}"; \
     rm -f "${liquidsoap_deb}"; \
-    groupadd --gid 1654 web10; \
-    useradd --uid 1654 --gid 1654 --create-home --home-dir /home/web10 --shell /usr/sbin/nologin web10; \
+    groupadd --gid 1000 web10; \
+    useradd --uid 1000 --gid 1000 --create-home --home-dir /home/web10 --shell /usr/sbin/nologin web10; \
     apt-get purge -y gpgv deb-multimedia-keyring; \
     rm -f /etc/apt/sources.list.d/dmo.sources; \
     rm -rf /var/lib/apt/lists/*
@@ -59,7 +59,7 @@ COPY --from=build /app/publish/ ./
 COPY scripts/check-runtime.sh ./scripts/check-runtime.sh
 COPY liquidsoap/web10.liq ./liquidsoap/web10.liq
 RUN chmod 0755 ./scripts/check-runtime.sh \
-    && install -d -o 1654 -g 1654 -m 0775 /run/web10 /var/lib/web10/storage /var/lib/web10/cache
+    && install -d -o 1000 -g 1000 -m 0775 /run/web10 /var/lib/web10/storage /var/lib/web10/cache
 
 HEALTHCHECK --interval=2s --timeout=5s --retries=30 --start-period=5s CMD ["./Web10.Radio.StreamNode", "--health-check", "http://127.0.0.1:18080/healthz"]
 ENTRYPOINT ["/usr/bin/dumb-init", "--"]

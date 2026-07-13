@@ -1,0 +1,15 @@
+# Keep the repo-root build context (deploy/Dockerfile.api) small and reproducible.
+.git
+.gitignore
+.claude
+**/bin
+**/obj
+**/node_modules
+**/dist
+**/coverage
+**/TestResults
+src/frontend/web-stage/mocks
+.storage
+.env
+.env.*
+!.env.prod.example

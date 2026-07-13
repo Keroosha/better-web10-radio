@@ -13,7 +13,7 @@ FROM mcr.microsoft.com/dotnet/aspnet:10.0-noble-chiseled AS runtime
 WORKDIR /app
 ENV ASPNETCORE_URLS=http://+:8080
 EXPOSE 8080
-USER 1654
+USER 1000:1000
 COPY --from=build /app/publish .
 HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=5 CMD ["dotnet", "Web10.Radio.Telegram.dll", "--health-check", "http://127.0.0.1:8080/health/live"]
 ENTRYPOINT ["dotnet", "Web10.Radio.Telegram.dll"]

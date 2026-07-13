@@ -21,7 +21,6 @@
 |---------------|----------------------------------------------------------------------|-----------------------------------|
 | `postgres`    | PostgreSQL 17, вся durable-стейт                                      | `localhost:5432`                  |
 | `migrator`    | One-shot FluentMigrator, применяет схему и выходит                    | —                                 |
-| `storage-init`| One-shot: правит права на `./.storage`, создаёт smoke-трек           | —                                 |
 | `api`         | ASP.NET/F# host: `/api/v0/*`, фоновые воркеры, health                 | `localhost:8080`                  |
 | `frontend`    | nginx: публичная сцена на `/`, админка на `/admin/`, проксирует `/api`| **сцена** `localhost:8090/` · **админка** `localhost:8090/admin/` |
 | `rtmp-sink`   | Внутренний RTMP-приёмник для оффлайн-смоука (в реальном стриме не участвует) | `localhost:8091/stat`      |
@@ -101,7 +100,7 @@ docker compose up -d --wait --wait-timeout 180
 Первый запуск собирает образы (дальше — из кэша). Дождитесь состояния:
 
 - `postgres`, `api`, `frontend`, `rtmp-sink`, `stream-node` — **healthy**;
-- `migrator`, `storage-init` — **exited (0)** (это one-shot).
+- `migrator` — **exited (0)** (это one-shot).
 
 Быстрая проверка:
 
@@ -224,9 +223,9 @@ docker compose logs stream-node --since 2m | grep -iE "Prepared|output-failed|RT
   (или `…RTMP_URL`).** Ключ короче 16 символов / с пробелами, либо URL не `rtmp(s)`.
   Поправьте `.env`.
 
-- **Права на `./.storage`.** API работает под UID `1654` и на старте проверяет
-  запись в `LOCAL_ROOT`; `storage-init` делает каталог доступным без смены владельца
-  ваших файлов. Если правили монтирование вручную — не ломайте этот one-shot.
+- **Права на `./.storage`.** API работает под UID `1000` (как и вы в системе) и на старте
+  проверяет запись в `LOCAL_ROOT`, поэтому каталог `./.storage` должен принадлежать вам —
+  в репозитории он уже есть (`.gitkeep`). Просто кладите свои аудиофайлы прямо в него.
 
 ---
 

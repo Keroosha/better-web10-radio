@@ -79,7 +79,6 @@ type Assignment =
       ClaimOwner: Guid
       ClaimAttempt: int
       TrackId: Guid
-      CachePath: string
       ContentType: string
       Title: string
       Artist: string

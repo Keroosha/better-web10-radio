@@ -74,3 +74,20 @@ type StreamNodeContractTests() =
             Assert.That(int rejected.StatusCode, Is.EqualTo(400))
         finally
             server.StopAsync().GetAwaiter().GetResult()
+
+    [<Test>]
+    member _.``media protocol uri is keyed by queue item and content type``() =
+        let baseAssignment: Assignment =
+            { QueueItemId = Guid.Parse("00000000-0000-0000-0000-0000000000ab")
+              ClaimOwner = Guid.NewGuid()
+              ClaimAttempt = 1
+              TrackId = Guid.NewGuid()
+              ContentType = "audio/mpeg"
+              Title = "t"
+              Artist = "a"
+              DurationMs = 1000 }
+
+        Assert.Multiple(fun () ->
+            Assert.That(Liquidsoap.mediaProtocolUri baseAssignment, Is.EqualTo("web10media:00000000-0000-0000-0000-0000000000ab.mp3"))
+            Assert.That(Liquidsoap.mediaProtocolUri { baseAssignment with ContentType = "audio/ogg" }, Is.EqualTo("web10media:00000000-0000-0000-0000-0000000000ab.ogg"))
+            Assert.That(Liquidsoap.mediaProtocolUri { baseAssignment with ContentType = "application/unknown" }, Is.EqualTo("web10media:00000000-0000-0000-0000-0000000000ab.mp3")))

@@ -1650,9 +1650,46 @@ module ApiEndpoints =
                 return StatusCodes.Status500InternalServerError
             | Ok None -> context.Response.StatusCode <- StatusCodes.Status204NoContent; return StatusCodes.Status204NoContent
             | Ok(Some assignment) ->
-                let dto: CurrentPlaybackAssignmentDto = { QueueItemId = assignment.QueueItemId.ToString("D"); ClaimOwner = assignment.ClaimOwner.ToString("D"); ClaimAttempt = assignment.ClaimAttempt; TrackId = assignment.TrackId.ToString("D"); CachePath = assignment.CachePath; ContentType = assignment.ContentType; Title = assignment.Title; Artist = assignment.Artist; DurationMs = max 0 assignment.DurationMs }
+                let dto: CurrentPlaybackAssignmentDto = { QueueItemId = assignment.QueueItemId.ToString("D"); ClaimOwner = assignment.ClaimOwner.ToString("D"); ClaimAttempt = assignment.ClaimAttempt; TrackId = assignment.TrackId.ToString("D"); ContentType = assignment.ContentType; Title = assignment.Title; Artist = assignment.Artist; DurationMs = max 0 assignment.DurationMs }
                 do! writeOk context dto
                 return StatusCodes.Status200OK
+        }
+
+    let private streamNodeMedia (context: HttpContext) =
+        task {
+            match parseGuidRoute "queueItemId" context with
+            | None ->
+                do! writeDomainProblem context StatusCodes.Status404NotFound "playback.media_not_found" "Playback media not found" "The requested playback media is unavailable."
+                return StatusCodes.Status404NotFound
+            | Some queueItemId ->
+                let source = context.RequestServices.GetRequiredService<NpgsqlDataSource>()
+                let! result = PlaybackQueueRepository.getPlaybackMediaFile source queueItemId context.RequestAborted
+                match result with
+                | Error _ ->
+                    do! repositoryReadFailed context
+                    return StatusCodes.Status500InternalServerError
+                | Ok None ->
+                    do! writeDomainProblem context StatusCodes.Status404NotFound "playback.media_not_found" "Playback media not found" "The requested playback media is unavailable."
+                    return StatusCodes.Status404NotFound
+                | Ok(Some(cachePath, contentType)) ->
+                    let openedStream =
+                        try
+                            Ok(File.OpenRead(cachePath))
+                        with
+                        | :? FileNotFoundException
+                        | :? DirectoryNotFoundException
+                        | :? UnauthorizedAccessException
+                        | :? IOException -> Error()
+
+                    match openedStream with
+                    | Error () ->
+                        do! writeDomainProblem context StatusCodes.Status404NotFound "playback.media_not_found" "Playback media not found" "The requested playback media is unavailable."
+                        return StatusCodes.Status404NotFound
+                    | Ok stream ->
+                        use stream = stream
+                        let result = Results.Stream(stream, contentType = contentType, enableRangeProcessing = true)
+                        do! result.ExecuteAsync(context)
+                        return context.Response.StatusCode
         }
 
     let private streamNodeControl (context: HttpContext) =
@@ -2634,6 +2671,7 @@ module ApiEndpoints =
         streamNode.RequireAuthorization(StreamNodeAuthentication.PolicyName) |> ignore
         map streamNode logger "POST" "/heartbeat" "/api/v0/stream-node/heartbeat" streamHeartbeat
         map streamNode logger "GET" "/playback/current" "/api/v0/stream-node/playback/current" currentPlaybackAssignment
+        map streamNode logger "GET" "/playback/{queueItemId}/media" "/api/v0/stream-node/playback/{queueItemId}/media" streamNodeMedia
         map streamNode logger "GET" "/control" "/api/v0/stream-node/control" streamNodeControl
         map streamNode logger "POST" "/playback/{queueItemId}/lease" "/api/v0/stream-node/playback/{queueItemId}/lease" playbackLease
         map streamNode logger "POST" "/playback/{queueItemId}/completion" "/api/v0/stream-node/playback/{queueItemId}/completion" playbackCompletion

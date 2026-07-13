@@ -207,7 +207,7 @@ docker compose logs stream-node --since 2m | grep -iE "Prepared|output-failed|RT
 
 - **`Status` застрял в `starting`, очередь пустая.** Проверьте, что есть хотя бы одна активная policy с подходящим schedule/cadence и доступным cached item; для `Manual` сохраните items, для `AllStorage` дождитесь завершения library scan.
 
-- **`Playback start callback timed out`, треки уходят в `Failed`, в логах `Nonexistent file or ill-formed URI`.** Проверьте, что `TrackFile.IsCached = true` и `CachePath` указывает на существующий файл. F# runtime передаёт Liquidsoap обычный абсолютный путь, поэтому пробелы в имени не требуют ручного URI-экранирования.
+- **`Playback start callback timed out`, треки уходят в `Failed`, в логах `Nonexistent file or ill-formed URI` или ошибки `curl`.** Проверьте, что `TrackFile.IsCached = true` и `CachePath` на стороне API указывает на существующий файл. F# runtime передаёт Liquidsoap `web10media:`-URI, который Liquidsoap скачивает с роута `GET /api/v0/stream-node/playback/{queueItemId}/media` по HTTP (bearer-токен) — общий том с API больше не нужен, но нода должна видеть `WEB10_API__BASE_URL`, а `WEB10_STREAM__CALLBACK_TOKEN` должен совпадать с API.
 - После изменения stream-node пересоберите только ноду: `docker compose build stream-node && docker compose up -d --no-deps --force-recreate stream-node`.
 
 - **`Status` уходит в `degraded`/`failed`, `Failure reason: RTMP output failed`.**

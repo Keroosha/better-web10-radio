@@ -166,6 +166,29 @@ ORDER BY q."StartedAtUtc" DESC NULLS LAST, q."UpdatedAtUtc" DESC, q."CreatedAtUt
 LIMIT 1;"""
 
     [<Literal>]
+    let private getPlaybackMediaFileSql = """SELECT tf."CachePath",
+       COALESCE(tf."ContentType", 'audio/mpeg')
+FROM "PlaybackQueue" AS q
+INNER JOIN "Tracks" AS t
+    ON t."Id" = q."TrackId"
+   AND t."IsDeleted" = false
+INNER JOIN LATERAL (
+    SELECT track_file."CachePath", track_file."ContentType"
+    FROM "TrackFiles" AS track_file
+    WHERE track_file."TrackId" = t."Id"
+      AND track_file."IsDeleted" = false
+      AND track_file."IsCached" = true
+      AND track_file."CachePath" IS NOT NULL
+      AND btrim(track_file."CachePath") <> ''
+    ORDER BY track_file."UpdatedAtUtc" DESC, track_file."CreatedAtUtc" DESC, track_file."Id" ASC
+    LIMIT 1
+) AS tf ON true
+WHERE q."IsDeleted" = false
+  AND q."Id" = @QueueItemId
+  AND q."Status" IN ('Claimed', 'Playing')
+LIMIT 1;"""
+
+    [<Literal>]
     let private enqueueNextActivePlaylistItemIfIdleSql = """WITH active_playlists AS (
     SELECT playlist."Id", playlist."Source", playlist."IsJingle", playlist."Interrupt", playlist."Type",
            playlist."Order", playlist."Weight", playlist."AvoidDuplicates", playlist."PlayEverySongs",
@@ -579,6 +602,29 @@ WHERE "Id" = @QueueItemId
                         return if hasRow then Some(readCurrentPlaybackAssignment reader) else None
                     with ex ->
                         return! Error(databaseError "PlaybackQueueRepository.getCurrentAssignment" ex)
+                })
+            cancellationToken
+
+    let getPlaybackMediaFile
+        (dataSource: NpgsqlDataSource)
+        (queueItemId: Guid)
+        (cancellationToken: CancellationToken)
+        : Task<Result<(string * string) option, RepositoryError>> =
+        DatabaseSession.withTransactionResult
+            dataSource
+            (fun connection transaction cancellationToken ->
+                taskResult {
+                    try
+                        use command = new NpgsqlCommand(getPlaybackMediaFileSql, connection, transaction)
+                        command.Parameters.AddWithValue("QueueItemId", queueItemId) |> ignore
+                        let! reader = command.ExecuteReaderAsync(cancellationToken)
+                        use reader = reader
+                        let! hasRow = reader.ReadAsync(cancellationToken)
+                        return
+                            if hasRow then Some(reader.GetString(0), reader.GetString(1))
+                            else None
+                    with ex ->
+                        return! Error(databaseError "PlaybackQueueRepository.getPlaybackMediaFile" ex)
                 })
             cancellationToken
 

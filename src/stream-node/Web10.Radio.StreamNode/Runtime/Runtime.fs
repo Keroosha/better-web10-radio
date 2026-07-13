@@ -284,10 +284,7 @@ type RuntimeSupervisor(
                             this.StartMedia()
                         | None -> ()
                         assignment <- Some value
-                        assignmentPath <- Liquidsoap.canonicalMediaPath config value.CachePath
-                        match assignmentPath with
-                        | None -> do! this.BeginCompletionAsync(value, PlaybackCompletion.Failed "Media file is unavailable")
-                        | Some _ -> ()
+                        assignmentPath <- Some(Liquidsoap.mediaProtocolUri value)
                 with
                 | :? OperationCanceledException -> ()
                 | _ -> this.SetDegraded("Backend playback request failed")

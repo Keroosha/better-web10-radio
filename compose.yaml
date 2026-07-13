@@ -192,9 +192,6 @@ services:
         required: true
       - path: .env
         required: false
-    volumes:
-      - ./.storage:/var/lib/web10/storage:ro
-      - web10-storage-cache:/var/lib/web10/cache:ro
     healthcheck:
       test: ["CMD", "./Web10.Radio.StreamNode", "--health-check", "http://127.0.0.1:18080/healthz"]
       interval: 2s

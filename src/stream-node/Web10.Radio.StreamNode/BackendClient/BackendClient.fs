@@ -169,7 +169,6 @@ type BackendClient(config: RuntimeConfig, ?httpClient: HttpClient) =
             let! claimOwner = Json.guid "claimOwner" operation root
             let! claimAttempt = Json.int32Positive "claimAttempt" operation root
             let! trackId = Json.guid "trackId" operation root
-            let! cachePath = Json.requiredString "cachePath" operation root
             let! contentType = Json.requiredString "contentType" operation root
             let! title =
                 match Json.tryProperty "title" root with
@@ -185,7 +184,7 @@ type BackendClient(config: RuntimeConfig, ?httpClient: HttpClient) =
                     let mutable parsed = 0
                     if value.TryGetInt32(&parsed) && parsed >= 0 then Ok parsed else Error(BackendError.InvalidResponse operation)
                 | _ -> Ok 0
-            return { QueueItemId = queueItemId; ClaimOwner = claimOwner; ClaimAttempt = claimAttempt; TrackId = trackId; CachePath = cachePath; ContentType = contentType; Title = title; Artist = artist; DurationMs = duration }
+            return { QueueItemId = queueItemId; ClaimOwner = claimOwner; ClaimAttempt = claimAttempt; TrackId = trackId; ContentType = contentType; Title = title; Artist = artist; DurationMs = duration }
         }
 
     member private this.MapResponse operation status =

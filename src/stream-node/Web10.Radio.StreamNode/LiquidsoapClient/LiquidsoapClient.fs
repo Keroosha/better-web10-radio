@@ -12,16 +12,18 @@ module Liquidsoap =
         if isNull value then ""
         else value.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", "\\r").Replace("\n", "\\n")
 
-    let canonicalMediaPath (config: RuntimeConfig) (candidate: string) =
-        try
-            let full = Path.GetFullPath candidate
-            let roots = [ Path.GetFullPath config.StorageRoot; Path.GetFullPath config.CacheRoot ]
-            let within root =
-                full.Equals(root, StringComparison.Ordinal) || full.StartsWith(root.TrimEnd(Path.DirectorySeparatorChar) + string Path.DirectorySeparatorChar, StringComparison.Ordinal)
-            if roots |> List.exists within && File.Exists full then Some full else None
-        with :? ArgumentException -> None
-           | :? IOException -> None
-           | :? UnauthorizedAccessException -> None
+    let private extensionForContentType (contentType: string) =
+        match (if isNull contentType then "" else contentType.Trim().ToLowerInvariant()) with
+        | "audio/mpeg" | "audio/mp3" -> "mp3"
+        | "audio/ogg" | "application/ogg" | "audio/vorbis" | "audio/x-vorbis+ogg" -> "ogg"
+        | "audio/flac" | "audio/x-flac" -> "flac"
+        | "audio/wav" | "audio/x-wav" | "audio/wave" | "audio/vnd.wave" -> "wav"
+        | "audio/mp4" | "audio/aac" | "audio/x-m4a" | "audio/m4a" -> "m4a"
+        | "audio/opus" -> "opus"
+        | _ -> "mp3"
+
+    let mediaProtocolUri (assignment: Assignment) =
+        sprintf "web10media:%s.%s" (assignment.QueueItemId.ToString("D")) (extensionForContentType assignment.ContentType)
 
     let annotatedFileUri assignment path =
         let metadata =

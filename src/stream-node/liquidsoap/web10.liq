@@ -33,6 +33,27 @@ rtmp_url = environment.get("WEB10_STREAM__RTMP_URL")
 rtmp_key = environment.get("WEB10_STREAM__RTMP_KEY")
 rtmp_target = "#{rtmp_url}#{rtmp_key}"
 
+web10_api_base = environment.get("WEB10_API__BASE_URL")
+web10_callback_token = environment.get("WEB10_STREAM__CALLBACK_TOKEN")
+web10_auth_header_file = "/run/web10/media-auth.header"
+file.write(data="Authorization: Bearer #{web10_callback_token}\n", perms=0o600, web10_auth_header_file)
+
+def web10media_protocol(~rlog, ~maxtime, arg) =
+  ignore(rlog)
+  ignore(maxtime)
+  extname = file.extension(leading_dot=false, arg)
+  queue_item_id = path.remove_extension(arg)
+  media_url = "#{web10_api_base}/api/v0/stream-node/playback/#{queue_item_id}/media"
+  process.uri(extname=extname, "curl -fsSL -H @#{web10_auth_header_file} -o $(output) #{media_url}")
+end
+protocol.add(
+  "web10media",
+  web10media_protocol,
+  temporary=true,
+  doc="Fetch the assigned track from the API over HTTP",
+  syntax="web10media:<queueItemId>.<ext>"
+)
+
 # Liquidsoap 2.4's experimental external readers do not preserve pipe framing
 # for rawvideo or AVI. Its native FFmpeg input captures the same X11 surface
 # directly, with decoded YUV frames and no intermediary framing failure.

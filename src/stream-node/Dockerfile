@@ -50,7 +50,7 @@ RUN set -eu; \
     rm -f "${liquidsoap_deb}"; \
     groupadd --gid 1654 web10; \
     useradd --uid 1654 --gid 1654 --create-home --home-dir /home/web10 --shell /usr/sbin/nologin web10; \
-    apt-get purge -y curl gpgv deb-multimedia-keyring; \
+    apt-get purge -y gpgv deb-multimedia-keyring; \
     rm -f /etc/apt/sources.list.d/dmo.sources; \
     rm -rf /var/lib/apt/lists/*
 

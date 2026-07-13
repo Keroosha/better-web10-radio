@@ -188,6 +188,93 @@ VALUES (@QueueItemId, @TrackId, 'fallback', 'Playing', 0, @NowUtc, @ClaimOwner, 
             })
 
     [<Test>]
+    let ``getPlaybackMediaFile returns the cached file for an active Playing item`` () =
+        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
+            task {
+                let trackId = newId ()
+                let trackFileId = newId ()
+                let queueItemId = newId ()
+                let claimOwner = newId ()
+                let nowUtc = DateTimeOffset(2026, 7, 10, 20, 5, 0, TimeSpan.Zero)
+
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+                use setup =
+                    new NpgsqlCommand(
+                        """INSERT INTO "Tracks" ("Id", "Title", "Artist", "DurationMs", "IsDeleted")
+VALUES (@TrackId, 'Active', 'Artist', 1000, false);
+
+INSERT INTO "TrackFiles" ("Id", "TrackId", "StoragePath", "CachePath", "ContentType", "IsCached", "IsDeleted")
+VALUES (@TrackFileId, @TrackId, '/library/current.ogg', '/cache/current.ogg', 'audio/ogg', true, false);
+
+INSERT INTO "PlaybackQueue" ("Id", "TrackId", "Source", "Status", "Priority", "RequestedAtUtc", "ClaimOwner", "ClaimAttempt", "ClaimLeaseExpiresAtUtc")
+VALUES (@QueueItemId, @TrackId, 'fallback', 'Playing', 0, @NowUtc, @ClaimOwner, 3, @LeaseExpiresAtUtc);""",
+                        connection
+                    )
+
+                for name, value in
+                    [ "TrackId", box trackId
+                      "TrackFileId", box trackFileId
+                      "QueueItemId", box queueItemId
+                      "ClaimOwner", box claimOwner
+                      "NowUtc", box nowUtc
+                      "LeaseExpiresAtUtc", box (nowUtc.AddSeconds(30.0)) ] do
+                    setup.Parameters.AddWithValue(name, value) |> ignore
+
+                let! _ = setup.ExecuteNonQueryAsync()
+                use dataSource = NpgsqlDataSource.Create(connectionString)
+                let! result = PlaybackQueueRepository.getPlaybackMediaFile dataSource queueItemId CancellationToken.None
+
+                match result with
+                | Ok(Some (cachePath, contentType)) ->
+                    Assert.Multiple(fun () ->
+                        Assert.That(cachePath, Is.EqualTo("/cache/current.ogg"))
+                        Assert.That(contentType, Is.EqualTo("audio/ogg")))
+                | actual ->
+                    Assert.Fail(sprintf "Expected the active item to expose its cached media file, but got %A." actual)
+            })
+
+    [<Test>]
+    let ``getPlaybackMediaFile ignores a non-active queued item`` () =
+        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
+            task {
+                let trackId = newId ()
+                let trackFileId = newId ()
+                let queueItemId = newId ()
+                let nowUtc = DateTimeOffset(2026, 7, 10, 20, 5, 0, TimeSpan.Zero)
+
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+                use setup =
+                    new NpgsqlCommand(
+                        """INSERT INTO "Tracks" ("Id", "Title", "Artist", "DurationMs", "IsDeleted")
+VALUES (@TrackId, 'Queued', 'Artist', 1000, false);
+
+INSERT INTO "TrackFiles" ("Id", "TrackId", "StoragePath", "CachePath", "ContentType", "IsCached", "IsDeleted")
+VALUES (@TrackFileId, @TrackId, '/library/queued.ogg', '/cache/queued.ogg', 'audio/ogg', true, false);
+
+INSERT INTO "PlaybackQueue" ("Id", "TrackId", "Source", "Status", "Priority", "RequestedAtUtc")
+VALUES (@QueueItemId, @TrackId, 'fallback', 'Queued', 0, @NowUtc);""",
+                        connection
+                    )
+
+                for name, value in
+                    [ "TrackId", box trackId
+                      "TrackFileId", box trackFileId
+                      "QueueItemId", box queueItemId
+                      "NowUtc", box nowUtc ] do
+                    setup.Parameters.AddWithValue(name, value) |> ignore
+
+                let! _ = setup.ExecuteNonQueryAsync()
+                use dataSource = NpgsqlDataSource.Create(connectionString)
+                let! result = PlaybackQueueRepository.getPlaybackMediaFile dataSource queueItemId CancellationToken.None
+
+                match result with
+                | Ok None -> ()
+                | actual -> Assert.Fail(sprintf "Expected no media file for a non-active queue item, but got %A." actual)
+            })
+
+    [<Test>]
     let ``removing a queued item soft-deletes it`` () =
         DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
             task {

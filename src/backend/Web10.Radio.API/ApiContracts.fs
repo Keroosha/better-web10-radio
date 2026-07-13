@@ -258,7 +258,6 @@ type CurrentPlaybackAssignmentDto =
       ClaimOwner: string
       ClaimAttempt: int
       TrackId: string
-      CachePath: string
       ContentType: string
       Title: string
       Artist: string

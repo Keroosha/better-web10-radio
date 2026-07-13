@@ -4,18 +4,27 @@
 # secrets store, managed Postgres, backups) is a separate, deferred step. To use:
 #
 #   cp .env.prod.example .env.prod   # fill in real secrets (gitignored)
-#   WEB10_IMAGE_TAG=<sha-or-version> docker compose -f compose.prod.yaml --env-file .env.prod up -d --wait
+#   COMPOSE_PROJECT_NAME=web10-radio-prod docker compose -p "$COMPOSE_PROJECT_NAME" -f compose.prod.yaml --env-file .env.prod up -d --wait
+#
+# WEB10_IMAGE_TAG must be an immutable sha-<short-commit>; latest is not supported.
 #
 # Differences from the dev compose.yaml:
 #   • no nginx `frontend` — the all-in-one `api` image serves both SPAs + /api/v0/*
 #   • no `rtmp-sink` / `storage-init` / seaweedfs (dev/smoke only)
-#   • `telegram` runs LongPolling (no inbound route)
+#   • `telegram` is disabled by default and runs LongPolling only when the `telegram` profile is enabled
 #   • `stream-node` loads the stage from the API and streams to the real RTMP target
-#   • images come from ghcr.io/keroosha/better-web10-radio/* at ${WEB10_IMAGE_TAG}
+
+x-web10-logging: &web10-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+    compress: "true"
 
 services:
   postgres:
     image: postgres:17
+    logging: *web10-logging
     environment:
       POSTGRES_DB: "${POSTGRES_DB:-web10}"
       POSTGRES_USER: "${POSTGRES_USER:-web10}"
@@ -31,7 +40,8 @@ services:
     restart: unless-stopped
 
   migrator:
-    image: "ghcr.io/keroosha/better-web10-radio/migrator:${WEB10_IMAGE_TAG:-latest}"
+    image: "ghcr.io/keroosha/better-web10-radio/migrator:${WEB10_IMAGE_TAG:?WEB10_IMAGE_TAG is required in prod}"
+    logging: *web10-logging
     depends_on:
       postgres:
         condition: service_healthy
@@ -41,7 +51,8 @@ services:
     restart: "no"
 
   api:
-    image: "ghcr.io/keroosha/better-web10-radio/api:${WEB10_IMAGE_TAG:-latest}"
+    image: "ghcr.io/keroosha/better-web10-radio/api:${WEB10_IMAGE_TAG:?WEB10_IMAGE_TAG is required in prod}"
+    logging: *web10-logging
     depends_on:
       postgres:
         condition: service_healthy
@@ -49,12 +60,12 @@ services:
         condition: service_completed_successfully
     ports:
       # The single public origin: public stage at '/', admin at '/admin/', API at '/api/v0/'.
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     env_file:
       - path: .env.prod
         required: true
     volumes:
-      - web10-storage:/var/lib/web10/storage
+      - ./.storage:/var/lib/web10/storage
       - web10-storage-cache:/var/lib/web10/cache
       - web10-data-protection:/var/lib/web10/data-protection
     healthcheck:
@@ -66,7 +77,9 @@ services:
     restart: unless-stopped
 
   telegram:
-    image: "ghcr.io/keroosha/better-web10-radio/telegram:${WEB10_IMAGE_TAG:-latest}"
+    image: "ghcr.io/keroosha/better-web10-radio/telegram:${WEB10_IMAGE_TAG:?WEB10_IMAGE_TAG is required in prod}"
+    logging: *web10-logging
+    profiles: [telegram]
     depends_on:
       postgres:
         condition: service_healthy
@@ -84,7 +97,9 @@ services:
     restart: unless-stopped
 
   stream-node:
-    image: "ghcr.io/keroosha/better-web10-radio/stream-node:${WEB10_IMAGE_TAG:-latest}"
+    image: "ghcr.io/keroosha/better-web10-radio/stream-node:${WEB10_IMAGE_TAG:?WEB10_IMAGE_TAG is required in prod}"
+    logging: *web10-logging
+    cpus: 4.0
     depends_on:
       api:
         condition: service_healthy
@@ -101,6 +116,5 @@ services:
 
 volumes:
   web10-postgres-data:
-  web10-storage:
   web10-storage-cache:
   web10-data-protection:

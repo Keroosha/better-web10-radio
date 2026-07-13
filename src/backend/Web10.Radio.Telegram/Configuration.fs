@@ -14,7 +14,7 @@ type OtelOptions =
 type TelegramServiceOptions =
     { Postgres: PostgresOptions
       Telegram: TelegramOptions
-      Otel: OtelOptions }
+      Otel: OtelOptions option }
 
 [<RequireQualifiedAccess>]
 module TelegramConfiguration =
@@ -30,7 +30,7 @@ module TelegramConfiguration =
           "TELEGRAM:CHANNEL_ID_OR_USERNAME", "WEB10_TELEGRAM__CHANNEL_ID_OR_USERNAME"
           "TELEGRAM:REQUEST_PRICE_STARS", "WEB10_TELEGRAM__REQUEST_PRICE_STARS"
           "TELEGRAM:SAY_PRICE_STARS", "WEB10_TELEGRAM__SAY_PRICE_STARS"
-          "OTEL:EXPORTER_OTLP_ENDPOINT", "WEB10_OTEL__EXPORTER_OTLP_ENDPOINT" ]
+          ]
 
     let private readOptionalExact (configuration: IConfiguration) key =
         let value = configuration[key]
@@ -124,7 +124,31 @@ module TelegramConfiguration =
         let requestPrice = parsePositiveInt32 errors "WEB10_TELEGRAM__REQUEST_PRICE_STARS" (required "TELEGRAM:REQUEST_PRICE_STARS")
         let sayPrice = parsePositiveInt32 errors "WEB10_TELEGRAM__SAY_PRICE_STARS" (required "TELEGRAM:SAY_PRICE_STARS")
         let updateMode = parseUpdateMode errors (optional "TELEGRAM:UPDATE_MODE")
-        let endpoint = parseAbsoluteHttpUri errors "WEB10_OTEL__EXPORTER_OTLP_ENDPOINT" (required "OTEL:EXPORTER_OTLP_ENDPOINT")
+        let otelEnabled =
+            match optional "OTEL:ENABLED" with
+            | None -> true
+            | value ->
+                match value with
+                | Some raw when String.IsNullOrWhiteSpace raw ->
+                    errors.Add("WEB10_OTEL__ENABLED must be exactly true or false.")
+                    false
+                | _ ->
+                    match value with
+                    | Some "true" -> true
+                    | Some "false" -> false
+                    | _ ->
+                        errors.Add("WEB10_OTEL__ENABLED must be exactly true or false.")
+                        false
+        let endpoint =
+            if otelEnabled then
+                match optional "OTEL:EXPORTER_OTLP_ENDPOINT" with
+                | Some raw when not (String.IsNullOrWhiteSpace raw) ->
+                    parseAbsoluteHttpUri errors "WEB10_OTEL__EXPORTER_OTLP_ENDPOINT" (Some(raw.Trim()))
+                | _ ->
+                    errors.Add("WEB10_OTEL__EXPORTER_OTLP_ENDPOINT is required when WEB10_OTEL__ENABLED=true.")
+                    None
+            else
+                None
         validateConnectionString errors connectionString
         validateTelegram errors botToken webhookSecret channel
 
@@ -141,7 +165,7 @@ module TelegramConfiguration =
                       RequestPriceStars = Option.get requestPrice
                       UpdateMode = updateMode
                       SayPriceStars = Option.get sayPrice }
-                  Otel = { ExporterOtlpEndpoint = Option.get endpoint } }
+                  Otel = Option.map (fun endpoint -> { ExporterOtlpEndpoint = endpoint }) endpoint }
 
 module Configuration =
     let load (configuration: IConfiguration) = TelegramConfiguration.load configuration

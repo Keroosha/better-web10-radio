@@ -9,6 +9,7 @@
 
   <ItemGroup>
     <Compile Include="ConfigurationTests.fs" />
+    <Compile Include="TelegramConfigurationTests.fs" />
     <Compile Include="DomainEventTests.fs" />
     <Compile Include="DatabaseTestSupport.fs" />
     <Compile Include="MigrationMetadataTests.fs" />

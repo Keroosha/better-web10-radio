@@ -437,8 +437,8 @@ The selected row is updated to `Claimed` in the same transaction before playback
 - `WEB10_STREAM__CALLBACK_TOKEN`
 - `WEB10_STORAGE__TYPE=Local|S3`
 - `WEB10_STORAGE__MAX_UPLOAD_BYTES` is optional, parses as a positive `Int64`, and defaults to `536870912` (512 MiB); invalid, zero, negative, or overflowing values fail startup.
-- `WEB10_OTEL__EXPORTER_OTLP_ENDPOINT`
-- `WEB10_DATA_PROTECTION__KEY_RING_PATH`
+- `WEB10_OTEL__ENABLED=true|false` (optional; defaults to `true`)
+- `WEB10_OTEL__EXPORTER_OTLP_ENDPOINT` is required only when `WEB10_OTEL__ENABLED=true`.
 
 Optional development configuration:
 
@@ -460,7 +460,9 @@ Startup validation rules:
 - `WEB10_POSTGRES__CONNECTION_STRING` парсится как Npgsql connection string.
 - `WEB10_ADMIN__USERNAME` is trimmed and must be 1–64 characters; `WEB10_ADMIN__PASSWORD` is not trimmed and must be 12–256 characters. At startup this configured credential is authoritative: it creates or updates that admin, soft-deletes other active admins, and revokes their sessions. Passwords, hashes, session values, and CSRF tokens are never logged.
 - `WEB10_DEV__FIXTURES_ENABLED`, if set, accepts exact `true|false` and defaults to `false`.
-- `WEB10_STREAM__RTMP_URL` разрешает только `rtmp`/`rtmps`; `WEB10_STREAM__STAGE_URL`, `WEB10_OTEL__EXPORTER_OTLP_ENDPOINT` и optional `WEB10_STORAGE__S3_SERVICE_URL` — только absolute `http`/`https` URI.
+- `WEB10_OTEL__ENABLED`, if set, accepts exact `true|false` and defaults to `true`.
+- When `WEB10_OTEL__ENABLED=true`, `WEB10_OTEL__EXPORTER_OTLP_ENDPOINT` must be non-empty and an absolute `http`/`https` URI; when disabled, the endpoint is ignored.
+- `WEB10_STREAM__RTMP_URL` разрешает только `rtmp`/`rtmps`; `WEB10_STREAM__STAGE_URL` и optional `WEB10_STORAGE__S3_SERVICE_URL` — только absolute `http`/`https` URI.
 - Telegram bot token, webhook secret и channel id/username проверяются синтаксически; `WEB10_TELEGRAM__UPDATE_MODE`, если задан, допускает exact `Webhook|LongPolling`; `WEB10_STREAM__RTMP_KEY` должен быть nontrivial whitespace-free secret минимум из 16 символов, а `WEB10_STREAM__CALLBACK_TOKEN` — bearer-safe secret минимум из 24 символов с exact alphabet `A-Za-z0-9_-`.
 - Telegram request/say price keys parse invariant positive `Int32`; missing, non-integer, overflow, zero или negative value fails startup с exact `<KEY> must be a positive 32-bit integer.`
 - Local storage root и Data Protection key-ring path проверяются как creatable/writable directories; S3 bucket, region и взаимоисключающие Local/S3 fields проверяются до `Build()`.
@@ -488,7 +490,7 @@ Logging/OTEL rules:
 
 - Use high-performance logging with `LoggerMessageAttribute`/source-generated logging or equivalent F# wrapper over source-generated partial methods where implemented in C# support code; no string interpolation in hot-path log calls.
 - Include `traceId`, `correlationId`, `eventId`, `telegramUpdateId`, and `queueItemId` where applicable.
-- Emit OTEL traces and metrics for API requests, Telegram updates, queue claims, library scans, stream-node heartbeats, and payment flow.
+- Emit OTEL traces and metrics for API requests, Telegram updates, queue claims, library scans, stream-node heartbeats, and payment flow only when `WEB10_OTEL__ENABLED=true`; disabled services do not register OTLP exporters.
 ## 10. Frontend architecture contract
 
 Frontend paths:

@@ -55,7 +55,7 @@ type Web10Options =
       Stream: StreamOptions
       Storage: StorageOptions
       Admin: AdminOptions
-      Otel: OtelOptions
+      Otel: OtelOptions option
       DevelopmentFixturesEnabled: bool
       ServeFrontend: bool
       DataProtection: DataProtectionOptions }
@@ -72,7 +72,6 @@ module Configuration =
           "STORAGE:CACHE_ROOT", "WEB10_STORAGE__CACHE_ROOT"
           "ADMIN:USERNAME", "WEB10_ADMIN__USERNAME"
           "ADMIN:PASSWORD", "WEB10_ADMIN__PASSWORD"
-          "OTEL:EXPORTER_OTLP_ENDPOINT", "WEB10_OTEL__EXPORTER_OTLP_ENDPOINT"
           "DATA_PROTECTION:KEY_RING_PATH", "WEB10_DATA_PROTECTION__KEY_RING_PATH" ]
 
     let private readRequired (configuration: IConfiguration) (errors: ResizeArray<string>) (key: string, envVar: string) =
@@ -316,7 +315,20 @@ module Configuration =
         let storageType = parseStorageType errors (requiredValue "STORAGE:TYPE")
         let rtmpUrl = parseAbsoluteUri errors "WEB10_STREAM__RTMP_URL" (Set.ofList [ "rtmp"; "rtmps" ]) (requiredValue "STREAM:RTMP_URL")
         let stageUrl = parseAbsoluteUri errors "WEB10_STREAM__STAGE_URL" (Set.ofList [ "http"; "https" ]) (requiredValue "STREAM:STAGE_URL")
-        let otlpEndpoint = parseAbsoluteUri errors "WEB10_OTEL__EXPORTER_OTLP_ENDPOINT" (Set.ofList [ "http"; "https" ]) (requiredValue "OTEL:EXPORTER_OTLP_ENDPOINT")
+        let otelEnabled =
+            match readOptionalExact configuration "OTEL:ENABLED" with
+            | None -> true
+            | value -> parseBoolean errors "WEB10_OTEL__ENABLED" value
+        let otlpEndpoint =
+            if otelEnabled then
+                match readOptional configuration "OTEL:EXPORTER_OTLP_ENDPOINT" with
+                | None ->
+                    errors.Add("WEB10_OTEL__EXPORTER_OTLP_ENDPOINT is required when WEB10_OTEL__ENABLED=true.")
+                    None
+                | endpoint ->
+                    parseAbsoluteUri errors "WEB10_OTEL__EXPORTER_OTLP_ENDPOINT" (Set.ofList [ "http"; "https" ]) endpoint
+            else
+                None
         let developmentFixturesEnabled = parseBoolean errors "WEB10_DEV__FIXTURES_ENABLED" (readOptionalExact configuration "DEV:FIXTURES_ENABLED")
         let serveFrontend = parseBoolean errors "WEB10_API__SERVE_FRONTEND" (readOptionalExact configuration "API:SERVE_FRONTEND")
         let s3ServiceUrl = parseAbsoluteUri errors "WEB10_STORAGE__S3_SERVICE_URL" (Set.ofList [ "http"; "https" ]) s3ServiceUrlRaw
@@ -352,7 +364,7 @@ module Configuration =
                   Admin =
                     { Username = getRequired "ADMIN:USERNAME"
                       Password = getRequired "ADMIN:PASSWORD" }
-                  Otel = { ExporterOtlpEndpoint = Option.get otlpEndpoint }
+                  Otel = Option.map (fun endpoint -> { ExporterOtlpEndpoint = endpoint }) otlpEndpoint
                   DataProtection = { KeyRingPath = getRequired "DATA_PROTECTION:KEY_RING_PATH" }
                   DevelopmentFixturesEnabled = developmentFixturesEnabled
                   ServeFrontend = serveFrontend }

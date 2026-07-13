@@ -25,7 +25,6 @@ module ConfigurationTests =
           "WEB10_STORAGE__TYPE"
           "WEB10_ADMIN__USERNAME"
           "WEB10_ADMIN__PASSWORD"
-          "WEB10_OTEL__EXPORTER_OTLP_ENDPOINT"
           "WEB10_DATA_PROTECTION__KEY_RING_PATH" ]
 
     let private configurationPairs (root: string) =
@@ -40,6 +39,7 @@ module ConfigurationTests =
               "STORAGE:LOCAL_ROOT", Path.Combine(root, "library")
               "ADMIN:USERNAME", "test-admin"
               "ADMIN:PASSWORD", "test-admin-password-1234567890"
+              "OTEL:ENABLED", "true"
               "OTEL:EXPORTER_OTLP_ENDPOINT", "https://otel.web10.radio/v1/traces"
               "DATA_PROTECTION:KEY_RING_PATH", Path.Combine(root, "keys") ]
 
@@ -127,8 +127,15 @@ module ConfigurationTests =
             Overrides = [ "STREAM:RTMP_URL", Some "https://stream.web10.radio/" ]
             ExpectedErrorFragments = [ "WEB10_STREAM__RTMP_URL" ] }
           { Name = "OTLP URI uses a disallowed scheme"
-            Overrides = [ "OTEL:EXPORTER_OTLP_ENDPOINT", Some "ftp://otel.web10.radio/v1/traces" ]
+            Overrides =
+                [ "OTEL:ENABLED", Some "true"
+                  "OTEL:EXPORTER_OTLP_ENDPOINT", Some "ftp://otel.web10.radio/v1/traces" ]
             ExpectedErrorFragments = [ "WEB10_OTEL__EXPORTER_OTLP_ENDPOINT" ] }
+          { Name = "enabled OTEL requires an endpoint"
+            Overrides =
+                [ "OTEL:ENABLED", Some "true"
+                  "OTEL:EXPORTER_OTLP_ENDPOINT", None ]
+            ExpectedErrorFragments = [ "WEB10_OTEL__EXPORTER_OTLP_ENDPOINT is required when WEB10_OTEL__ENABLED=true." ] }
           { Name = "S3 bucket has invalid syntax"
             Overrides =
                 [ "STORAGE:TYPE", Some "S3"
@@ -273,3 +280,45 @@ module ConfigurationTests =
             match Configuration.load (buildConfiguration pairs) with
             | Ok options -> Assert.That(options.Storage.S3ForcePathStyle, Is.False)
             | Error errors -> Assert.Fail(sprintf "Expected explicit Local false S3 force-path-style to be accepted, but got %s." (joinedErrors errors)))
+
+    [<Test>]
+    let ``disabled OTEL without endpoint succeeds with no OTEL options`` () =
+        withTemporaryDirectory (fun root ->
+            let pairs =
+                configurationPairs root
+                |> Map.add "OTEL:ENABLED" "false"
+                |> Map.remove "OTEL:EXPORTER_OTLP_ENDPOINT"
+
+            match Configuration.load (buildConfiguration pairs) with
+            | Ok options -> Assert.That(Option.isNone options.Otel, Is.True)
+            | Error errors ->
+                Assert.Fail(sprintf "Disabled OTEL must not require an endpoint, but got %s." (joinedErrors errors)))
+
+    [<Test>]
+    let ``disabled OTEL ignores malformed endpoint`` () =
+        withTemporaryDirectory (fun root ->
+            let pairs =
+                configurationPairs root
+                |> Map.add "OTEL:ENABLED" "false"
+                |> Map.add "OTEL:EXPORTER_OTLP_ENDPOINT" "not-an-absolute-uri"
+
+            match Configuration.load (buildConfiguration pairs) with
+            | Ok options -> Assert.That(Option.isNone options.Otel, Is.True)
+            | Error errors ->
+                Assert.Fail(sprintf "Disabled OTEL must ignore malformed endpoints, but got %s." (joinedErrors errors)))
+
+    [<Test>]
+    let ``API process rejects enabled OTEL without endpoint before host bind`` () : Threading.Tasks.Task =
+        withTemporaryDirectory (fun root ->
+            task {
+                let baseline = configurationPairs root
+                let testCase =
+                    { Name = "enabled OTEL requires an endpoint before host bind"
+                      Overrides =
+                        [ "OTEL:ENABLED", Some "true"
+                          "OTEL:EXPORTER_OTLP_ENDPOINT", None ]
+                      ExpectedErrorFragments =
+                        [ "WEB10_OTEL__EXPORTER_OTLP_ENDPOINT is required when WEB10_OTEL__ENABLED=true." ] }
+
+                do! baseline |> applyOverrides <| testCase.Overrides |> assertProcessRejects testCase
+            })

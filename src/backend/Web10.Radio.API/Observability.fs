@@ -177,23 +177,25 @@ module FlowTelemetry =
         attempt.TryFinish(outcome, metricTags)
 
 module ObservabilityComposition =
-    let addObservability (otel: OtelOptions) (_environment: IHostEnvironment) (services: IServiceCollection) : IServiceCollection =
-        services
-            .AddOpenTelemetry()
-            .ConfigureResource(fun resource -> resource.AddService(serviceName = "Web10.Radio.API") |> ignore)
-            .WithTracing(fun tracing ->
-                tracing
-                    .AddSource(FlowTelemetry.ActivitySourceName)
+    let addObservability (otel: OtelOptions option) (_environment: IHostEnvironment) (services: IServiceCollection) : IServiceCollection =
+        match otel with
+        | None -> services
+        | Some otel ->
+            services
+                .AddOpenTelemetry()
+                .ConfigureResource(fun resource -> resource.AddService(serviceName = "Web10.Radio.API") |> ignore)
+                .WithTracing(fun tracing ->
+                    tracing
+                        .AddSource(FlowTelemetry.ActivitySourceName)
+                        .AddAspNetCoreInstrumentation()
+                        .AddOtlpExporter(fun exporter -> exporter.Endpoint <- otel.ExporterOtlpEndpoint)
+                    |> ignore)
+                .WithMetrics(fun metrics ->
+                    metrics
+                        .AddAspNetCoreInstrumentation()
+                        .AddMeter(FlowTelemetry.MeterName)
+                        .AddOtlpExporter(fun exporter -> exporter.Endpoint <- otel.ExporterOtlpEndpoint)
+                    |> ignore)
+            |> ignore
 
-                    .AddAspNetCoreInstrumentation()
-                    .AddOtlpExporter(fun exporter -> exporter.Endpoint <- otel.ExporterOtlpEndpoint)
-                |> ignore)
-            .WithMetrics(fun metrics ->
-                metrics
-                    .AddAspNetCoreInstrumentation()
-                    .AddMeter(FlowTelemetry.MeterName)
-                    .AddOtlpExporter(fun exporter -> exporter.Endpoint <- otel.ExporterOtlpEndpoint)
-                |> ignore)
-        |> ignore
-
-        services
+            services

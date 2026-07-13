@@ -261,7 +261,9 @@ type CurrentPlaybackAssignmentDto =
       ContentType: string
       Title: string
       Artist: string
-      DurationMs: int }
+      DurationMs: int
+      CueStartMs: int option
+      CueDurationMs: int option }
 
 type PlaylistScheduleDto =
     { Id: string

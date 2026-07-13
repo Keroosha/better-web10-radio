@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-for command in liquidsoap Xvfb chromium ffmpeg unclutter; do
+for command in liquidsoap Xvfb chromium ffmpeg ffprobe unclutter; do
     command -v "$command" >/dev/null
 done
 
@@ -97,5 +97,20 @@ DISPLAY="$display" ffmpeg -hide_banner -loglevel error -y \
 
 if [ ! -s "$flv_output" ]; then
     echo "FFmpeg did not produce an FLV capture" >&2
+    exit 1
+fi
+
+cue_source="${runtime_dir}/cue-source.flac"
+cue_segment="${runtime_dir}/cue-segment.flac"
+ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i sine=frequency=1000:sample_rate=48000 \
+    -t 2 -map 0:a:0 -vn -sn -dn -c:a flac "$cue_source"
+ffmpeg -hide_banner -loglevel error -y \
+    -i "$cue_source" -ss 0.500 -t 1.000 \
+    -map 0:a:0 -vn -sn -dn -c:a flac "$cue_segment"
+
+cue_duration="$(ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 "$cue_segment")"
+if ! awk -v duration="$cue_duration" 'BEGIN { exit !(duration >= 0.90 && duration <= 1.10) }'; then
+    echo "FFmpeg did not produce a 0.90-1.10 second FLAC CUE segment" >&2
     exit 1
 fi

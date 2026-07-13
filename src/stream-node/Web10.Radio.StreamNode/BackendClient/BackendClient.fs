@@ -55,6 +55,21 @@ module private Json =
             if value.TryGetInt32(&parsed) && parsed > 0 then Ok parsed else Error(BackendError.InvalidResponse operation)
         | _ -> Error(BackendError.InvalidResponse operation)
 
+    let cueTiming operation root =
+        match tryProperty "cueStartMs" root, tryProperty "cueDurationMs" root with
+        | Option.None, Option.None -> Ok(None, None)
+        | Some start, Some duration when start.ValueKind = JsonValueKind.Null && duration.ValueKind = JsonValueKind.Null ->
+            Ok(None, None)
+        | Some start, Some duration when start.ValueKind = JsonValueKind.Number && duration.ValueKind = JsonValueKind.Number ->
+            let mutable parsedStart = 0
+            let mutable parsedDuration = 0
+            if start.TryGetInt32(&parsedStart) && parsedStart >= 0
+               && duration.TryGetInt32(&parsedDuration) && parsedDuration > 0 then
+                Ok(Some parsedStart, Some parsedDuration)
+            else
+                Error(BackendError.InvalidResponse operation)
+        | _ -> Error(BackendError.InvalidResponse operation)
+
     let guid name operation root =
         match requiredString name operation root with
         | Error error -> Error error
@@ -183,7 +198,18 @@ type BackendClient(config: RuntimeConfig, ?httpClient: HttpClient) =
                     let mutable parsed = 0
                     if value.TryGetInt32(&parsed) && parsed >= 0 then Ok parsed else Error(BackendError.InvalidResponse operation)
                 | _ -> Ok 0
-            return { QueueItemId = queueItemId; ClaimOwner = claimOwner; ClaimAttempt = claimAttempt; TrackId = trackId; ContentType = contentType; Title = title; Artist = artist; DurationMs = duration }
+            let! cueStartMs, cueDurationMs = Json.cueTiming operation root
+            return
+                { QueueItemId = queueItemId
+                  ClaimOwner = claimOwner
+                  ClaimAttempt = claimAttempt
+                  TrackId = trackId
+                  ContentType = contentType
+                  Title = title
+                  Artist = artist
+                  DurationMs = duration
+                  CueStartMs = cueStartMs
+                  CueDurationMs = cueDurationMs }
         }
 
     member private this.ParseAssignment(bytes: byte array) =

@@ -14,8 +14,7 @@ type StorageSettings =
       UpdatedAtUtc: DateTimeOffset }
 
 type CacheEvictionCandidate =
-    { TrackFileId: Guid
-      CachePath: string
+    { CachePath: string
       SizeBytes: int64 }
 
 module StorageSettingsRepository =
@@ -115,14 +114,17 @@ RETURNING "Id", "S3CacheMaxBytes", "PresignTtlSeconds", "CreatedAtUtc", "Updated
                 })
             cancellationToken
 
-    [<Literal>]
-    let private cacheBytesSql = """SELECT COALESCE(SUM(COALESCE(tf."SizeBytes", 0)), 0)
-FROM "TrackFiles" AS tf
-WHERE tf."IsDeleted" = false
-  AND tf."IsCached" = true
-  AND tf."CachePath" IS NOT NULL AND btrim(tf."CachePath") <> ''
-  AND tf."CachePath" <> tf."StoragePath"
-  AND tf."StorageBackendId" IS NULL;"""
+    let private cacheBytesSql = """SELECT COALESCE(SUM(cache_path."SizeBytes"), 0)
+FROM (
+    SELECT MAX(COALESCE(tf."SizeBytes", 0)) AS "SizeBytes"
+    FROM "TrackFiles" AS tf
+    WHERE tf."IsDeleted" = false
+      AND tf."IsCached" = true
+      AND tf."CachePath" IS NOT NULL AND btrim(tf."CachePath") <> ''
+      AND tf."CachePath" <> tf."StoragePath"
+      AND tf."StorageBackendId" IS NULL
+    GROUP BY tf."CachePath"
+) AS cache_path;"""
 
     let totalS3CacheBytes (dataSource: NpgsqlDataSource) (cancellationToken: CancellationToken) : Task<Result<int64, RepositoryError>> =
         DatabaseSession.withTransactionResult
@@ -139,25 +141,41 @@ WHERE tf."IsDeleted" = false
                 })
             cancellationToken
 
-    [<Literal>]
-    let private evictionCandidatesSql = """SELECT tf."Id", tf."CachePath", COALESCE(tf."SizeBytes", 0)
-FROM "TrackFiles" AS tf
+    let private evictionCandidatesSql = """SELECT cached."CachePath", cached."SizeBytes"
+FROM (
+    SELECT
+        tf."CachePath",
+        MAX(COALESCE(tf."SizeBytes", 0)) AS "SizeBytes",
+        MAX(tf."UpdatedAtUtc") AS "LatestUpdatedAtUtc"
+    FROM "TrackFiles" AS tf
+    WHERE tf."IsDeleted" = false
+      AND tf."IsCached" = true
+      AND tf."CachePath" IS NOT NULL AND btrim(tf."CachePath") <> ''
+      AND tf."CachePath" <> tf."StoragePath"
+      AND tf."StorageBackendId" IS NULL
+    GROUP BY tf."CachePath"
+) AS cached
 LEFT JOIN LATERAL (
     SELECT MAX(pq."FinishedAtUtc") AS "LastPlayedAtUtc"
-    FROM "PlaybackQueue" AS pq
-    WHERE pq."TrackId" = tf."TrackId" AND pq."IsDeleted" = false AND pq."Status" = 'Played'
+    FROM "TrackFiles" AS linked
+    INNER JOIN "PlaybackQueue" AS pq
+        ON pq."TrackId" = linked."TrackId"
+       AND pq."IsDeleted" = false
+       AND pq."Status" = 'Played'
+    WHERE linked."IsDeleted" = false
+      AND linked."CachePath" = cached."CachePath"
 ) AS history ON true
-WHERE tf."IsDeleted" = false
-  AND tf."IsCached" = true
-  AND tf."CachePath" IS NOT NULL AND btrim(tf."CachePath") <> ''
-  AND tf."CachePath" <> tf."StoragePath"
-  AND tf."StorageBackendId" IS NULL
-  AND NOT EXISTS (
-      SELECT 1 FROM "PlaybackQueue" AS active
-      WHERE active."TrackId" = tf."TrackId" AND active."IsDeleted" = false
-        AND active."Status" IN ('Queued', 'Claimed', 'Playing')
-  )
-ORDER BY history."LastPlayedAtUtc" ASC NULLS FIRST, tf."UpdatedAtUtc" ASC, tf."Id" ASC;"""
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM "TrackFiles" AS linked
+    INNER JOIN "PlaybackQueue" AS active
+        ON active."TrackId" = linked."TrackId"
+       AND active."IsDeleted" = false
+       AND active."Status" IN ('Queued', 'Claimed', 'Playing')
+    WHERE linked."IsDeleted" = false
+      AND linked."CachePath" = cached."CachePath"
+)
+ORDER BY history."LastPlayedAtUtc" ASC NULLS FIRST, cached."LatestUpdatedAtUtc" ASC, cached."CachePath" ASC;"""
 
     let listEvictionCandidates (dataSource: NpgsqlDataSource) (cancellationToken: CancellationToken) : Task<Result<CacheEvictionCandidate list, RepositoryError>> =
         DatabaseSession.withTransactionResult
@@ -173,9 +191,8 @@ ORDER BY history."LastPlayedAtUtc" ASC NULLS FIRST, tf."UpdatedAtUtc" ASC, tf."I
                             let! found = reader.ReadAsync(token)
                             if found then
                                 values.Add
-                                    { TrackFileId = reader.GetGuid(0)
-                                      CachePath = reader.GetString(1)
-                                      SizeBytes = reader.GetInt64(2) }
+                                    { CachePath = reader.GetString(0)
+                                      SizeBytes = reader.GetInt64(1) }
                             else
                                 reading <- false
                         return Ok(List.ofSeq values)
@@ -185,7 +202,7 @@ ORDER BY history."LastPlayedAtUtc" ASC NULLS FIRST, tf."UpdatedAtUtc" ASC, tf."I
                 })
             cancellationToken
 
-    let markCacheEvicted (dataSource: NpgsqlDataSource) (trackFileId: Guid) (atUtc: DateTimeOffset) (cancellationToken: CancellationToken) : Task<Result<bool, RepositoryError>> =
+    let markCacheEvicted (dataSource: NpgsqlDataSource) (cachePath: string) (atUtc: DateTimeOffset) (cancellationToken: CancellationToken) : Task<Result<bool, RepositoryError>> =
         DatabaseSession.withTransactionResult
             dataSource
             (fun connection transaction token ->
@@ -195,14 +212,14 @@ ORDER BY history."LastPlayedAtUtc" ASC NULLS FIRST, tf."UpdatedAtUtc" ASC, tf."I
 SET "IsCached" = false,
     "CachePath" = NULL,
     "UpdatedAtUtc" = @AtUtc
-WHERE "Id" = @Id
+WHERE "CachePath" = @CachePath
   AND "IsDeleted" = false
   AND "CachePath" <> "StoragePath"
   AND "StorageBackendId" IS NULL;""", connection, transaction)
-                        command.Parameters.AddWithValue("Id", trackFileId) |> ignore
+                        command.Parameters.AddWithValue("CachePath", cachePath) |> ignore
                         command.Parameters.AddWithValue("AtUtc", atUtc) |> ignore
                         let! affected = command.ExecuteNonQueryAsync(token)
-                        return Ok(affected = 1)
+                        return Ok(affected > 0)
                     with
                     | :? OperationCanceledException as ex when token.IsCancellationRequested -> return raise ex
                     | ex -> return Error(databaseError "StorageSettingsRepository.markCacheEvicted" ex)

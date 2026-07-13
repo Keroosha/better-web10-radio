@@ -616,6 +616,8 @@ ORDER BY index_class.relname;""",
                           "TrackAssets", "TrackAssets_Kind_check"
                           "TrackAssets", "TrackAssets_Source_check"
                           "TrackFiles", "TrackFiles_SizeBytes_check"
+                          "TrackFiles", "CK_TrackFiles_CueSegment_AllOrNone"
+                          "TrackFiles", "CK_TrackFiles_CueSegment_Values"
                           "TrackLinks", "TrackLinks_Kind_check"
                           "TrackRequests", "TrackRequests_Status_check"
                           "Tracks", "Tracks_DurationMs_check"
@@ -631,8 +633,8 @@ ORDER BY index_class.relname;""",
                           "UX_TrackLinks_Active_TrackId_Url", "IsDeleted=false"
                           "IX_TrackFiles_Active_TrackId", "IsDeleted=false"
                           "IX_TrackFiles_Active_StorageBackendId", "IsDeleted=false"
-                          "UX_TrackFiles_Active_Backend_StoragePath", "IsDeleted=falseANDStorageBackendIdISNOTNULL"
-                          "UX_TrackFiles_Active_NullBackend_StoragePath", "IsDeleted=falseANDStorageBackendIdISNULL"
+                          "UX_TrackFiles_Active_Backend_StoragePath_Cue", "IsDeleted=falseANDStorageBackendIdISNOTNULL"
+                          "UX_TrackFiles_Active_NullBackend_StoragePath_Cue", "IsDeleted=falseANDStorageBackendIdISNULL"
                           "UX_Playlists_Active_Name", "IsDeleted=false"
                           "IX_PlaylistItems_Active_PlaylistId", "IsDeleted=false"
                           "IX_PlaylistSchedules_Active_PlaylistId", "IsDeleted=false"
@@ -829,7 +831,7 @@ VALUES ('00000000-0000-0000-0000-000000000302', '00000000-0000-0000-0000-0000000
 
                 Assert.That(
                     List.ofSeq versions,
-                    Is.EqualTo(([ 202607080001L; 202607100001L; 202607100002L; 202607100003L; 202607100004L; 202607110001L; 202607110002L; 202607110003L; 202607110004L; 202607120001L; 202607120002L; 202607120003L; 202607130001L; 202607130002L ] : int64 list) :> obj),
+                    Is.EqualTo(([ 202607080001L; 202607100001L; 202607100002L; 202607100003L; 202607100004L; 202607110001L; 202607110002L; 202607110003L; 202607110004L; 202607120001L; 202607120002L; 202607120003L; 202607130001L; 202607130002L; 202607130003L ] : int64 list) :> obj),
                     "A full down/up cycle must restore every migration in version order."
                 )
             })
@@ -1527,4 +1529,72 @@ VALUES (@Id, 'primary', @DesiredState, @RestartGeneration, false, @Timestamp, @T
                         "23505"
                         "A second active StreamNodeControlState singleton"
                         (fun () -> insertControlState (Guid.Parse("00000000-0000-0000-0000-000000000612")) "Running" 3)
+            })
+
+    [<Test>]
+    let ``FLAC CUE migration adds logical segment columns constraints and indexes`` () =
+        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
+            task {
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+                use columns =
+                    new NpgsqlCommand(
+                        """SELECT column_name FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'TrackFiles'
+  AND column_name IN ('CueSheetPath', 'CueTrackNumber', 'CueStartMs', 'CueDurationMs')
+ORDER BY column_name;""",
+                        connection
+                    )
+                use! reader = columns.ExecuteReaderAsync()
+                let names = ResizeArray<string>()
+                let mutable reading = true
+                while reading do
+                    let! found = reader.ReadAsync()
+                    if found then names.Add(reader.GetString(0)) else reading <- false
+                reader.Close()
+                Assert.That(names |> Set.ofSeq, Is.EqualTo<Set<string>>(Set.ofList [ "CueSheetPath"; "CueTrackNumber"; "CueStartMs"; "CueDurationMs" ]))
+                let cueTrack = Guid.NewGuid()
+                let cueFile = Guid.NewGuid()
+                use insertCue =
+                    new NpgsqlCommand(
+                        """INSERT INTO "Tracks" ("Id", "Title", "Artist", "MetadataSource", "IsDeleted")
+VALUES (@TrackId, 'cue', 'artist', 'Cue', false);
+INSERT INTO "TrackFiles" ("Id", "TrackId", "StoragePath", "ContentType", "IsCached", "CueSheetPath", "CueTrackNumber", "CueStartMs", "CueDurationMs", "IsDeleted")
+VALUES (@FileId, @TrackId, 'album.flac', 'audio/flac', false, 'album.cue', 1, 0, 1000, false);""",
+                        connection
+                    )
+                insertCue.Parameters.AddWithValue("TrackId", cueTrack) |> ignore
+                insertCue.Parameters.AddWithValue("FileId", cueFile) |> ignore
+                let! _ = insertCue.ExecuteNonQueryAsync()
+                use invalid =
+                    new NpgsqlCommand(
+                        """INSERT INTO "TrackFiles" ("Id", "TrackId", "StoragePath", "IsCached", "CueSheetPath", "CueTrackNumber", "CueStartMs", "CueDurationMs", "IsDeleted")
+VALUES (@FileId, @TrackId, 'invalid.flac', false, 'album.cue', 2, 1000, 0, false);""",
+                        connection
+                    )
+                invalid.Parameters.AddWithValue("FileId", Guid.NewGuid()) |> ignore
+                invalid.Parameters.AddWithValue("TrackId", cueTrack) |> ignore
+                let! violation =
+                    task {
+                        try
+                            let! _ = invalid.ExecuteNonQueryAsync()
+                            return None
+                        with :? PostgresException as error -> return Some error.SqlState
+                    }
+                Assert.That(violation, Is.EqualTo(Some "23514"))
+                use indexes =
+                    new NpgsqlCommand(
+                        """SELECT indexname FROM pg_indexes
+WHERE schemaname = 'public'
+  AND tablename = 'TrackFiles'
+  AND indexname IN ('UX_TrackFiles_Active_Backend_StoragePath_Cue', 'UX_TrackFiles_Active_NullBackend_StoragePath_Cue');""",
+                        connection
+                    )
+                use! indexReader = indexes.ExecuteReaderAsync()
+                let indexNames = ResizeArray<string>()
+                let mutable readingIndexes = true
+                while readingIndexes do
+                    let! found = indexReader.ReadAsync()
+                    if found then indexNames.Add(indexReader.GetString(0)) else readingIndexes <- false
+                Assert.That(indexNames, Has.Count.EqualTo(2))
             })

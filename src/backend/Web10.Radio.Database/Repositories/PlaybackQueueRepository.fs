@@ -59,7 +59,9 @@ type CurrentPlaybackAssignment =
       ContentType: string
       Title: string
       Artist: string
-      DurationMs: int }
+      DurationMs: int
+      CueStartMs: int option
+      CueDurationMs: int option }
 
 type UpcomingPlaybackAssignments =
     { Current: CurrentPlaybackAssignment option
@@ -165,13 +167,15 @@ LIMIT 1;"""
        COALESCE(tf."ContentType", 'audio/mpeg'),
        COALESCE(t."Title", ''),
        COALESCE(t."Artist", ''),
-       COALESCE(t."DurationMs", 0)
+       COALESCE(t."DurationMs", 0),
+       tf."CueStartMs",
+       tf."CueDurationMs"
 FROM "PlaybackQueue" AS q
 INNER JOIN "Tracks" AS t
     ON t."Id" = q."TrackId"
    AND t."IsDeleted" = false
 INNER JOIN LATERAL (
-    SELECT track_file."CachePath", track_file."ContentType"
+    SELECT track_file."CachePath", track_file."ContentType", track_file."CueStartMs", track_file."CueDurationMs"
     FROM "TrackFiles" AS track_file
     WHERE track_file."TrackId" = t."Id"
       AND track_file."IsDeleted" = false
@@ -221,13 +225,15 @@ LIMIT 1;"""
        COALESCE(tf."ContentType", 'audio/mpeg'),
        COALESCE(t."Title", ''),
        COALESCE(t."Artist", ''),
-       COALESCE(t."DurationMs", 0)
+       COALESCE(t."DurationMs", 0),
+       tf."CueStartMs",
+       tf."CueDurationMs"
 FROM "PlaybackQueue" AS q
 INNER JOIN "Tracks" AS t
     ON t."Id" = q."TrackId"
    AND t."IsDeleted" = false
 INNER JOIN LATERAL (
-    SELECT track_file."CachePath", track_file."ContentType"
+    SELECT track_file."CachePath", track_file."ContentType", track_file."CueStartMs", track_file."CueDurationMs"
     FROM "TrackFiles" AS track_file
     WHERE track_file."TrackId" = t."Id"
       AND track_file."IsDeleted" = false
@@ -600,7 +606,9 @@ WHERE "Id" = @QueueItemId
           ContentType = reader.GetString(5)
           Title = reader.GetString(6)
           Artist = reader.GetString(7)
-          DurationMs = reader.GetInt32(8) }
+          DurationMs = reader.GetInt32(8)
+          CueStartMs = if reader.IsDBNull(9) then None else Some(reader.GetInt32(9))
+          CueDurationMs = if reader.IsDBNull(10) then None else Some(reader.GetInt32(10)) }
 
     let claimNextDetailedInTransaction
         (connection: NpgsqlConnection)
@@ -748,7 +756,9 @@ WHERE "Id" = @QueueItemId
                                       ContentType = reader.GetString(6)
                                       Title = reader.GetString(7)
                                       Artist = reader.GetString(8)
-                                      DurationMs = reader.GetInt32(9) }
+                                      DurationMs = reader.GetInt32(9)
+                                      CueStartMs = if reader.IsDBNull(10) then None else Some(reader.GetInt32(10))
+                                      CueDurationMs = if reader.IsDBNull(11) then None else Some(reader.GetInt32(11)) }
                                 if status = "Playing" && Option.isNone current then current <- Some assignment
                                 elif status = "Claimed" && Option.isNone next then next <- Some assignment
                             else

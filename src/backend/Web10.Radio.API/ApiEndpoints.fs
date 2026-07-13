@@ -1652,7 +1652,9 @@ module ApiEndpoints =
           ContentType = assignment.ContentType
           Title = assignment.Title
           Artist = assignment.Artist
-          DurationMs = max 0 assignment.DurationMs }
+          DurationMs = max 0 assignment.DurationMs
+          CueStartMs = assignment.CueStartMs
+          CueDurationMs = assignment.CueDurationMs }
 
     let private currentPlaybackAssignment (context: HttpContext) =
         task {

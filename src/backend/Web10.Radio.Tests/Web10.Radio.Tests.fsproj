@@ -20,6 +20,7 @@
     <Compile Include="AuditRegressionTests.fs" />
     <Compile Include="OutboxEventRepositoryTests.fs" />
     <Compile Include="TelegramUpdateInboxRepositoryTests.fs" />
+    <Compile Include="CueSheetTests.fs" />
     <Compile Include="LibraryScanRepositoryTests.fs" />
     <Compile Include="PaymentRepositoryTests.fs" />
     <Compile Include="TelegramBotTests.fs" />

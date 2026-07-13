@@ -24,20 +24,35 @@ module HealthOperabilityTests =
 
     type private BucketProbe(result: Choice<unit, exn>) =
         interface IS3ObjectStorage with
-            member _.VisitPagesAsync(_, _, cancellationToken) =
+            member _.ListPageAsync(_, _, _, _, _, _, cancellationToken) =
+                cancellationToken.ThrowIfCancellationRequested()
+                Task.FromResult({ Objects = []; CommonPrefixes = []; NextContinuationToken = None })
+
+            member _.GetMetadataAsync(_, _, _, cancellationToken) =
+                cancellationToken.ThrowIfCancellationRequested()
+                Task.FromResult({ ContentLength = 0L; ContentType = None; LastModifiedUtc = None; ETag = None })
+
+            member _.OpenReadAsync(_, _, _, _, cancellationToken) =
+                cancellationToken.ThrowIfCancellationRequested()
+                Task.FromException<S3ReadHandle>(InvalidOperationException("not used"))
+
+            member _.UploadAsync(_, _, _, _, _, _, cancellationToken) =
                 cancellationToken.ThrowIfCancellationRequested()
                 Task.CompletedTask
 
-            member _.ProbeBucketAsync(_, cancellationToken) =
+            member _.DeleteManyAsync(_, _, _, cancellationToken) =
+                cancellationToken.ThrowIfCancellationRequested()
+                Task.FromResult([])
+
+            member _.ProbeBucketAsync(_, _, cancellationToken) =
                 task {
                     cancellationToken.ThrowIfCancellationRequested()
-
                     match result with
                     | Choice1Of2 () -> return ()
                     | Choice2Of2 error -> return raise error
                 }
 
-            member _.DownloadToFileAsync(_, _, _, cancellationToken) =
+            member _.DownloadToFileAsync(_, _, _, _, cancellationToken) =
                 cancellationToken.ThrowIfCancellationRequested()
                 Task.CompletedTask
 
@@ -48,7 +63,8 @@ module HealthOperabilityTests =
           S3Bucket = bucket
           S3Region = "us-east-1"
           S3ServiceUrl = None
-          S3ForcePathStyle = false }
+          S3ForcePathStyle = false
+          MaxUploadBytes = 536870912L }
 
     let private check (healthCheck: IHealthCheck) cancellationToken =
         healthCheck.CheckHealthAsync(Unchecked.defaultof<HealthCheckContext>, cancellationToken)

@@ -15,8 +15,14 @@ import { Popup } from '../../shared/ui/Popup';
 import { errorMessage } from '../../shared/lib/errorMessage';
 import { useToast } from '../../shared/ui/toast';
 import { COLORS, formGrid } from '../../shared/ui/tokens';
+import { StorageFileManager } from '../../features/storage-file-manager/StorageFileManager';
 
 type Backend = StorageAdditionalBackend;
+interface FileManagerTarget {
+  readonly storageBackendId: string | null;
+  readonly storageName: string;
+  readonly enabled: boolean;
+}
 
 function toReplaceItem(backend: Backend): StorageReplaceRequest['additionalBackends'][number] {
   return {
@@ -37,6 +43,7 @@ export function StoragePage(): ReactElement {
   const load = useCallback((): Promise<Storage> => getStorage(), [reloadKey]);
   const resource = useApiResource(load, reloadKey);
   const [deleteTarget, setDeleteTarget] = useState<Backend | null>(null);
+  const [fileManagerTarget, setFileManagerTarget] = useState<FileManagerTarget | null>(null);
   const [formOpen, setFormOpen] = useState(false);
 
   const persist = async (backends: Backend[], message: string): Promise<void> => {
@@ -64,8 +71,16 @@ export function StoragePage(): ReactElement {
   return (
     <div>
       <ResourceView resource={resource}>
-        {(storage) => (
-          <>
+        {(storage) =>
+          fileManagerTarget !== null ? (
+            <StorageFileManager
+              storageBackendId={fileManagerTarget.storageBackendId}
+              storageName={fileManagerTarget.storageName}
+              enabled={fileManagerTarget.enabled}
+              onBack={() => setFileManagerTarget(null)}
+            />
+          ) : (
+            <>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px', flexWrap: 'wrap', gap: '8px' }}>
               <p style={{ margin: 0, fontSize: '12px', color: COLORS.subtle, maxWidth: '60ch' }}>
                 Источники музыки. Хранилище по умолчанию задаётся окружением и не удаляется.
@@ -87,6 +102,7 @@ export function StoragePage(): ReactElement {
                 typeLabel={storage.defaultBackend.type === 'local' ? 'Локальное' : 'S3'}
                 path={storage.defaultBackend.localRoot ?? storage.defaultBackend.s3Bucket ?? ''}
                 enabled
+                onOpenFiles={() => setFileManagerTarget({ storageBackendId: null, storageName: 'Хранилище по умолчанию', enabled: true })}
               />
               {storage.additionalBackends.map((backend) => (
                 <StorageCard
@@ -97,6 +113,7 @@ export function StoragePage(): ReactElement {
                   typeLabel={backend.type === 'local' ? 'Локальное' : 'S3'}
                   path={backend.localRoot ?? backend.s3Bucket ?? ''}
                   enabled={backend.isEnabled}
+                  onOpenFiles={() => setFileManagerTarget({ storageBackendId: backend.id, storageName: backend.name, enabled: backend.isEnabled })}
                   onScan={() => scan(backend.id, backend.name)}
                   onToggle={() =>
                     void persist(
@@ -166,6 +183,7 @@ interface StorageCardProps {
   readonly path: string;
   readonly enabled: boolean;
   readonly onScan?: () => void;
+  readonly onOpenFiles?: () => void;
   readonly onToggle?: () => void;
   readonly onDelete?: () => void;
 }
@@ -186,6 +204,11 @@ function StorageCard(props: StorageCardProps): ReactElement {
         </div>
       </div>
       <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+        {props.onOpenFiles !== undefined ? (
+          <button type="button" onClick={props.onOpenFiles} style={{ minWidth: 0, padding: '3px 10px' }}>
+            Открыть файлы
+          </button>
+        ) : null}
         {props.onScan !== undefined ? (
           <button type="button" onClick={props.onScan} style={{ minWidth: 0, padding: '3px 10px' }}>
             ⟳ Сканировать

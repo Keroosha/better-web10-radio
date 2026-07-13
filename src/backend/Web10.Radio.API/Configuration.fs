@@ -3,6 +3,7 @@ namespace Web10.Radio.API
 open System
 open System.IO
 open System.Net
+open System.Globalization
 open System.Text.RegularExpressions
 open Microsoft.Extensions.Configuration
 open Npgsql
@@ -25,7 +26,8 @@ type StorageOptions =
       S3Bucket: string
       S3Region: string
       S3ServiceUrl: Uri option
-      S3ForcePathStyle: bool }
+      S3ForcePathStyle: bool
+      MaxUploadBytes: int64 }
 
 type AdminOptions =
     { Username: string
@@ -118,6 +120,16 @@ module Configuration =
         | Some _ ->
             errors.Add(sprintf "%s must be exactly true or false." envVar)
             false
+    let private parseMaxUploadBytes (errors: ResizeArray<string>) (value: string option) =
+        match value with
+        | None -> 536870912L
+        | Some raw ->
+            match Int64.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture) with
+            | true, parsed when parsed > 0L -> parsed
+            | _ ->
+                errors.Add("WEB10_STORAGE__MAX_UPLOAD_BYTES must be a positive Int64.")
+                536870912L
+
 
 
     let private validateConnectionString (errors: ResizeArray<string>) (value: string option) =
@@ -276,6 +288,7 @@ module Configuration =
 
         let requiredValue key = values[key]
         let connectionString = requiredValue "POSTGRES:CONNECTION_STRING"
+        let maxUploadBytes = parseMaxUploadBytes errors (readOptional configuration "STORAGE:MAX_UPLOAD_BYTES")
         let optionalValue key = readOptional configuration key
         let rtmpKey = requiredValue "STREAM:RTMP_KEY"
         let streamCallbackToken = requiredValue "STREAM:CALLBACK_TOKEN"
@@ -321,7 +334,8 @@ module Configuration =
                       S3Bucket = Option.defaultValue "" s3Bucket
                       S3Region = Option.defaultValue "" s3Region
                       S3ServiceUrl = s3ServiceUrl
-                      S3ForcePathStyle = forcePathStyle }
+                      S3ForcePathStyle = forcePathStyle
+                      MaxUploadBytes = maxUploadBytes }
                   Admin =
                     { Username = getRequired "ADMIN:USERNAME"
                       Password = getRequired "ADMIN:PASSWORD" }

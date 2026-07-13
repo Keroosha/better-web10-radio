@@ -30,6 +30,7 @@
     <Compile Include="AdminRepositoryTests.fs" />
     <Compile Include="BannerRepositoryTests.fs" />
     <Compile Include="StreamNodeContractTests.fs" />
+    <Compile Include="StorageContentTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

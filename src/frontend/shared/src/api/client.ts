@@ -122,6 +122,24 @@ export interface UploadRequest<TResponse> extends AdminRequestContext {
   readonly signal?: AbortSignal;
   readonly fetchImpl?: FetchImpl;
 }
+/** Authenticated request returning the raw response (for HEAD and bounded text reads). */
+export interface RawRequest extends AdminRequestContext {
+  readonly method?: string;
+  readonly headers?: Readonly<Record<string, string>>;
+  readonly signal?: AbortSignal;
+  readonly fetchImpl?: FetchImpl;
+}
+
+function createRawRequestInit(request: RawRequest): RequestInit {
+  const method = request.method ?? 'GET';
+  return {
+    method,
+    headers: { ...createHeaders(request, method, false), ...(request.headers ?? {}) },
+    ...(request.admin === true ? { credentials: 'include' as const } : {}),
+    ...(request.signal ? { signal: request.signal } : {}),
+  };
+}
+
  
 
 
@@ -212,6 +230,16 @@ export async function apiUpload<TResponse>(
     return throwForError(res, req);
   }
   return req.schema.parse(await res.json());
+}
+
+/** Perform an authenticated request and return its raw successful response. */
+export async function apiRawResponse(path: string, req: RawRequest = {}): Promise<Response> {
+  const doFetch = req.fetchImpl ?? fetch;
+  const res = await doFetch(`${apiBaseUrl}${path}`, createRawRequestInit(req));
+  if (!res.ok) {
+    return throwForError(res, req);
+  }
+  return res;
 }
 /** Perform a request that returns no body on success (such as `204`). */
 export async function apiSend<TBody extends object>(

@@ -31,6 +31,7 @@
     <Compile Include="Repositories\TelegramCommandRepository.fs" />
     <Compile Include="Repositories\StreamNodeHeartbeatRepository.fs" />
     <Compile Include="Repositories\PlaybackQueueRepository.fs" />
+    <Compile Include="Repositories\StorageContentRepository.fs" />
     <Compile Include="Composition.fs" />
   </ItemGroup>
 

@@ -1,6 +1,5 @@
 // Typed clients for every pinned `/api/v0/admin/*` contract.
 import { z } from 'zod';
-
 import {
   type BannersReplaceRequest,
   AdminSessionSchema,
@@ -38,6 +37,16 @@ import {
   type Storage,
   type StorageReplaceRequest,
   StorageSchema,
+  type StorageEntry,
+  type StorageEntryPage,
+  StorageEntrySchema,
+  StorageEntryPageSchema,
+  type StorageDeleteRequest,
+  type StorageDeleteConfirmRequest,
+  type StorageDeleteImpact,
+  StorageDeleteImpactSchema,
+  type StorageDeleteResult,
+  StorageDeleteResultSchema,
   type StreamNodeControl,
   StreamNodeControlSchema,
   type StreamNodeStatus,
@@ -433,6 +442,103 @@ export function replaceStorage(
   return apiFetch<Storage, StorageReplaceRequest>(`${API_V0_PREFIX}/admin/storage`, {
     schema: StorageSchema,
     method: 'PUT',
+    body,
+    admin: true,
+    ...opts,
+  });
+}
+
+export interface StorageEntriesQuery {
+  readonly storageBackendId?: string | null;
+  readonly path?: string;
+  readonly limit?: number;
+  readonly cursor?: string | null;
+}
+
+function storageQueryString(query: StorageEntriesQuery): string {
+  const params = new URLSearchParams();
+  if (query.storageBackendId !== undefined && query.storageBackendId !== null) {
+    params.set('storageBackendId', query.storageBackendId);
+  }
+  if (query.path !== undefined) {
+    params.set('path', query.path);
+  }
+  if (query.limit !== undefined) {
+    params.set('limit', String(query.limit));
+  }
+  if (query.cursor !== undefined && query.cursor !== null) {
+    params.set('cursor', query.cursor);
+  }
+  const encoded = params.toString();
+  return encoded === '' ? '' : `?${encoded}`;
+}
+
+export function getStorageEntries(
+  query: StorageEntriesQuery = {},
+  opts: RequestOptions = {},
+): Promise<StorageEntryPage> {
+  return apiFetch(`${API_V0_PREFIX}/admin/storage/files${storageQueryString(query)}`, {
+    schema: StorageEntryPageSchema,
+    admin: true,
+    ...opts,
+  });
+}
+
+export interface StorageContentQuery {
+  readonly storageBackendId?: string | null;
+  readonly path: string;
+  readonly download?: boolean;
+}
+
+export function storageContentUrl(query: StorageContentQuery): string {
+  const params = new URLSearchParams();
+  if (query.storageBackendId !== undefined && query.storageBackendId !== null) {
+    params.set('storageBackendId', query.storageBackendId);
+  }
+  params.set('path', query.path);
+  if (query.download === true) {
+    params.set('download', 'true');
+  }
+  return `${API_V0_PREFIX}/admin/storage/files/content?${params.toString()}`;
+}
+export function uploadStorageFile(
+  query: StorageContentQuery,
+  file: File,
+  opts: RequestOptions = {},
+): Promise<StorageEntry> {
+  const queryParams: StorageEntriesQuery = query.storageBackendId === undefined
+    ? { path: query.path }
+    : { storageBackendId: query.storageBackendId, path: query.path };
+  return apiUpload(`${API_V0_PREFIX}/admin/storage/files/content${storageQueryString(queryParams)}`, {
+    schema: StorageEntrySchema,
+    method: 'PUT',
+    body: file,
+    contentType: file.type === '' ? 'application/octet-stream' : file.type,
+    admin: true,
+    ...opts,
+  });
+}
+
+export function previewStorageDelete(
+  body: StorageDeleteRequest,
+  opts: RequestOptions = {},
+): Promise<StorageDeleteImpact> {
+  return apiFetch(`${API_V0_PREFIX}/admin/storage/files/delete-preview`, {
+    schema: StorageDeleteImpactSchema,
+    method: 'POST',
+    body,
+    admin: true,
+    ...opts,
+  });
+}
+
+export function deleteStorageEntries(
+  body: StorageDeleteConfirmRequest,
+  opts: RequestOptions = {},
+): Promise<StorageDeleteResult> {
+  return apiFetch(`${API_V0_PREFIX}/admin/storage/files`, {
+    schema: StorageDeleteResultSchema,
+    method: 'DELETE',
     body,
     admin: true,
     ...opts,

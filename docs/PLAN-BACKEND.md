@@ -48,7 +48,7 @@
 - [x] Implement local event dispatch where needed and move shared event envelopes, audience mapping, and relay contracts into `Web10.Radio.Application`.
 - [x] Persist audience-partitioned outbox events before restart-sensitive effects; API and Telegram relays claim only their own partition with owner/attempt fencing.
 - [x] Deduplicate Telegram updates using `TelegramUpdateInbox` before emitting domain events; `/request` and `/say` durable events create idempotent domain rows instead of no-op dispatch.
-- [x] Implement library scanner discovery for Local files and page-streamed S3 object metadata, renew the fenced scan lease per page, filter supported audio extensions, and emit `TrackDiscovered`; S3 discovery remains uncached until a separate cache path downloads the object.
+- [x] Implement library scanner discovery for Local files and page-streamed S3 object metadata, renew the fenced scan lease per page, filter supported audio extensions, download supported audio into `CacheRoot/audio`, extract metadata, persist `IsCached=true`, and emit `TrackDiscovered`.
 - [x] Implement playback program claim/start plus 30-second fenced lease renewal and authoritative `Played|Failed` completion callbacks; terminal state and `PlaybackEnded` append commit atomically, and stale attempts recover without blocking the queue.
 - [x] Implement cache path for tracks needed for streaming; cache misses are explicit `degraded` state, not silent fallback.
 
@@ -63,6 +63,8 @@
 - [x] Implement Telegram service `GET /api/v0/telegram/health` with monotonic last update/error state.
 - [x] Implement authenticated stream-node playback lease/completion callbacks with owner/attempt fencing and bounded bodies.
 - [x] Implement all admin routes listed in `SPEC.md`.
+- [x] Implement authenticated Storage File Manager list/read/HEAD/range/create-upload/delete-preview/confirm routes with exact RFC7807 storage errors, Local/S3 path safety, bounded streaming, CSRF, and no-overwrite semantics.
+- [x] Implement recursive impact aggregation and ordered detach/skip/track cleanup with impact-token fencing, per-backend operation coordination, and post-commit physical deletion.
 - [x] Add route-level logging fields: route, status, traceId, correlationId, elapsedMs.
 - [x] Add API integration tests for player state/SSE/range streaming, complete admin auth matrix, typed Telegram webhook dedupe and domain effects, stream-node callback fencing/body limits, health routes, and problem-details errors.
 
@@ -105,5 +107,7 @@
 - [x] Document backend Compose smoke commands, migration check, and Docker image policy.
 - [x] Add NUnit integration tests for database, API, Telegram, and stream-node contracts.
 - [x] Verify all apps can run in containers with required config.
+- [x] Verify isolated SeaweedFS 4.29 S3 smoke with visible Chrome: bucket init, authenticated uploads, recursive folder listing/delete, inline/range/download responses, scan terminal status, and physical cleanup; no MinIO image or request was used.
+- [x] Full backend verification: `dotnet test Web10.Radio.sln --no-restore` → 102 passed, 0 failed.
 - [x] Verify startup fails when required config keys are missing.
 - [x] Verify no application repository executes `DELETE` against domain tables.

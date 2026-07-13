@@ -243,6 +243,16 @@ module ApiEndpoints =
 
         services.AddSingleton<StreamOptions>(streamOptions) |> ignore
         services.AddSingleton<IPlayerEventsDelay, PlayerEventsDelay>() |> ignore
+        services.AddSingleton<StorageOperationCoordinator>() |> ignore
+        services.AddSingleton<StorageContentService>(fun provider ->
+            StorageContentService(
+                provider.GetRequiredService<StorageOptions>(),
+                provider.GetRequiredService<NpgsqlDataSource>(),
+                provider.GetRequiredService<IS3ObjectStorage>(),
+                provider.GetRequiredService<TimeProvider>(),
+                provider.GetRequiredService<StorageOperationCoordinator>()
+            ))
+        |> ignore
 
         services
             .AddAuthentication(AdminSessionAuthentication.SchemeName)
@@ -2249,6 +2259,249 @@ module ApiEndpoints =
                     return StatusCodes.Status400BadRequest
         }
 
+    let private storageError context error =
+        let status, code, title, message =
+            match error with
+            | StorageContentError.RequestInvalid -> 400, "storage.files.request_invalid", "Invalid storage files request", "The storage path or request body is invalid."
+            | StorageContentError.BackendNotFound -> 404, "storage.backend_not_found", "Storage backend not found", "The requested storage backend is unavailable."
+            | StorageContentError.FileNotFound -> 404, "storage.file_not_found", "Storage file not found", "The requested storage file does not exist."
+            | StorageContentError.FileExists -> 409, "storage.file_exists", "Storage file already exists", "The destination file already exists."
+            | StorageContentError.ImpactChanged -> 409, "storage.delete_impact_changed", "Storage delete impact changed", "The storage delete impact changed; preview it again."
+            | StorageContentError.UploadTooLarge -> 413, "storage.upload_too_large", "Storage upload too large", "The upload exceeds the configured storage limit."
+            | StorageContentError.RangeNotSatisfiable -> 416, "storage.range_not_satisfiable", "Range not satisfiable", "The requested byte range is invalid."
+            | StorageContentError.ReadFailed -> 502, "storage.read_failed", "Storage read failed", "The storage object could not be read."
+            | StorageContentError.UploadFailed -> 502, "storage.upload_failed", "Storage upload failed", "The storage object could not be uploaded."
+            | StorageContentError.DeleteFailed -> 502, "storage.delete_failed", "Storage delete failed", "The storage object could not be deleted."
+            | StorageContentError.RepositoryFailed -> 500, "repository.write_failed", "Repository write failed", "The requested change could not be persisted."
+        task {
+            do! writeDomainProblem context status code title message
+            return status
+        }
+
+    let private storageBackendQuery (context: HttpContext) =
+        let value = if context.Request.Query.ContainsKey("storageBackendId") then context.Request.Query["storageBackendId"].ToString() else ""
+        if String.IsNullOrWhiteSpace value then Some None
+        else tryPositiveGuid value |> Option.map Some
+
+    let private storagePathQuery (context: HttpContext) : string =
+        if context.Request.Query.ContainsKey("path") then context.Request.Query["path"].ToString() else String.Empty
+    let private storageDownloadRequested (context: HttpContext) =
+        match context.Request.Query.TryGetValue("download") with
+        | true, values ->
+            let value = values.ToString()
+            String.Equals(value, "true", StringComparison.OrdinalIgnoreCase)
+        | _ -> false
+
+    let private storageFileName (path: string) =
+        let candidate = Path.GetFileName(path)
+        let safe = if String.IsNullOrWhiteSpace candidate then "download" else candidate
+        safe.Replace("\r", String.Empty, StringComparison.Ordinal).Replace("\n", String.Empty, StringComparison.Ordinal)
+
+    let private storageInlineContentType (contentType: string) =
+        let value = contentType.ToLowerInvariant()
+        value.StartsWith("audio/", StringComparison.Ordinal)
+        || value.StartsWith("video/", StringComparison.Ordinal)
+        || value = "image/png"
+        || value = "image/jpeg"
+        || value = "image/gif"
+        || value = "image/webp"
+        || value = "text/plain"
+
+
+    let private storageEntryDto (entry: StorageContentEntry) : StorageEntryDto =
+        { Path = entry.Path; Name = entry.Name; Kind = entry.Kind; SizeBytes = entry.SizeBytes; LastModifiedUtc = entry.LastModifiedUtc |> Option.map ApiTime.toIsoUtc; ContentType = entry.ContentType }
+
+    let private storageList (context: HttpContext) =
+        task {
+            let backend = storageBackendQuery context
+            let path = storagePathQuery context
+            let limitValue = if context.Request.Query.ContainsKey("limit") then context.Request.Query["limit"].ToString() else "100"
+            let mutable parsedLimit = 0
+            let limit = if Int32.TryParse(limitValue, NumberStyles.None, CultureInfo.InvariantCulture, &parsedLimit) then parsedLimit else 0
+            let cursor = if context.Request.Query.ContainsKey("cursor") then Some(context.Request.Query["cursor"].ToString()) else None
+            match backend with
+            | None -> return! storageError context StorageContentError.RequestInvalid
+            | Some backend ->
+                let service = context.RequestServices.GetRequiredService<StorageContentService>()
+                let! result = service.ListAsync(backend, path, limit, cursor, context.RequestAborted)
+                match result with
+                | Error error -> return! storageError context error
+                | Ok page ->
+                    let dto : StorageEntryPageDto = { Path = page.Path; Items = page.Items |> List.map storageEntryDto; NextCursor = page.NextCursor }
+                    do! writeOk context dto
+                    return 200
+        }
+
+    let private storageContentRead (context: HttpContext) =
+        task {
+            match storageBackendQuery context with
+            | None -> return! storageError context StorageContentError.RequestInvalid
+            | Some backend ->
+                let path = storagePathQuery context
+                let range = if context.Request.Headers.ContainsKey("Range") then Some(context.Request.Headers["Range"].ToString()) else None
+                let service = context.RequestServices.GetRequiredService<StorageContentService>()
+                let! result = service.OpenReadAsync(backend, path, range, context.RequestAborted)
+                match result with
+                | Error error -> return! storageError context error
+                | Ok handle ->
+                    use handle = handle
+                    let contentType = handle.ContentType |> Option.defaultValue "application/octet-stream"
+                    context.Response.StatusCode <- if handle.ContentRange.IsSome then StatusCodes.Status206PartialContent else StatusCodes.Status200OK
+                    context.Response.ContentType <- contentType
+                    context.Response.Headers["X-Content-Type-Options"] <- "nosniff"
+                    context.Response.Headers["Accept-Ranges"] <- "bytes"
+                    handle.ContentRange |> Option.iter (fun value -> context.Response.Headers["Content-Range"] <- value)
+                    context.Response.ContentLength <- Nullable handle.ContentLength
+                    if storageDownloadRequested context || not (storageInlineContentType contentType) then
+                        let disposition: string = sprintf "attachment; filename=\"%s\"" (storageFileName path)
+                        context.Response.Headers["Content-Disposition"] <- StringValues(disposition)
+                    if not (HttpMethods.IsHead(context.Request.Method)) then
+                        do! handle.Stream.CopyToAsync(context.Response.Body, context.RequestAborted)
+                    return context.Response.StatusCode
+        }
+
+    let private storageContentHead (context: HttpContext) =
+        task {
+            let! status = storageContentRead context
+            return status
+        }
+
+    let private storageContentUpload (context: HttpContext) =
+        task {
+            match storageBackendQuery context with
+            | None -> return! storageError context StorageContentError.RequestInvalid
+            | Some backend ->
+                let service = context.RequestServices.GetRequiredService<StorageContentService>()
+                let path = storagePathQuery context
+                let contentType = if String.IsNullOrWhiteSpace(context.Request.ContentType) then None else Some(context.Request.ContentType.Split(';')[0])
+                let contentLength = if context.Request.ContentLength.HasValue then Some context.Request.ContentLength.Value else None
+                let! result = service.UploadAsync(backend, path, context.Request.Body, contentType, contentLength, context.RequestAborted)
+                match result with
+                | Error error -> return! storageError context error
+                | Ok entry ->
+                    do! ApiJson.write context 201 ApiJson.JsonContentType (storageEntryDto entry)
+                    return 201
+        }
+
+    let private parseStorageSelections (entries: StorageDeleteEntryDto list) =
+        if entries.IsEmpty || entries.Length > 100 then None
+        else
+            let parsed =
+                entries
+                |> List.map (fun entry ->
+                    match StoragePath.nonRoot entry.Path, entry.Kind with
+                    | Ok path, "file" -> Some { PhysicalPath = path; Kind = StorageSelectionKind.File }
+                    | Ok path, "folder" -> Some { PhysicalPath = path; Kind = StorageSelectionKind.Folder }
+                    | _ -> None)
+            if parsed |> List.exists Option.isNone then None
+            else
+                let values = parsed |> List.choose id
+                if values |> List.map (fun value -> value.PhysicalPath, value.Kind) |> Set.ofList |> Set.count <> values.Length then None else Some values
+
+    let private parseStorageDeleteBody requireImpact (root: JsonElement) =
+        let expected = if requireImpact then Set.ofList [ "storageBackendId"; "entries"; "impactToken" ] else Set.ofList [ "storageBackendId"; "entries" ]
+        if not (hasExactProperties expected root) then None
+        else
+            let backendId =
+                match tryProperty "storageBackendId" root with
+                | Some value when value.ValueKind = JsonValueKind.Null -> Some None
+                | Some value when value.ValueKind = JsonValueKind.String -> tryPositiveGuid (value.GetString()) |> Option.map Some
+                | _ -> None
+            let entries =
+                match tryProperty "entries" root with
+                | Some values when values.ValueKind = JsonValueKind.Array && values.GetArrayLength() >= 1 && values.GetArrayLength() <= 100 ->
+                    values.EnumerateArray()
+                    |> Seq.map (fun value ->
+                        if hasExactProperties (Set.ofList [ "path"; "kind" ]) value then
+                            match tryString "path" value, tryString "kind" value with
+                            | Some path, Some kind -> Some { Path = path; Kind = kind }
+                            | _ -> None
+                        else None)
+                    |> Seq.toList
+                | _ -> []
+            let token =
+                if requireImpact then
+                    tryString "impactToken" root |> Option.filter (fun value -> value.Length > 0 && value.Length <= 256)
+                else None
+            if backendId.IsSome && entries.Length >= 1 && entries |> List.forall Option.isSome && (not requireImpact || token.IsSome) then
+                Some(backendId.Value, entries |> List.choose id, token)
+            else None
+
+    let private storageImpactDto (report: StorageDeleteReport) =
+        let impact = report.Impact
+        let grouped : StoragePlaylistMembershipDto list =
+            impact.PlaylistMemberships
+            |> List.groupBy (fun item -> item.PlaylistId, item.PlaylistName)
+            |> List.map (fun ((id, name), items) -> { PlaylistId = id.ToString("D"); PlaylistName = name; TrackCount = items |> List.map _.TrackId |> List.distinct |> List.length })
+        let samples : StorageSampleTrackDto list =
+            impact.TracksToDelete
+            |> List.truncate 100
+            |> List.map (fun track ->
+                { TrackId = track.TrackId.ToString("D"); Title = track.Title; Artist = track.Artist; PlaylistNames = impact.PlaylistMemberships |> List.filter (fun item -> item.TrackId = track.TrackId) |> List.map _.PlaylistName |> List.distinct })
+        let current : StorageCurrentTrackDto option =
+            impact.CurrentPlayback
+            |> Option.bind (fun current -> impact.TracksToDelete |> List.tryFind (fun track -> track.TrackId = current.TrackId))
+            |> Option.map (fun track -> { TrackId = track.TrackId.ToString("D"); Title = track.Title; Artist = track.Artist })
+        let result : StorageDeleteImpactDto =
+            { FileCount = report.Descriptors |> List.filter (fun item -> item.Kind = StorageSelectionKind.File) |> List.length
+              FolderCount = report.Descriptors |> List.filter (fun item -> item.Kind = StorageSelectionKind.Folder) |> List.length
+              TotalBytes = report.Descriptors |> List.sumBy _.SizeBytes
+              TrackedFileCount = impact.TrackFiles.Length
+              TracksToDeleteCount = impact.TracksToDelete.Length
+              PlaylistMemberships = grouped
+              SampleTracks = samples
+              SampleTracksTruncated = impact.TracksToDelete.Length > samples.Length
+              CurrentTrack = current
+              ImpactToken = report.ImpactToken }
+        result
+
+    let private storageDeletePreview (context: HttpContext) =
+        task {
+            match! readJsonBody (128 * 1024) context with
+            | BodyTooLarge
+            | BodyInvalid -> return! storageError context StorageContentError.RequestInvalid
+            | BodyParsed root ->
+                match parseStorageDeleteBody false root with
+                | Some(backendId, entries, _) ->
+                    match parseStorageSelections entries with
+                    | None -> return! storageError context StorageContentError.RequestInvalid
+                    | Some selections ->
+                        let service = context.RequestServices.GetRequiredService<StorageContentService>()
+                        let! result = service.PreviewDeleteAsync(backendId, selections, context.RequestAborted)
+                        match result with
+                        | Error error -> return! storageError context error
+                        | Ok report ->
+                            do! writeOk context (storageImpactDto report)
+                            return 200
+                | None -> return! storageError context StorageContentError.RequestInvalid
+        }
+
+    let private storageDelete (context: HttpContext) =
+        task {
+            match! readJsonBody (128 * 1024) context with
+            | BodyTooLarge
+            | BodyInvalid -> return! storageError context StorageContentError.RequestInvalid
+            | BodyParsed root ->
+                match parseStorageDeleteBody true root with
+                | Some(backendId, entries, Some token) ->
+                    match parseStorageSelections entries with
+                    | None -> return! storageError context StorageContentError.RequestInvalid
+                    | Some selections ->
+                        let service = context.RequestServices.GetRequiredService<StorageContentService>()
+                        let! result = service.DeleteAsync(backendId, selections, token, context.RequestAborted)
+                        match result with
+                        | Error error -> return! storageError context error
+                        | Ok(report, mutation) ->
+                            let dto : StorageDeleteResultDto =
+                                { DeletedFileCount = report.Descriptors |> List.filter (fun item -> item.Kind = StorageSelectionKind.File) |> List.length
+                                  DeletedFolderCount = report.Descriptors |> List.filter (fun item -> item.Kind = StorageSelectionKind.Folder) |> List.length
+                                  DetachedPlaylistItemCount = mutation.DetachedPlaylistItemCount
+                                  DeletedTrackCount = mutation.DeletedTrackCount
+                                  PlaybackAdvanced = mutation.PlaybackAdvanced }
+                            do! writeOk context dto
+                            return 200
+                | _ -> return! storageError context StorageContentError.RequestInvalid
+        }
     let private defaultStorageDto (options: StorageOptions) =
         match options.Type with
         | Local -> { Type = "local"; LocalRoot = options.LocalRoot; S3Bucket = null; S3Region = null; S3ServiceUrl = null; S3ForcePathStyle = false }
@@ -2426,6 +2679,12 @@ module ApiEndpoints =
         map admin logger "PUT" "/playlists/{playlistId}/items" "/api/v0/admin/playlists/{playlistId}/items" (csrfProtected replacePlaylistItems)
         map admin logger "GET" "/storage" "/api/v0/admin/storage" adminStorage
         map admin logger "PUT" "/storage" "/api/v0/admin/storage" (csrfProtected adminStorageUpdate)
+        map admin logger "GET" "/storage/files" "/api/v0/admin/storage/files" storageList
+        map admin logger "GET" "/storage/files/content" "/api/v0/admin/storage/files/content" storageContentRead
+        map admin logger "HEAD" "/storage/files/content" "/api/v0/admin/storage/files/content" storageContentHead
+        map admin logger "PUT" "/storage/files/content" "/api/v0/admin/storage/files/content" (csrfProtected storageContentUpload)
+        map admin logger "POST" "/storage/files/delete-preview" "/api/v0/admin/storage/files/delete-preview" (csrfProtected storageDeletePreview)
+        map admin logger "DELETE" "/storage/files" "/api/v0/admin/storage/files" (csrfProtected storageDelete)
         map admin logger "GET" "/stream-node/status" "/api/v0/admin/stream-node/status" adminStreamStatus
         map admin logger "POST" "/stream-node/start" "/api/v0/admin/stream-node/start" (csrfProtected (adminStreamControl "start"))
         map admin logger "POST" "/stream-node/pause" "/api/v0/admin/stream-node/pause" (csrfProtected (adminStreamControl "pause"))

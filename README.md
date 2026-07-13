@@ -44,6 +44,7 @@ Admin routes используют session auth (не bearer): `WEB10_ADMIN__USER
 Telegram request/say prices обязательны и не имеют runtime defaults: `WEB10_TELEGRAM__REQUEST_PRICE_STARS` и `WEB10_TELEGRAM__SAY_PRICE_STARS` должны быть positive invariant `Int32`; `compose.yaml` задает smoke values `100` и `50`.
 
 Для Local storage задаются `WEB10_STORAGE__TYPE=Local` и `WEB10_STORAGE__LOCAL_ROOT`; для S3 задаются `WEB10_STORAGE__TYPE=S3`, bucket и region. Полный startup-validation contract и exact key literals находятся в `docs/SPEC.md` §9.
+- `WEB10_STORAGE__MAX_UPLOAD_BYTES` defaults to 512 MiB and is validated as a positive `Int64`; it bounds the streaming upload endpoint without buffering request bodies.
 ## Backend Compose smoke
 
 `compose.yaml` разворачивает PostgreSQL + migrator + API + `frontend` (nginx со stage на `/` и admin на `/admin/`, проксирует `/api`) + реальный F# `stream-node` + внутренний `rtmp-sink`. Это Development vertical-slice env (`WEB10_DEV__FIXTURES_ENABLED=true`): stream-node владеет Xvfb, kiosk Chromium, Liquidsoap, loopback callbacks и Unix command socket; Liquidsoap кодирует H.264/AAC FLV и публикует в Compose RTMP sink. Telegram service запускается отдельно и получает `/api/v0/telegram/*` через nginx. OTLP collector optional.
@@ -83,6 +84,25 @@ dotnet run --project src/stream-node/Web10.Radio.StreamNode.Tools/Web10.Radio.St
 `docker compose up --wait` ожидает health state всех сервисов. API liveness healthcheck использует managed self-probe `dotnet Web10.Radio.API.dll --health-check ...` в .NET chiseled image и не требует Alpine/libmusl, shell, `curl` или `wget` внутри API container. Smoke-config intentionally uses an invalid Telegram token, поэтому `/health/ready` может быть `503`, пока `/health/live` и Compose service health остаются зелёными.
 
 Ожидаемый migration tail: `202607110001`, `202607110002`, `202607110003`, `202607110004`. Для ручной cleanup вне smoke block: `docker compose down --volumes --remove-orphans`.
+## SeaweedFS S3 File Manager smoke
+
+Для изолированного S3 smoke используйте только `compose.s3-smoke.yaml`, не изменяя обычный Compose project и не подменяя SeaweedFS на MinIO:
+
+```sh
+docker compose -p web10-radio-s3-smoke -f compose.yaml -f compose.s3-smoke.yaml config --quiet
+WEB10_STREAM__RTMP_URL=rtmp://rtmp-sink:1935/s/ \
+WEB10_STREAM__RTMP_KEY=compose-smoke-rtmp-key \
+docker compose -p web10-radio-s3-smoke -f compose.yaml -f compose.s3-smoke.yaml up --build --wait --wait-timeout 180
+```
+
+The override pins `chrislusf/seaweedfs:4.29`, creates `web10-radio` with `seaweedfs-init`, configures path-style S3 at `http://seaweedfs:8333`, and uses `web10-smoke` / `web10-smoke-secret`. The API depends on successful bucket initialization. Use the configured visible Chrome DevTools MCP workflow at `http://localhost:8090/admin/` to upload files and `webkitdirectory` trees, scan once, browse/preview/download, verify `206` ranges, and confirm recursive delete impact before deletion. Finish with:
+
+```sh
+docker compose -p web10-radio-s3-smoke -f compose.yaml -f compose.s3-smoke.yaml down -v
+```
+
+Observed 2026-07-12/13: SeaweedFS bucket init, authenticated file and folder uploads, scan `completed`, text preview, `206 bytes 0-5/11`, attachment download, recursive folder preview/delete, and physical key cleanup passed in visible Chrome; no MinIO image or request appeared.
+
 
 ## Backend local checks
 
@@ -91,10 +111,10 @@ dotnet build src/backend/Web10.Radio.sln
 dotnet test src/backend/Web10.Radio.sln --no-restore
 ```
 
-Observed 2026-07-12 after the shared-kernel, metadata/artwork, playback-policy, Telegram split, and F# stream-node work:
+Observed 2026-07-13 after the storage File Manager, SeaweedFS smoke, metadata/artwork, playback-policy, Telegram split, and F# stream-node work:
 
-- `dotnet test src/backend/Web10.Radio.sln --no-restore` passed `88/88`, including 3 stream-node configuration/callback contract tests.
-- `bun run test` passed `175/175` (`shared` 80, `web-stage` 57, `admin` 38).
+- `dotnet test src/backend/Web10.Radio.sln --no-restore` passed `102/102` (0 failed).
+- `bun run test` passed `144/144` (`shared` 80, `web-stage` 60, `admin` 4).
 - `docker compose config --quiet` passed; `docker compose up --build --wait --wait-timeout 180` built and reached healthy PostgreSQL, Telegram, API, frontend, RTMP sink, and F# stream-node containers. The latest applied migration was `202607110004`.
 - `/health/live` returned `200 Healthy`; Telegram health returned configured adapter state; webhook smoke returned `204`.
 - F# stream-node tool controls `play-now`, `reorder`, and `skip` returned `status=passed` against the local Compose stack.

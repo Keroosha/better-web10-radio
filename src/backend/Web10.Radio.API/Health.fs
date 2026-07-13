@@ -88,7 +88,7 @@ type StorageHealthCheck(options: StorageOptions, s3: IS3ObjectStorage) =
                             return HealthCheckResult.Healthy("local storage create/write/delete succeeded")
                     | S3 ->
                         use timeout = ReadinessProbe.createTimeoutToken cancellationToken
-                        do! s3.ProbeBucketAsync(options.S3Bucket, timeout.Token)
+                        do! s3.ProbeBucketAsync(S3ClientScope.ConfiguredDefault, options.S3Bucket, timeout.Token)
                         cancellationToken.ThrowIfCancellationRequested()
                         return HealthCheckResult.Healthy("S3 authenticated bucket list probe succeeded")
                 with

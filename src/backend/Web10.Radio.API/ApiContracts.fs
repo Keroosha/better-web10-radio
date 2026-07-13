@@ -319,6 +319,67 @@ type AdminStorageDto =
     { DefaultBackend: DefaultStorageBackendDto
       AdditionalBackends: AdditionalStorageBackendDto list }
 
+type StorageEntryDto =
+    { Path: string
+      Name: string
+      Kind: string
+      SizeBytes: int64 option
+      LastModifiedUtc: string option
+      ContentType: string option }
+
+type StorageEntryPageDto =
+    { Path: string
+      Items: StorageEntryDto list
+      NextCursor: string option }
+
+type StorageDeleteEntryDto =
+    { Path: string
+      Kind: string }
+
+type StorageDeleteRequestDto =
+    { StorageBackendId: string option
+      Entries: StorageDeleteEntryDto list }
+
+type StorageDeleteConfirmRequestDto =
+    { StorageBackendId: string option
+      Entries: StorageDeleteEntryDto list
+      ImpactToken: string }
+
+type StoragePlaylistMembershipDto =
+    { PlaylistId: string
+      PlaylistName: string
+      TrackCount: int }
+
+type StorageSampleTrackDto =
+    { TrackId: string
+      Title: string
+      Artist: string
+      PlaylistNames: string list }
+
+type StorageCurrentTrackDto =
+    { TrackId: string
+      Title: string
+      Artist: string }
+
+type StorageDeleteImpactDto =
+    { FileCount: int
+      FolderCount: int
+      TotalBytes: int64
+      TrackedFileCount: int
+      TracksToDeleteCount: int
+      PlaylistMemberships: StoragePlaylistMembershipDto list
+      SampleTracks: StorageSampleTrackDto list
+      SampleTracksTruncated: bool
+      CurrentTrack: StorageCurrentTrackDto option
+      ImpactToken: string }
+
+type StorageDeleteResultDto =
+    { DeletedFileCount: int
+      DeletedFolderCount: int
+      DetachedPlaylistItemCount: int
+      DeletedTrackCount: int
+      PlaybackAdvanced: bool }
+
 type PaidVerticalSliceFixtureResponseDto =
     { DonationPaymentId: string
       SayPaymentId: string

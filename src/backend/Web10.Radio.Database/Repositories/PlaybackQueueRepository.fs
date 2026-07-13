@@ -995,6 +995,36 @@ WHERE "Id" = @QueueItemId AND "IsDeleted" = false AND "Status" = 'Queued';""", c
                 return! Error(databaseError "PlaybackQueueRepository.skipCurrentInTransaction" ex)
         }
 
+    let skipCurrentTrackInTransaction
+        (connection: NpgsqlConnection)
+        (transaction: NpgsqlTransaction)
+        (affectedTrackIds: Guid list)
+        (nowUtc: DateTimeOffset)
+        (cancellationToken: CancellationToken)
+        : Task<Result<PlaybackCommandApplied option, RepositoryError>> =
+        taskResult {
+            try
+                do! lockPlaybackControl connection transaction cancellationToken
+                let! current = loadCurrentFenceForUpdate connection transaction cancellationToken
+                match current with
+                | None -> return None
+                | Some fence ->
+                    use trackCommand = new NpgsqlCommand("SELECT \"TrackId\" FROM \"PlaybackQueue\" WHERE \"Id\" = @QueueItemId AND \"IsDeleted\" = false;", connection, transaction)
+                    trackCommand.Parameters.AddWithValue("QueueItemId", fence.QueueItemId) |> ignore
+                    let! value = trackCommand.ExecuteScalarAsync(cancellationToken)
+                    let currentTrackId = if isNull value || value = box DBNull.Value then None else Some(value :?> Guid)
+                    if currentTrackId |> Option.exists (fun id -> not (List.contains id affectedTrackIds)) then
+                        return None
+                    else
+                        let! changed = markSkippedByFence connection transaction fence nowUtc cancellationToken
+                        if changed <> 1 then return None
+                        else
+                            let! generation = insertControlCommand connection transaction "Skip" fence nowUtc cancellationToken
+                            return Some { Fence = fence; Generation = generation; Action = "Skip" }
+            with ex ->
+                return! Error(databaseError "PlaybackQueueRepository.skipCurrentTrackInTransaction" ex)
+        }
+
     let restartCurrentInTransaction
         (connection: NpgsqlConnection)
         (transaction: NpgsqlTransaction)

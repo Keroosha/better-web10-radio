@@ -155,6 +155,12 @@ WHERE "Id" = @StorageBackendId
 LIMIT 1;"""
 
     [<Literal>]
+    let private getStorageBackendForManagementSql = """SELECT "Id", "Name", "Type", "LocalRoot", "S3Bucket"
+FROM "StorageBackends"
+WHERE "Id" = @StorageBackendId
+  AND "IsDeleted" = false
+LIMIT 1;"""
+    [<Literal>]
     let private activeJobForStorageBackendSql = """SELECT
     "Id", "StorageBackendId", "Status", "DiscoveredCount", "RequestedAtUtc", "StartedAtUtc", "FinishedAtUtc", "FailureReason"
 FROM "LibraryScanJobs"
@@ -483,6 +489,26 @@ WHERE "Id" = @TrackId
                 return! Error(databaseError "LibraryScanRepository.getStorageBackend" ex)
         }
 
+    let getStorageBackendForManagement
+        (dataSource: NpgsqlDataSource)
+        (storageBackendId: Guid)
+        (cancellationToken: CancellationToken)
+        : Task<Result<StorageBackendRecord option, RepositoryError>> =
+        taskResult {
+            try
+                use! connection = dataSource.OpenConnectionAsync(cancellationToken)
+                use command = new NpgsqlCommand(getStorageBackendForManagementSql, connection)
+                command.Parameters.AddWithValue("StorageBackendId", storageBackendId) |> ignore
+                use! reader = command.ExecuteReaderAsync(cancellationToken)
+                let! hasRow = reader.ReadAsync(cancellationToken)
+                if hasRow then
+                    return Some { Id = Some(reader.GetGuid(0)); Name = reader.GetString(1); Type = reader.GetString(2); LocalRoot = readNullableString reader 3; S3Bucket = readNullableString reader 4 }
+                else
+                    return None
+            with ex ->
+                return! Error(databaseError "LibraryScanRepository.getStorageBackendForManagement" ex)
+        }
+
     let private tryReadActiveJobInTransaction
         (connection: NpgsqlConnection)
         (transaction: NpgsqlTransaction)
@@ -491,6 +517,7 @@ WHERE "Id" = @TrackId
         : Task<Result<LibraryScanJobStatusRecord option, RepositoryError>> =
         taskResult {
             try
+
                 use command = new NpgsqlCommand(activeJobForStorageBackendSql, connection, transaction)
                 addNullableUuid command "StorageBackendId" storageBackendId
                 let! reader = command.ExecuteReaderAsync(cancellationToken)

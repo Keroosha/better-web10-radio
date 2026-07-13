@@ -335,6 +335,90 @@ export const StorageReplaceRequestSchema = z.strictObject({
   additionalBackends: z.array(StorageAdditionalBackendReplaceSchema),
 });
 export type StorageReplaceRequest = z.infer<typeof StorageReplaceRequestSchema>;
+export const StorageEntryKindSchema = z.enum(['file', 'folder']);
+export type StorageEntryKind = z.infer<typeof StorageEntryKindSchema>;
+
+const StorageUuidSchema = z.string().uuid();
+const StorageTimestampSchema = z.string().datetime({ offset: true });
+
+export const StorageEntrySchema = z.strictObject({
+  path: z.string(),
+  name: z.string(),
+  kind: StorageEntryKindSchema,
+  sizeBytes: NonNegativeIntegerSchema.nullable(),
+  lastModifiedUtc: StorageTimestampSchema.nullable(),
+  contentType: z.string().nullable(),
+});
+export type StorageEntry = z.infer<typeof StorageEntrySchema>;
+
+export const StorageEntryPageSchema = z.strictObject({
+  path: z.string(),
+  items: z.array(StorageEntrySchema),
+  nextCursor: z.string().nullable(),
+});
+export type StorageEntryPage = z.infer<typeof StorageEntryPageSchema>;
+
+export const StorageDeleteSelectionSchema = z.strictObject({
+  path: z.string().min(1),
+  kind: StorageEntryKindSchema,
+});
+export type StorageDeleteSelection = z.infer<typeof StorageDeleteSelectionSchema>;
+
+export const StorageDeleteRequestSchema = z.strictObject({
+  storageBackendId: StorageUuidSchema.nullable(),
+  entries: z.array(StorageDeleteSelectionSchema).min(1).max(100),
+});
+export type StorageDeleteRequest = z.infer<typeof StorageDeleteRequestSchema>;
+
+export const StorageDeleteConfirmRequestSchema = StorageDeleteRequestSchema.extend({
+  impactToken: z.string().min(1),
+});
+export type StorageDeleteConfirmRequest = z.infer<typeof StorageDeleteConfirmRequestSchema>;
+
+export const StoragePlaylistMembershipSchema = z.strictObject({
+  playlistId: StorageUuidSchema,
+  playlistName: z.string(),
+  trackCount: NonNegativeIntegerSchema,
+});
+export type StoragePlaylistMembership = z.infer<typeof StoragePlaylistMembershipSchema>;
+
+export const StorageImpactTrackSchema = z.strictObject({
+  trackId: StorageUuidSchema,
+  title: z.string(),
+  artist: z.string(),
+  playlistNames: z.array(z.string()),
+});
+export type StorageImpactTrack = z.infer<typeof StorageImpactTrackSchema>;
+
+export const StorageCurrentTrackSchema = z.strictObject({
+  trackId: StorageUuidSchema,
+  title: z.string(),
+  artist: z.string(),
+});
+export type StorageCurrentTrack = z.infer<typeof StorageCurrentTrackSchema>;
+
+export const StorageDeleteImpactSchema = z.strictObject({
+  fileCount: NonNegativeIntegerSchema,
+  folderCount: NonNegativeIntegerSchema,
+  totalBytes: NonNegativeIntegerSchema,
+  trackedFileCount: NonNegativeIntegerSchema,
+  tracksToDeleteCount: NonNegativeIntegerSchema,
+  playlistMemberships: z.array(StoragePlaylistMembershipSchema),
+  sampleTracks: z.array(StorageImpactTrackSchema),
+  sampleTracksTruncated: z.boolean(),
+  currentTrack: StorageCurrentTrackSchema.nullable(),
+  impactToken: z.string().min(1),
+});
+export type StorageDeleteImpact = z.infer<typeof StorageDeleteImpactSchema>;
+
+export const StorageDeleteResultSchema = z.strictObject({
+  deletedFileCount: NonNegativeIntegerSchema,
+  deletedFolderCount: NonNegativeIntegerSchema,
+  detachedPlaylistItemCount: NonNegativeIntegerSchema,
+  deletedTrackCount: NonNegativeIntegerSchema,
+  playbackAdvanced: z.boolean(),
+});
+export type StorageDeleteResult = z.infer<typeof StorageDeleteResultSchema>;
 
 export const PlaybackCommandSchema = z.strictObject({
   generation: NonNegativeIntegerSchema,

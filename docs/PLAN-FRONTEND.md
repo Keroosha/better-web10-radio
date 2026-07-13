@@ -76,11 +76,13 @@
 - [x] Implement `/say` moderation queue with approve/reject actions. ✅ (2026-07-10) — `SayModerationPage` (status tabs + approve `{}` / reject `{reason}` 1–500 chars), backed by the pinned SPEC §5 contract and the real backend routes; `AdminSayMessageDto` + `getSayMessages`/`approveSayMessage`/`rejectSayMessage` in `shared`.
 - [x] Implement library scan trigger backed by `/api/v0/admin/library/scan`.
 - [x] Add auth guard placeholder that consumes backend admin auth result; do not invent OAuth/provider UX in this milestone.
+- [x] Add the Storage File Manager under `features/storage-file-manager`: typed folder/file listing, breadcrumbs, safe media/text previews, authenticated downloads, create-only streamed file and directory uploads, scan polling, recursive impact preview, CSRF confirmation, stale-token retry, abort cleanup, and empty/offline states.
+- [x] Verify Storage File Manager against SeaweedFS in visible Chrome DevTools: upload and folder-relative navigation, scan terminal `completed`, inline text/range read, attachment download, recursive folder preview/delete, and no-overwrite conflict.
 
 ### Phase F5 — Frontend verification and handoff (2026-07-10)
 
 - [x] Run strict TypeScript check for all frontend workspaces. — `bun run typecheck` → all three workspaces exit 0.
-- [x] Run frontend tests for API client fallback, SSE event handling, empty states, and formatter edge cases. — `bun run test` → 175 passing (shared 80, web-stage 57, admin 38), including playback controls, tracks metadata, playlist policies, and API clients.
+- [x] Run frontend tests for API client fallback, SSE event handling, empty states, and formatter edge cases. — `bun run test` → 144 passing (shared 80, web-stage 60, admin 4), including playback controls, stage cleanup, storage contracts, and API clients.
 - [ ] Run a visual/manual checklist for both themes and all three layouts. — **manual step remaining:** `bun run --filter web-stage dev`, then open `?overlayStyle=aero|win9x` × `?overlayLayout=corners|sidebar|bottombar` (dev QA params on `StagePage`).
 - [x] Verify authored source contains no `.js`, no `any`, and no `unknown`. — `bun run lint` clean (ESLint bans `TSAnyKeyword`/`TSUnknownKeyword`/`no-explicit-any`) + no `.js`/`.jsx` authored sources found.
 - [x] Verify scene unmount cleanup by mounting/unmounting the stage in a test harness or development page. — covered by `StageScene.test.tsx` ("unmounting disposes the scene exactly once" + StrictMode build/dispose parity).

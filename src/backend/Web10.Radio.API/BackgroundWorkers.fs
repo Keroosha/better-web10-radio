@@ -808,6 +808,11 @@ type LibraryScanHostedService
 
     let processS3Backend (job: LibraryScanJobRecord) (backend: StorageBackendRecord) bucketName cancellationToken =
         taskResult {
+            let scope =
+                match backend.Id with
+                | None -> S3ClientScope.ConfiguredDefault
+                | Some _ -> S3ClientScope.AwsDefaultChain
+
             let visitPage (items: System.Collections.Generic.IReadOnlyList<S3ObjectDescriptor>) (pageCancellationToken: CancellationToken) =
                 task {
                     let! pageResult =
@@ -823,7 +828,7 @@ type LibraryScanHostedService
                                     Directory.CreateDirectory(Path.GetDirectoryName(audioPath)) |> ignore
 
                                     try
-                                        do! s3ObjectStorage.DownloadToFileAsync(bucketName, item.Key, temporary, pageCancellationToken)
+                                        do! s3ObjectStorage.DownloadToFileAsync(scope, bucketName, item.Key, temporary, pageCancellationToken)
                                         File.Move(temporary, audioPath, true)
                                         let! existing = tryGetExistingTrackFile backend item.Key pageCancellationToken
                                         let emitMaterialized = existing |> Option.exists (fun value -> not value.IsCached)
@@ -853,7 +858,23 @@ type LibraryScanHostedService
                 }
                 :> Task
 
-            do! s3ObjectStorage.VisitPagesAsync(bucketName, visitPage, cancellationToken)
+            let mutable continuationToken: string option = None
+            let mutable hasMore = true
+            while hasMore do
+                let! page =
+                    s3ObjectStorage.ListPageAsync(
+                        scope,
+                        bucketName,
+                        "",
+                        None,
+                        1000,
+                        continuationToken,
+                        cancellationToken
+                    )
+                let objects = page.Objects |> List.toArray :> System.Collections.Generic.IReadOnlyList<S3ObjectDescriptor>
+                do! visitPage objects cancellationToken
+                continuationToken <- page.NextContinuationToken
+                hasMore <- continuationToken.IsSome
         }
 
 

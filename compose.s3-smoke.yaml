@@ -1,0 +1,72 @@
+services:
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.29
+    command:
+      - server
+      - -s3
+      - -dir=/data
+      - -s3.port=8333
+    environment:
+      AWS_ACCESS_KEY_ID: web10-smoke
+      AWS_SECRET_ACCESS_KEY: web10-smoke-secret
+    volumes:
+      - seaweedfs-s3-smoke-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "printf '%s\\n' 's3.bucket.list' | weed shell -master=127.0.0.1:9333"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+    restart: unless-stopped
+
+  seaweedfs-init:
+    image: chrislusf/seaweedfs:4.29
+    entrypoint:
+      - /bin/sh
+      - -ec
+    environment:
+      AWS_ACCESS_KEY_ID: web10-smoke
+      AWS_SECRET_ACCESS_KEY: web10-smoke-secret
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    command:
+      - |
+        attempts=0
+        while [ "$$attempts" -lt 60 ]; do
+          buckets="$$(printf '%s\n' 's3.bucket.list' | weed shell -master=seaweedfs:9333 2>/dev/null || true)"
+          if printf '%s\n' "$$buckets" | grep -Eq '(^|[[:space:]])web10-radio([[:space:]]|$$)'; then
+            exit 0
+          fi
+
+          if printf '%s\n' 's3.bucket.create -name=web10-radio' | weed shell -master=seaweedfs:9333 >/dev/null 2>&1; then
+            buckets="$$(printf '%s\n' 's3.bucket.list' | weed shell -master=seaweedfs:9333 2>/dev/null || true)"
+            if printf '%s\n' "$$buckets" | grep -Eq '(^|[[:space:]])web10-radio([[:space:]]|$$)'; then
+              exit 0
+            fi
+          fi
+
+          attempts=$$((attempts + 1))
+          sleep 1
+        done
+
+        printf '%s\n' 'SeaweedFS bucket web10-radio was not ready after 60 attempts.' >&2
+        exit 1
+    restart: "no"
+
+  api:
+    depends_on:
+      seaweedfs-init:
+        condition: service_completed_successfully
+    environment:
+      WEB10_STORAGE__TYPE: S3
+      WEB10_STORAGE__LOCAL_ROOT: ""
+      WEB10_STORAGE__S3_BUCKET: web10-radio
+      WEB10_STORAGE__S3_REGION: us-east-1
+      WEB10_STORAGE__S3_SERVICE_URL: http://seaweedfs:8333
+      WEB10_STORAGE__S3_FORCE_PATH_STYLE: "true"
+      AWS_ACCESS_KEY_ID: web10-smoke
+      AWS_SECRET_ACCESS_KEY: web10-smoke-secret
+
+volumes:
+  seaweedfs-s3-smoke-data:

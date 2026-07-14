@@ -529,7 +529,7 @@ function StorageExplorer({ initial }: { readonly initial: Storage }): ReactEleme
       });
       setDeleteDialog(null);
       clearSelection();
-      showToast(`Удалено файлов: ${result.deletedFileCount}`);
+      showToast(`Удалено файлов: ${result.deletedFileCount}, папок: ${result.deletedFolderCount}`);
       reload();
     } catch (cause) {
       const retryable =
@@ -912,7 +912,7 @@ function StorageExplorer({ initial }: { readonly initial: Storage }): ReactEleme
       {cacheOpen ? <CacheSettingsPopup onClose={() => setCacheOpen(false)} /> : null}
 
       {deleteDriveId !== null ? (
-        <Popup title="⚠ Удаление хранилища" warning width={420} onClose={() => setDeleteDriveId(null)}>
+        <Popup title="⚠ Удаление хранилища" width={420} onClose={() => setDeleteDriveId(null)}>
           <div className="has-space">
             <p style={{ marginTop: 0 }}>
               Удалить хранилище <strong>{drives.find((drive) => drive.driveKey === deleteDriveId)?.name ?? ''}</strong>?
@@ -1553,7 +1553,7 @@ interface DeleteImpactPopupProps {
 function DeleteImpactPopup({ dialog, deleting, onCancel, onConfirm }: DeleteImpactPopupProps): ReactElement {
   const { impact } = dialog;
   return (
-    <Popup title="⚠ Подтверждение удаления" warning width={560} onClose={onCancel}>
+    <Popup title="⚠ Подтверждение удаления" width={560} onClose={onCancel}>
       <div style={{ padding: '12px' }}>
         <p>
           Файлов: {impact.fileCount}, папок: {impact.folderCount}, размер: {formatBytes(impact.totalBytes)}.

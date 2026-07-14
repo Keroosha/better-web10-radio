@@ -1,7 +1,6 @@
 namespace Web10.Radio.API
 
 open System
-open System.Collections.Concurrent
 open System.Globalization
 open System.IO
 open System.Net
@@ -9,16 +8,12 @@ open System.Security.Cryptography
 open System.Text
 open System.Threading
 open System.Threading.Tasks
+open FsToolkit.ErrorHandling
 open Microsoft.AspNetCore.StaticFiles
 open Npgsql
 open Web10.Radio.Application
 open Web10.Radio.Database
 open Web10.Radio.Database.Repositories
-
-[<RequireQualifiedAccess>]
-type StorageBackendKey =
-    | Default
-    | Additional of Guid
 
 [<RequireQualifiedAccess>]
 type StorageContentError =
@@ -77,6 +72,9 @@ type StorageReadHandle(stream: Stream, contentLength: int64, contentType: string
     member _.ContentRange = contentRange
     interface IDisposable with member _.Dispose() = dispose()
 
+type private StoragePhysicalDeleteException() =
+    inherit Exception()
+
 [<RequireQualifiedAccess>]
 module StoragePath =
     let canonical (path: string) =
@@ -112,21 +110,6 @@ module StoragePath =
         let full = Path.GetFullPath(full)
         if full = root then "" else full.Substring(root.Length + 1).Replace(Path.DirectorySeparatorChar, '/')
 
-[<Sealed>]
-type private CoordinatorLease(semaphore: SemaphoreSlim) =
-    interface IAsyncDisposable with
-        member _.DisposeAsync() = semaphore.Release() |> ignore; ValueTask()
-
-[<Sealed>]
-type StorageOperationCoordinator() =
-    let semaphores = ConcurrentDictionary<StorageBackendKey, SemaphoreSlim>()
-    member _.AcquireAsync(key: StorageBackendKey, cancellationToken: CancellationToken) : ValueTask<IAsyncDisposable> =
-        let semaphore = semaphores.GetOrAdd(key, fun _ -> new SemaphoreSlim(1, 1))
-        let waitTask = task {
-            do! semaphore.WaitAsync(cancellationToken)
-            return (CoordinatorLease(semaphore) :> IAsyncDisposable)
-        }
-        ValueTask<IAsyncDisposable>(waitTask)
 
 [<Sealed>]
 type private LimitedStream(inner: FileStream, start: int64, length: int64) =
@@ -446,57 +429,154 @@ type StorageContentService(options: StorageOptions, dataSource: NpgsqlDataSource
                         | _ -> return Error StorageContentError.UploadFailed
         }
 
-    member private _.EnumerateDescriptors(backend: StorageContentBackend, selections: StorageSelection list, cancellationToken: CancellationToken) : Task<StoragePhysicalDescriptor list> =
-        task {
-            match backend.Type with
-            | Local ->
-                let result = ResizeArray<StoragePhysicalDescriptor>()
-                let rec visit full =
-                    task {
-                        if File.Exists full then
-                            let info = FileInfo(full)
-                            result.Add({ Path = StoragePath.wireFromLocal backend.LocalRoot.Value full; Kind = StorageSelectionKind.File; SizeBytes = info.Length; LastModifiedUtc = Some(DateTimeOffset(info.LastWriteTimeUtc)); ETag = None })
-                        elif Directory.Exists full then
-                            if full <> backend.LocalRoot.Value then
-                                let info = DirectoryInfo(full)
-                                result.Add({ Path = StoragePath.wireFromLocal backend.LocalRoot.Value full; Kind = StorageSelectionKind.Folder; SizeBytes = 0L; LastModifiedUtc = Some(DateTimeOffset(info.LastWriteTimeUtc)); ETag = None })
-                            for child in Directory.EnumerateFileSystemEntries(full) do
-                                if (File.GetAttributes(child) &&& FileAttributes.ReparsePoint) = FileAttributes.Normal then
-                                    do! visit child
-                    }
-                for selection in selections do
-                    match StoragePath.localAbsolute backend.LocalRoot.Value selection.PhysicalPath with
-                    | Ok path -> do! visit path
-                    | Error () -> ()
+    member private _.EnumerateDescriptors
+        (backend: StorageContentBackend, selections: StorageSelection list, cancellationToken: CancellationToken)
+        : Task<Result<StoragePhysicalDescriptor list, StorageContentError>> =
+        taskResult {
+            let result = ResizeArray<StoragePhysicalDescriptor>()
+
+            try
+                match backend.Type with
+                | Local ->
+                    let localRoot = backend.LocalRoot.Value
+
+                    let rec visit (full: string) (isSelection: bool) : Task<Result<unit, StorageContentError>> =
+                        taskResult {
+                            try
+                                let attributes = File.GetAttributes(full)
+
+                                if (attributes &&& FileAttributes.ReparsePoint) = FileAttributes.ReparsePoint then
+                                    return ()
+                                elif (attributes &&& FileAttributes.Directory) = FileAttributes.Directory then
+                                    if full <> localRoot then
+                                        let info = DirectoryInfo(full)
+                                        result.Add({ Path = StoragePath.wireFromLocal localRoot full; Kind = StorageSelectionKind.Folder; SizeBytes = 0L; LastModifiedUtc = Some(DateTimeOffset(info.LastWriteTimeUtc)); ETag = None })
+
+                                    for child in Directory.EnumerateFileSystemEntries(full) do
+                                        do! visit child false
+
+                                    return ()
+                                else
+                                    let info = FileInfo(full)
+                                    result.Add({ Path = StoragePath.wireFromLocal localRoot full; Kind = StorageSelectionKind.File; SizeBytes = info.Length; LastModifiedUtc = Some(DateTimeOffset(info.LastWriteTimeUtc)); ETag = None })
+                                    return ()
+                            with
+                            | :? FileNotFoundException when isSelection -> return ()
+                            | :? DirectoryNotFoundException when isSelection -> return ()
+                            | :? OperationCanceledException as error when cancellationToken.IsCancellationRequested -> return raise error
+                            | _ -> return! Error StorageContentError.ReadFailed
+                        }
+
+                    for selection in selections do
+                        let! path =
+                            StoragePath.localAbsolute localRoot selection.PhysicalPath
+                            |> Result.mapError (fun _ -> StorageContentError.ReadFailed)
+                        do! visit path true
+                | S3 ->
+                    let addMetadata path kind =
+                        taskResult {
+                            try
+                                let! metadata = s3.GetMetadataAsync(backend.Scope, backend.S3Bucket.Value, path, cancellationToken)
+                                result.Add({ Path = path; Kind = kind; SizeBytes = metadata.ContentLength; LastModifiedUtc = metadata.LastModifiedUtc; ETag = metadata.ETag })
+                                return ()
+                            with
+                            | :? Amazon.S3.AmazonS3Exception as error when error.StatusCode = HttpStatusCode.NotFound -> return ()
+                            | :? OperationCanceledException as error when cancellationToken.IsCancellationRequested -> return raise error
+                            | _ -> return! Error StorageContentError.ReadFailed
+                        }
+
+                    let rec listPrefix (prefix: string) (token: string option) : Task<Result<unit, StorageContentError>> =
+                        taskResult {
+                            try
+                                let! page = s3.ListPageAsync(backend.Scope, backend.S3Bucket.Value, prefix, None, 1000, token, cancellationToken)
+
+                                for item in page.Objects do
+                                    let kind = if S3KeyValidation.isFolderMarker item.Key then StorageSelectionKind.Folder else StorageSelectionKind.File
+                                    result.Add({ Path = item.Key; Kind = kind; SizeBytes = item.SizeBytes; LastModifiedUtc = item.LastModifiedUtc; ETag = item.ETag })
+
+                                match page.NextContinuationToken with
+                                | Some next -> return! listPrefix prefix (Some next)
+                                | None -> return ()
+                            with
+                            | :? OperationCanceledException as error when cancellationToken.IsCancellationRequested -> return raise error
+                            | _ -> return! Error StorageContentError.ReadFailed
+                        }
+
+                    for selection in selections do
+                        match selection.Kind with
+                        | StorageSelectionKind.File ->
+                            do! addMetadata selection.PhysicalPath StorageSelectionKind.File
+                        | StorageSelectionKind.Folder ->
+                            let markerPath = selection.PhysicalPath + "/"
+                            do! addMetadata markerPath StorageSelectionKind.Folder
+                            do! listPrefix markerPath None
+
                 return result |> Seq.distinctBy (fun value -> value.Path, value.Kind) |> Seq.toList
-            | S3 ->
-                let result = ResizeArray<StoragePhysicalDescriptor>()
-                let rec listPrefix prefix token =
-                    task {
-                        let! page = s3.ListPageAsync(backend.Scope, backend.S3Bucket.Value, prefix, None, 1000, token, cancellationToken)
-                        for item in page.Objects do
-                            let kind = if S3KeyValidation.isFolderMarker item.Key then StorageSelectionKind.Folder else StorageSelectionKind.File
-                            let descriptor : StoragePhysicalDescriptor = { Path = item.Key; Kind = kind; SizeBytes = item.SizeBytes; LastModifiedUtc = item.LastModifiedUtc; ETag = item.ETag }
-                            result.Add(descriptor)
-                        match page.NextContinuationToken with
-                        | Some next -> return! listPrefix prefix (Some next)
-                        | None -> return ()
-                    }
-                for selection in selections do
-                    match selection.Kind with
-                    | StorageSelectionKind.File ->
-                        try
-                            let! metadata = s3.GetMetadataAsync(backend.Scope, backend.S3Bucket.Value, selection.PhysicalPath, cancellationToken)
-                            result.Add({ Path = selection.PhysicalPath; Kind = StorageSelectionKind.File; SizeBytes = metadata.ContentLength; LastModifiedUtc = metadata.LastModifiedUtc; ETag = metadata.ETag })
-                        with _ -> ()
-                    | StorageSelectionKind.Folder ->
-                        let markerPath = selection.PhysicalPath + "/"
-                        try
-                            let! metadata = s3.GetMetadataAsync(backend.Scope, backend.S3Bucket.Value, markerPath, cancellationToken)
-                            result.Add({ Path = markerPath; Kind = StorageSelectionKind.Folder; SizeBytes = metadata.ContentLength; LastModifiedUtc = metadata.LastModifiedUtc; ETag = metadata.ETag })
-                        with _ -> ()
-                        do! listPrefix markerPath None
-                return result |> Seq.distinctBy (fun value -> value.Path, value.Kind) |> Seq.toList
+            with
+            | :? OperationCanceledException as error when cancellationToken.IsCancellationRequested -> return raise error
+            | _ -> return! Error StorageContentError.ReadFailed
+        }
+
+    member private _.DeleteDescriptors
+        (backend: StorageContentBackend, descriptors: StoragePhysicalDescriptor list, cancellationToken: CancellationToken)
+        : Task<Result<unit, StorageContentError>> =
+        taskResult {
+            try
+                match backend.Type with
+                | Local ->
+                    let ordered =
+                        descriptors
+                        |> List.sortBy (fun descriptor ->
+                            (if descriptor.Kind = StorageSelectionKind.File then 0 else 1),
+                            -descriptor.Path.Length)
+
+                    for descriptor in ordered do
+                        let! path =
+                            StoragePath.localAbsolute backend.LocalRoot.Value descriptor.Path
+                            |> Result.mapError (fun _ -> StorageContentError.DeleteFailed)
+
+                        match descriptor.Kind with
+                        | StorageSelectionKind.File ->
+                            if not (File.Exists(path)) then
+                                return! Error StorageContentError.DeleteFailed
+                            File.Delete(path)
+                        | StorageSelectionKind.Folder ->
+                            if not (Directory.Exists(path)) then
+                                return! Error StorageContentError.DeleteFailed
+                            Directory.Delete(path, false)
+                | S3 ->
+                    let rec deleteBatches batches : Task<Result<unit, StorageContentError>> =
+                        taskResult {
+                            match batches with
+                            | [] -> return ()
+                            | batch :: remaining ->
+                                try
+                                    let! failures =
+                                        s3.DeleteManyAsync(
+                                            backend.Scope,
+                                            backend.S3Bucket.Value,
+                                            batch |> List.map (fun value -> value.Path, value.ETag |> Option.defaultValue ""),
+                                            cancellationToken
+                                        )
+
+                                    if failures.IsEmpty then
+                                        return! deleteBatches remaining
+                                    else
+                                        return! Error StorageContentError.DeleteFailed
+                                with
+                                | :? OperationCanceledException as error when cancellationToken.IsCancellationRequested -> return raise error
+                                | _ -> return! Error StorageContentError.DeleteFailed
+                        }
+
+                    let files = descriptors |> List.filter (fun value -> value.Kind <> StorageSelectionKind.Folder) |> List.chunkBySize 1000
+                    let markers = descriptors |> List.filter (fun value -> value.Kind = StorageSelectionKind.Folder) |> List.chunkBySize 1000
+                    do! deleteBatches files
+                    do! deleteBatches markers
+
+                return ()
+            with
+            | :? OperationCanceledException as error when cancellationToken.IsCancellationRequested -> return raise error
+            | _ -> return! Error StorageContentError.DeleteFailed
         }
 
     member private _.ComputeToken(backend: StorageContentBackend, selections: StorageSelection list, descriptors: StoragePhysicalDescriptor list, impact: StorageImpactRecord) =
@@ -515,74 +595,90 @@ type StorageContentService(options: StorageOptions, dataSource: NpgsqlDataSource
             match resolved with
             | Error error -> return Error error
             | Ok backend ->
-                let! descriptors = this.EnumerateDescriptors(backend, selections, cancellationToken)
-                let! impactResult = DatabaseSession.withTransactionResult dataSource (fun connection transaction token -> StorageContentRepository.loadImpactInTransaction connection transaction backend.Id selections token) cancellationToken
-                match impactResult with
-                | Error _ -> return Error StorageContentError.RepositoryFailed
-                | Ok impact -> return Ok { Impact = impact; Descriptors = descriptors; ImpactToken = this.ComputeToken(backend, selections, descriptors, impact) }
+                let! descriptorResult = this.EnumerateDescriptors(backend, selections, cancellationToken)
+
+                match descriptorResult with
+                | Error error -> return Error error
+                | Ok descriptors ->
+                    let! impactResult = DatabaseSession.withTransactionResult dataSource (fun connection transaction token -> StorageContentRepository.loadImpactInTransaction connection transaction backend.Id selections token) cancellationToken
+
+                    match impactResult with
+                    | Error _ -> return Error StorageContentError.RepositoryFailed
+                    | Ok impact -> return Ok { Impact = impact; Descriptors = descriptors; ImpactToken = this.ComputeToken(backend, selections, descriptors, impact) }
         }
 
     member this.DeleteAsync(backendId: Guid option, selections: StorageSelection list, expectedToken: string, cancellationToken: CancellationToken) : Task<Result<StorageDeleteReport * StorageDeleteMutation, StorageContentError>> =
         task {
             let! resolved = resolveBackend backendId cancellationToken
+
             match resolved with
             | Error error -> return Error error
             | Ok backend ->
                 let! lease = coordinator.AcquireAsync(backend.Key, cancellationToken)
                 use lease = lease
-                let! descriptors = this.EnumerateDescriptors(backend, selections, cancellationToken)
-                let! result =
-                    DatabaseSession.withTransactionResult
-                        dataSource
-                        (fun connection transaction token ->
-                            task {
-                                let! impactResult = StorageContentRepository.loadImpactInTransaction connection transaction backend.Id selections token
-                                match impactResult with
-                                | Error error -> return Error error
-                                | Ok impact ->
-                                    let tokenValue = this.ComputeToken(backend, selections, descriptors, impact)
-                                    if tokenValue <> expectedToken then
-                                        return Error(RepositoryError.DatabaseError("StorageContentRepository.impact", "impact changed"))
-                                    else
-                                        let append connection transaction command token =
-                                            let payload = System.Text.Json.JsonSerializer.Serialize({| queueItemId = command.Fence.QueueItemId.ToString("D"); claimOwner = command.Fence.ClaimOwner.ToString("D"); claimAttempt = command.Fence.ClaimAttempt; commandGeneration = command.Generation |}, DomainJson.options)
-                                            match DomainEventEnvelope.create clock DomainEventType.PlaybackSkipped "Web10.Radio.API.Admin" None None payload with
-                                            | Error _ -> Task.FromResult(Error(RepositoryError.DatabaseError("StorageContentRepository.delete", "invalid event")))
-                                            | Ok envelope -> OutboxEventRepository.appendInTransaction connection transaction (OutboxMapping.toOutboxEvent envelope) token
-                                        let! mutation = StorageContentRepository.applyDeletionInTransaction connection transaction impact (clock.GetUtcNow()) PlaybackQueueRepository.skipCurrentTrackInTransaction append token
-                                        return mutation |> Result.map (fun value -> impact, value)
-                            })
-                        cancellationToken
-                match result with
-                | Error(DatabaseError(_, message)) when message = "impact changed" -> return Error StorageContentError.ImpactChanged
-                | Error _ -> return Error StorageContentError.RepositoryFailed
-                | Ok(impact, mutation) ->
-                        match backend.Type with
-                        | Local ->
-                            for descriptor in descriptors |> List.sortByDescending _.Path.Length do
-                                match StoragePath.localAbsolute backend.LocalRoot.Value descriptor.Path with
-                                | Ok path when descriptor.Kind = StorageSelectionKind.File && File.Exists path -> File.Delete path
-                                | Ok path when descriptor.Kind = StorageSelectionKind.Folder && Directory.Exists path ->
-                                    try Directory.Delete(path, false) with _ -> ()
-                                | _ -> ()
-                            return Ok({ Impact = impact; Descriptors = descriptors; ImpactToken = expectedToken }, mutation)
-                        | S3 ->
-                            let deleteDescriptors values =
-                                let rec deleteBatches batches =
+                let! descriptorResult = this.EnumerateDescriptors(backend, selections, cancellationToken)
+
+                match descriptorResult with
+                | Error error -> return Error error
+                | Ok descriptors ->
+                    try
+                        let! result =
+                            DatabaseSession.withTransactionResult
+                                dataSource
+                                (fun connection transaction token ->
                                     task {
-                                        match batches with
-                                        | [] -> return true
-                                        | batch :: rest ->
-                                            let! failures = s3.DeleteManyAsync(backend.Scope, backend.S3Bucket.Value, batch |> List.map (fun value -> value.Path, value.ETag |> Option.defaultValue ""), cancellationToken)
-                                            if not failures.IsEmpty then return false
-                                            else return! deleteBatches rest
-                                    }
-                                deleteBatches (values |> List.chunkBySize 1000)
-                            let fileDescriptors = descriptors |> List.filter (fun value -> value.Kind <> StorageSelectionKind.Folder)
-                            let markerDescriptors = descriptors |> List.filter (fun value -> value.Kind = StorageSelectionKind.Folder)
-                            let! filesDeleted = deleteDescriptors fileDescriptors
-                            let! markersDeleted = if filesDeleted then deleteDescriptors markerDescriptors else Task.FromResult false
-                            let deleted = filesDeleted && markersDeleted
-                            if not deleted then return Error StorageContentError.DeleteFailed
-                            else return Ok({ Impact = impact; Descriptors = descriptors; ImpactToken = expectedToken }, mutation)
+                                        let! impactResult = StorageContentRepository.loadImpactInTransaction connection transaction backend.Id selections token
+
+                                        match impactResult with
+                                        | Error error -> return Error error
+                                        | Ok impact ->
+                                            let tokenValue = this.ComputeToken(backend, selections, descriptors, impact)
+
+                                            if tokenValue <> expectedToken then
+                                                return Error(RepositoryError.DatabaseError("StorageContentRepository.impact", "impact changed"))
+                                            else
+                                                let append connection transaction command token =
+                                                    let payload =
+                                                        System.Text.Json.JsonSerializer.Serialize(
+                                                            {| queueItemId = command.Fence.QueueItemId.ToString("D")
+                                                               claimOwner = command.Fence.ClaimOwner.ToString("D")
+                                                               claimAttempt = command.Fence.ClaimAttempt
+                                                               commandGeneration = command.Generation |},
+                                                            DomainJson.options
+                                                        )
+
+                                                    match DomainEventEnvelope.create clock DomainEventType.PlaybackSkipped "Web10.Radio.API.Admin" None None payload with
+                                                    | Error _ -> Task.FromResult(Error(RepositoryError.DatabaseError("StorageContentRepository.delete", "invalid event")))
+                                                    | Ok envelope -> OutboxEventRepository.appendInTransaction connection transaction (OutboxMapping.toOutboxEvent envelope) token
+
+                                                let! mutationResult =
+                                                    StorageContentRepository.applyDeletionInTransaction
+                                                        connection
+                                                        transaction
+                                                        impact
+                                                        (clock.GetUtcNow())
+                                                        PlaybackQueueRepository.skipCurrentTrackInTransaction
+                                                        append
+                                                        token
+
+                                                match mutationResult with
+                                                | Error error -> return Error error
+                                                | Ok mutation ->
+                                                    let! physicalDeleteResult = this.DeleteDescriptors(backend, descriptors, token)
+
+                                                    match physicalDeleteResult with
+                                                    | Error _ -> return raise (StoragePhysicalDeleteException())
+                                                    | Ok () -> return Ok(impact, mutation)
+                                    })
+                                cancellationToken
+
+                        match result with
+                        | Error(DatabaseError(_, message)) when message = "impact changed" -> return Error StorageContentError.ImpactChanged
+                        | Error _ -> return Error StorageContentError.RepositoryFailed
+                        | Ok(impact, mutation) ->
+                            return Ok({ Impact = impact; Descriptors = descriptors; ImpactToken = expectedToken }, mutation)
+                    with
+                    | :? StoragePhysicalDeleteException -> return Error StorageContentError.DeleteFailed
+                    | :? OperationCanceledException as error when cancellationToken.IsCancellationRequested -> return raise error
+                    | _ -> return Error StorageContentError.RepositoryFailed
         }

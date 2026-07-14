@@ -48,6 +48,7 @@ type DiscoveredTrackFile =
       CueTrackNumber: int option
       CueStartMs: int option
       CueDurationMs: int option
+      LastSeenScanJobId: Guid
       DiscoveredAtUtc: DateTimeOffset }
 
 type DiscoveredTrackIdentity =
@@ -246,15 +247,6 @@ WHERE "IsDeleted" = false
   AND "CueTrackNumber" IS NOT DISTINCT FROM @CueTrackNumber
 LIMIT 1;"""
 
-    [<Literal>]
-    let private activeCueTrackFileForSourceSql = """SELECT EXISTS (
-    SELECT 1
-    FROM "TrackFiles"
-    WHERE "IsDeleted" = false
-      AND "StorageBackendId" IS NOT DISTINCT FROM @StorageBackendId
-      AND "StoragePath" = @StoragePath
-      AND "CueSheetPath" IS NOT NULL
-);"""
 
     [<Literal>]
     let private insertTrackSql = """INSERT INTO "Tracks" (
@@ -267,12 +259,12 @@ VALUES (@TrackId, @Title, @Artist, @Album, @DurationMs, @MetadataSource,
     [<Literal>]
     let private insertTrackFileSql = """INSERT INTO "TrackFiles" (
     "Id", "TrackId", "StorageBackendId", "StoragePath", "CachePath", "ContentType", "SizeBytes", "IsCached",
-    "CueSheetPath", "CueTrackNumber", "CueStartMs", "CueDurationMs",
+    "CueSheetPath", "CueTrackNumber", "CueStartMs", "CueDurationMs", "LastSeenScanJobId",
     "IsDeleted", "CreatedAtUtc", "UpdatedAtUtc"
 )
 VALUES (
     @TrackFileId, @TrackId, @StorageBackendId, @StoragePath, @CachePath, @ContentType, @SizeBytes, @IsCached,
-    @CueSheetPath, @CueTrackNumber, @CueStartMs, @CueDurationMs,
+    @CueSheetPath, @CueTrackNumber, @CueStartMs, @CueDurationMs, @LastSeenScanJobId,
     false, @DiscoveredAtUtc, @DiscoveredAtUtc
 )
 ON CONFLICT DO NOTHING
@@ -759,24 +751,6 @@ WHERE "Id" = @TrackId
             | ex -> return! Error(databaseError "LibraryScanRepository.tryGetActiveTrackFileState" ex)
         }
 
-    let hasActiveCueTrackFileForSource
-        (dataSource: NpgsqlDataSource)
-        (storageBackendId: Guid option)
-        (storagePath: string)
-        (cancellationToken: CancellationToken)
-        : Task<Result<bool, RepositoryError>> =
-        taskResult {
-            try
-                use! connection = dataSource.OpenConnectionAsync(cancellationToken)
-                use command = new NpgsqlCommand(activeCueTrackFileForSourceSql, connection)
-                addNullableUuid command "StorageBackendId" storageBackendId
-                command.Parameters.AddWithValue("StoragePath", storagePath) |> ignore
-                let! exists = command.ExecuteScalarAsync(cancellationToken)
-                return Convert.ToBoolean(exists)
-            with
-            | :? OperationCanceledException as ex when cancellationToken.IsCancellationRequested -> return raise ex
-            | ex -> return! Error(databaseError "LibraryScanRepository.hasActiveCueTrackFileForSource" ex)
-        }
 
     let private updateTrackInTransaction
         (connection: NpgsqlConnection)
@@ -815,7 +789,8 @@ WHERE "Id" = @TrackId;""", connection, transaction)
         : Task =
         task {
             use command = new NpgsqlCommand("""UPDATE "TrackFiles"
-SET "CachePath" = @CachePath,
+SET "StoragePath" = @StoragePath,
+    "CachePath" = @CachePath,
     "ContentType" = @ContentType,
     "SizeBytes" = @SizeBytes,
     "IsCached" = @IsCached,
@@ -823,10 +798,12 @@ SET "CachePath" = @CachePath,
     "CueTrackNumber" = @CueTrackNumber,
     "CueStartMs" = @CueStartMs,
     "CueDurationMs" = @CueDurationMs,
+    "LastSeenScanJobId" = @LastSeenScanJobId,
     "IsDeleted" = false,
     "UpdatedAtUtc" = @UpdatedAtUtc
 WHERE "Id" = @TrackFileId AND "IsDeleted" = false;""", connection, transaction)
             command.Parameters.AddWithValue("TrackFileId", trackFileId) |> ignore
+            command.Parameters.AddWithValue("StoragePath", trackFile.StoragePath) |> ignore
             addNullableText command "CachePath" trackFile.CachePath
             addNullableText command "ContentType" trackFile.ContentType
             addNullableInt64 command "SizeBytes" trackFile.SizeBytes
@@ -835,6 +812,7 @@ WHERE "Id" = @TrackFileId AND "IsDeleted" = false;""", connection, transaction)
             addNullableInt32 command "CueTrackNumber" trackFile.CueTrackNumber
             addNullableInt32 command "CueStartMs" trackFile.CueStartMs
             addNullableInt32 command "CueDurationMs" trackFile.CueDurationMs
+            command.Parameters.AddWithValue("LastSeenScanJobId", trackFile.LastSeenScanJobId) |> ignore
             command.Parameters.AddWithValue("UpdatedAtUtc", trackFile.DiscoveredAtUtc) |> ignore
             let! _ = command.ExecuteNonQueryAsync(cancellationToken)
             return ()
@@ -980,6 +958,7 @@ VALUES (@AssetId, @TrackId, 'Cover', 'Embedded', @CachePath, @ContentType, @Size
                     addNullableInt32 trackFileCommand "CueTrackNumber" trackFile.CueTrackNumber
                     addNullableInt32 trackFileCommand "CueStartMs" trackFile.CueStartMs
                     addNullableInt32 trackFileCommand "CueDurationMs" trackFile.CueDurationMs
+                    trackFileCommand.Parameters.AddWithValue("LastSeenScanJobId", trackFile.LastSeenScanJobId) |> ignore
                     trackFileCommand.Parameters.AddWithValue("DiscoveredAtUtc", trackFile.DiscoveredAtUtc) |> ignore
                     let! inserted = trackFileCommand.ExecuteScalarAsync(cancellationToken)
 

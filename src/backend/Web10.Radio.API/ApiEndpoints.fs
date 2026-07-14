@@ -244,7 +244,6 @@ module ApiEndpoints =
 
         services.AddSingleton<StreamOptions>(streamOptions) |> ignore
         services.AddSingleton<IPlayerEventsDelay, PlayerEventsDelay>() |> ignore
-        services.AddSingleton<StorageOperationCoordinator>() |> ignore
         services.AddSingleton<StorageContentService>(fun provider ->
             StorageContentService(
                 provider.GetRequiredService<StorageOptions>(),
@@ -2555,7 +2554,7 @@ module ApiEndpoints =
             if parsed |> List.exists Option.isNone then None
             else
                 let values = parsed |> List.choose id
-                if values |> List.map (fun value -> value.PhysicalPath, value.Kind) |> Set.ofList |> Set.count <> values.Length then None else Some values
+                if values |> List.map _.PhysicalPath |> Set.ofList |> Set.count <> values.Length then None else Some values
 
     let private parseStorageDeleteBody requireImpact (root: JsonElement) =
         let expected = if requireImpact then Set.ofList [ "storageBackendId"; "entries"; "impactToken" ] else Set.ofList [ "storageBackendId"; "entries" ]

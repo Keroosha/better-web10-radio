@@ -243,21 +243,47 @@ WHERE "Id" = @QueueItemId;""",
             })
 
     [<Test>]
-    let ``cached file whose parent Track is soft deleted is not playable`` () =
+    let ``reconciled soft-deleted track and file are unavailable to media and current-assignment lookup`` () =
         DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
             task {
                 let trackId = newId ()
+                let trackFileId = newId ()
+                let queueItemId = newId ()
+                let claimOwner = newId ()
+                let nowUtc = DateTimeOffset(2026, 7, 14, 12, 0, 0, TimeSpan.Zero)
                 use connection = new NpgsqlConnection(connectionString)
                 do! connection.OpenAsync()
-                use command = new NpgsqlCommand("""INSERT INTO "Tracks" ("Id", "Title", "Artist", "IsDeleted") VALUES (@TrackId, 'Deleted parent', 'Regression', true); INSERT INTO "TrackFiles" ("Id", "TrackId", "StoragePath", "CachePath", "IsCached", "IsDeleted") VALUES (@TrackFileId, @TrackId, '/library/deleted.mp3', '/cache/deleted.mp3', true, false);""", connection)
+
+                use command =
+                    new NpgsqlCommand(
+                        """INSERT INTO "Tracks" ("Id", "Title", "Artist", "IsDeleted")
+VALUES (@TrackId, 'Reconciled parent', 'Regression', true);
+INSERT INTO "TrackFiles" ("Id", "TrackId", "StoragePath", "CachePath", "IsCached", "IsDeleted")
+VALUES (@TrackFileId, @TrackId, 'album/reconciled.mp3', '/cache/reconciled.mp3', true, true);
+INSERT INTO "PlaybackQueue" ("Id", "TrackId", "Source", "Status", "RequestedAtUtc", "StartedAtUtc", "ClaimOwner", "ClaimAttempt", "IsDeleted")
+VALUES (@QueueItemId, @TrackId, 'admin', 'Playing', @NowUtc, @NowUtc, @ClaimOwner, 1, false);""",
+                        connection
+                    )
+
                 command.Parameters.AddWithValue("TrackId", trackId) |> ignore
-                command.Parameters.AddWithValue("TrackFileId", newId ()) |> ignore
+                command.Parameters.AddWithValue("TrackFileId", trackFileId) |> ignore
+                command.Parameters.AddWithValue("QueueItemId", queueItemId) |> ignore
+                command.Parameters.AddWithValue("NowUtc", nowUtc) |> ignore
+                command.Parameters.AddWithValue("ClaimOwner", claimOwner) |> ignore
                 let! _ = command.ExecuteNonQueryAsync()
                 use dataSource = NpgsqlDataSource.Create(connectionString)
-                let! result = PlaybackQueueRepository.findCachedTrackFile dataSource trackId false CancellationToken.None
-                match result with
+
+                let! cachedMedia = PlaybackQueueRepository.findCachedTrackFile dataSource trackId false CancellationToken.None
+
+                match cachedMedia with
                 | Ok None -> ()
-                | actual -> Assert.Fail(sprintf "Expected an active file with a soft-deleted parent Track to be excluded, but got %A." actual)
+                | actual -> Assert.Fail(sprintf "Reconciled soft-deleted media must not resolve, but got %A." actual)
+
+                let! currentAssignment = PlaybackQueueRepository.getCurrentAssignment dataSource false CancellationToken.None
+
+                match currentAssignment with
+                | Ok None -> ()
+                | actual -> Assert.Fail(sprintf "Reconciled soft-deleted media must not produce a current assignment, but got %A." actual)
             })
 
     let private assertInserted description result =

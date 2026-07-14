@@ -633,6 +633,7 @@ ORDER BY index_class.relname;""",
                           "UX_TrackLinks_Active_TrackId_Url", "IsDeleted=false"
                           "IX_TrackFiles_Active_TrackId", "IsDeleted=false"
                           "IX_TrackFiles_Active_StorageBackendId", "IsDeleted=false"
+                          "IX_TrackFiles_Active_StorageBackend_LastSeenScanJob", "IsDeleted=false"
                           "UX_TrackFiles_Active_Backend_StoragePath_Cue", "IsDeleted=falseANDStorageBackendIdISNOTNULL"
                           "UX_TrackFiles_Active_NullBackend_StoragePath_Cue", "IsDeleted=falseANDStorageBackendIdISNULL"
                           "UX_Playlists_Active_Name", "IsDeleted=false"
@@ -677,6 +678,38 @@ ORDER BY index_class.relname;""",
                 let actualCheckConstraintNames = checkConstraints |> Set.map (fun (tableName, constraintName, _) -> tableName, constraintName)
                 Assert.That((actualCheckConstraintNames = expectedCheckConstraints), Is.True, sprintf "Check-constraint drift. Expected: %A; actual: %A" expectedCheckConstraints actualCheckConstraintNames)
                 Assert.That((activeIndexPredicates = expectedActiveIndexPredicates), Is.True, sprintf "Active-index predicate drift. Expected: %A; actual: %A" expectedActiveIndexPredicates activeIndexPredicates)
+            })
+
+    [<Test>]
+    let ``202607140001 installs nullable scan generation marker and active reconciliation index`` () =
+        DatabaseTestSupport.withMigratedDatabase (fun connectionString ->
+            task {
+                use connection = new NpgsqlConnection(connectionString)
+                do! connection.OpenAsync()
+
+                use columnCommand =
+                    new NpgsqlCommand(
+                        """SELECT data_type, is_nullable
+FROM information_schema.columns
+WHERE table_schema = 'public'
+  AND table_name = 'TrackFiles'
+  AND column_name = 'LastSeenScanJobId';""",
+                        connection
+                    )
+
+                use! columnReader = columnCommand.ExecuteReaderAsync()
+                Assert.That((columnReader.Read()), Is.True, "LastSeenScanJobId column is missing.")
+                Assert.That(columnReader.GetString(0), Is.EqualTo("uuid"))
+                Assert.That(columnReader.GetString(1), Is.EqualTo("YES"))
+                do! columnReader.CloseAsync()
+
+                let! activeIndexPredicates = readActiveIndexPredicates connection
+
+                Assert.That(
+                    activeIndexPredicates.Contains("IX_TrackFiles_Active_StorageBackend_LastSeenScanJob", "IsDeleted=false"),
+                    Is.True,
+                    sprintf "Active reconciliation index is missing. Actual: %A" activeIndexPredicates
+                )
             })
 
     [<Test>]
@@ -831,7 +864,7 @@ VALUES ('00000000-0000-0000-0000-000000000302', '00000000-0000-0000-0000-0000000
 
                 Assert.That(
                     List.ofSeq versions,
-                    Is.EqualTo(([ 202607080001L; 202607100001L; 202607100002L; 202607100003L; 202607100004L; 202607110001L; 202607110002L; 202607110003L; 202607110004L; 202607120001L; 202607120002L; 202607120003L; 202607130001L; 202607130002L; 202607130003L ] : int64 list) :> obj),
+                    Is.EqualTo(([ 202607080001L; 202607100001L; 202607100002L; 202607100003L; 202607100004L; 202607110001L; 202607110002L; 202607110003L; 202607110004L; 202607120001L; 202607120002L; 202607120003L; 202607130001L; 202607130002L; 202607130003L; 202607140001L ] : int64 list) :> obj),
                     "A full down/up cycle must restore every migration in version order."
                 )
             })

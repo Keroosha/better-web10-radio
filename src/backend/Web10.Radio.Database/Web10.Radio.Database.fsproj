@@ -21,6 +21,7 @@
     <Compile Include="Migrations\StorageCacheSettings.fs" />
     <Compile Include="Migrations\BannerDesigner.fs" />
     <Compile Include="Migrations\FlacCueTracks.fs" />
+    <Compile Include="Migrations\LibraryScanReconciliation.fs" />
     <Compile Include="Repositories\RepositoryError.fs" />
     <Compile Include="Repositories\AdminIdentityRepository.fs" />
     <Compile Include="Repositories\OutboxEventRepository.fs" />

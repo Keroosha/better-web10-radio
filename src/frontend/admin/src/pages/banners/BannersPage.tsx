@@ -16,6 +16,7 @@ import {
 
 import { DonationGoalEditor } from '../../features/donation-goal-editor/DonationGoalEditor';
 import { errorMessage } from '../../shared/lib/errorMessage';
+import { Checkbox } from '../../shared/ui/Checkbox';
 import { useToast } from '../../shared/ui/toast';
 import { COLORS, formGrid, iconButton, panel } from '../../shared/ui/tokens';
 
@@ -179,10 +180,9 @@ export function BannersPage(): ReactElement {
                   />
                 ))}
               </div>
-              <label htmlFor="bn-enabled" style={{ gridColumn: '1 / -1', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                <input id="bn-enabled" type="checkbox" checked={selected.enabled} onChange={(event) => patch({ enabled: event.target.checked })} />
-                Показывать на стриме
-              </label>
+              <div style={{ gridColumn: '1 / -1', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <Checkbox id="bn-enabled" label="Показывать на стриме" checked={selected.enabled} onChange={(event) => patch({ enabled: event.target.checked })} />
+              </div>
               {selected.type === 'social' ? (
                 <>
                   <label htmlFor="bn-rotation">Смена ссылок</label>
@@ -479,9 +479,13 @@ function SocialLinksEditor(): ReactElement {
               <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
                 <input value={link.glyph} placeholder="Значок" maxLength={2} onChange={(event) => setLink(index, { glyph: event.target.value })} style={{ width: '54px' }} />
                 <input type="color" value={/^#[0-9a-fA-F]{6}$/.test(link.color) ? link.color : '#2aabee'} onChange={(event) => setLink(index, { color: event.target.value })} style={{ width: '38px', padding: 0 }} />
-                <label style={{ fontSize: '11px', color: COLORS.subtle }}>
-                  <input type="checkbox" checked={link.isFeatured} onChange={(event) => setLink(index, { isFeatured: event.target.checked })} /> Основная (с QR)
-                </label>
+                <Checkbox
+                  id={`social-link-featured-${index}`}
+                  label="Основная (с QR)"
+                  checked={link.isFeatured}
+                  onChange={(event) => setLink(index, { isFeatured: event.target.checked })}
+                  labelStyle={{ fontSize: '11px', color: COLORS.subtle }}
+                />
               </div>
               <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
                 <span

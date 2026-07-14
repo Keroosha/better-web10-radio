@@ -125,6 +125,7 @@ services:
 
   stream-node:
     image: web10-radio-stream-node:local
+    cpus: 6.0
     build:
       context: ./src/stream-node
       dockerfile: Dockerfile

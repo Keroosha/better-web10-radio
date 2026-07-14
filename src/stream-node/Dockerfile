@@ -62,6 +62,7 @@ COPY scripts/check-runtime.sh ./scripts/check-runtime.sh
 COPY liquidsoap/web10.liq ./liquidsoap/web10.liq
 RUN chmod 0755 ./scripts/check-runtime.sh \
     && install -d -o 1000 -g 1000 -m 0775 /run/web10 /var/lib/web10/storage /var/lib/web10/cache
+USER 1000:1000
 
 HEALTHCHECK --interval=2s --timeout=5s --retries=30 --start-period=5s CMD ["./Web10.Radio.StreamNode", "--health-check", "http://127.0.0.1:18080/healthz"]
 ENTRYPOINT ["/usr/bin/dumb-init", "--"]

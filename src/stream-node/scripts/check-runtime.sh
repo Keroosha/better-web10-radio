@@ -100,12 +100,20 @@ DISPLAY="$display" ffmpeg -hide_banner -loglevel error -y \
     -f x11grab -framerate "$framerate" -video_size "${width}x${height}" -i "$display" \
     -f lavfi -i anullsrc=r=48000:cl=stereo \
     -t 3 -map 0:v:0 -map 1:a:0 \
+    -x264-params sar=1/1 \
     -c:v libx264 -pix_fmt yuv420p -preset veryfast -b:v 2500k -g $((framerate * 2)) \
     -c:a aac -ar 48000 -b:a "${WEB10_STREAM__BITRATE_KBPS:-192}k" \
     -f flv "$flv_output"
 
 if [ ! -s "$flv_output" ]; then
     echo "FFmpeg did not produce an FLV capture" >&2
+    exit 1
+fi
+
+video_geometry="$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height,sample_aspect_ratio -of csv=p=0 "$flv_output")"
+expected_video_geometry="${width},${height},1:1"
+if [ "$video_geometry" != "$expected_video_geometry" ]; then
+    echo "FFmpeg produced ${video_geometry}; expected ${expected_video_geometry}" >&2
     exit 1
 fi
 

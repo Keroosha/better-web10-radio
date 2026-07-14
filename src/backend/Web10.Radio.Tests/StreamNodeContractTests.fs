@@ -49,6 +49,27 @@ type StreamNodeContractTests() =
         | Error error -> Assert.Fail(sprintf "Expected valid stream-node configuration, got %A." error)
 
     [<Test>]
+    member _.``runtime configuration propagates a square-pixel 4:3 geometry``() =
+        let values = Dictionary<string, string>()
+        values["WEB10_API__BASE_URL"] <- "http://api:8080"
+        values["WEB10_STREAM__CALLBACK_TOKEN"] <- "stream-callback-token-1234567890"
+        values["WEB10_STREAM__STAGE_URL"] <- "http://frontend/"
+        values["WEB10_STREAM__RTMP_URL"] <- "rtmp://rtmp-sink:1935/s/"
+        values["WEB10_STREAM__RTMP_KEY"] <- "compose-smoke-rtmp-key"
+        values["WEB10_STREAM__WIDTH"] <- "1024"
+        values["WEB10_STREAM__HEIGHT"] <- "768"
+
+        match Configuration.validate values with
+        | Ok config ->
+            let processEnvironment = Runtime.environment config
+            Assert.Multiple(fun () ->
+                Assert.That(config.Width, Is.EqualTo(1024))
+                Assert.That(config.Height, Is.EqualTo(768))
+                Assert.That(processEnvironment["WEB10_STREAM__WIDTH"], Is.EqualTo("1024"))
+                Assert.That(processEnvironment["WEB10_STREAM__HEIGHT"], Is.EqualTo("768")))
+        | Error error -> Assert.Fail(sprintf "Expected valid 4:3 stream configuration, got %A." error)
+
+    [<Test>]
     member _.``runtime configuration rejects non-RTMP target``() =
         let values = Dictionary<string, string>()
         values["WEB10_API__BASE_URL"] <- "http://api:8080"

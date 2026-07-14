@@ -102,6 +102,9 @@ captured_video = input.ffmpeg(
   string_args=[("video_size", "#{width}x#{height}")],
   display
 )
+# `input.ffmpeg` delivers a canvas with no durable display-aspect metadata. Tell
+# libx264 to emit square-pixel VUI metadata, preserving the configured frame ratio
+# for RTMP consumers (for example, 1024x768 remains 4:3).
 video = mksafe(captured_video)
 
 queue = request.queue(id="web10", prefetch=1)
@@ -170,6 +173,7 @@ rtmp_encoder = %ffmpeg(
   %audio(codec="aac", samplerate=48000, b="#{bitrate_kbps}k"),
   %video(
     codec="libx264",
+    "x264-params"="sar=1/1",
     pixel_format="yuv420p",
     b="2500k",
     preset="veryfast",

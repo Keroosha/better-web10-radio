@@ -99,7 +99,7 @@ services:
   stream-node:
     image: "ghcr.io/keroosha/better-web10-radio/stream-node:${WEB10_IMAGE_TAG:?WEB10_IMAGE_TAG is required in prod}"
     logging: *web10-logging
-    cpus: 4.0
+    cpus: 8.0
     depends_on:
       api:
         condition: service_healthy

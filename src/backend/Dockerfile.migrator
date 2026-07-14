@@ -10,4 +10,5 @@ RUN dotnet publish Web10.Radio.Migrator/Web10.Radio.Migrator.fsproj -c Release -
 FROM mcr.microsoft.com/dotnet/runtime:10.0-noble-chiseled AS runtime
 WORKDIR /app
 COPY --from=build /app/publish .
+USER 1000:1000
 ENTRYPOINT ["dotnet", "Web10.Radio.Migrator.dll"]

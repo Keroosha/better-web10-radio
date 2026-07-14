@@ -89,6 +89,15 @@ WHERE tf."IsDeleted" = false
 ORDER BY tf."TrackId", tf."Id"
 FOR UPDATE;"""
 
+    [<Literal>]
+    let private loadScanReconciliationFilesSql = """SELECT tf."Id", tf."TrackId", tf."StoragePath", tf."CachePath", tf."SizeBytes", tf."UpdatedAtUtc"
+FROM "TrackFiles" tf
+WHERE tf."IsDeleted" = false
+  AND tf."StorageBackendId" IS NOT DISTINCT FROM @StorageBackendId
+  AND tf."LastSeenScanJobId" IS DISTINCT FROM @ScanJobId
+ORDER BY tf."TrackId", tf."Id"
+FOR UPDATE;"""
+
     let private loadTracksSql = """SELECT t."Id", t."Title", t."Artist"
 FROM "Tracks" t
 WHERE t."IsDeleted" = false AND t."Id" = ANY(@TrackIds)
@@ -104,6 +113,22 @@ WHERE t."IsDeleted" = false AND t."Id" = ANY(@TrackIds)
             SELECT 1 FROM unnest(CAST(@SelectorPaths AS text[]), CAST(@SelectorKinds AS text[])) AS s(path, kind)
             WHERE (s.kind = 'file' AND remaining."StorageBackendId" IS NOT DISTINCT FROM @StorageBackendId AND remaining."StoragePath" = s.path)
                OR (s.kind = 'folder' AND remaining."StorageBackendId" IS NOT DISTINCT FROM @StorageBackendId AND left(remaining."StoragePath", length(s.path) + 1) = s.path || '/')
+        )
+  )
+ORDER BY t."Id";"""
+
+    [<Literal>]
+    let private loadScanReconciliationTracksToDeleteSql = """SELECT t."Id", t."Title", t."Artist"
+FROM "Tracks" t
+WHERE t."IsDeleted" = false AND t."Id" = ANY(@TrackIds)
+  AND NOT EXISTS (
+      SELECT 1
+      FROM "TrackFiles" remaining
+      WHERE remaining."TrackId" = t."Id"
+        AND remaining."IsDeleted" = false
+        AND NOT (
+            remaining."StorageBackendId" IS NOT DISTINCT FROM @StorageBackendId
+            AND remaining."LastSeenScanJobId" IS DISTINCT FROM @ScanJobId
         )
   )
 ORDER BY t."Id";"""
@@ -195,6 +220,78 @@ ORDER BY q."TrackId";"""
             with
             | :? OperationCanceledException as ex when cancellationToken.IsCancellationRequested -> return raise ex
             | ex -> return! Error(DatabaseError("StorageContentRepository.loadImpactInTransaction", ex.Message))
+        }
+
+    let loadScanReconciliationImpactInTransaction
+        (connection: NpgsqlConnection)
+        (transaction: NpgsqlTransaction)
+        (storageBackendId: Guid option)
+        (scanJobId: Guid)
+        (cancellationToken: CancellationToken)
+        : Task<Result<StorageImpactRecord, RepositoryError>> =
+        taskResult {
+            try
+                use filesCommand = new NpgsqlCommand(loadScanReconciliationFilesSql, connection, transaction)
+                addNullableUuid filesCommand "StorageBackendId" storageBackendId |> ignore
+                filesCommand.Parameters.AddWithValue("ScanJobId", scanJobId) |> ignore
+                use! filesReader = filesCommand.ExecuteReaderAsync(cancellationToken)
+                let files = ResizeArray<StorageTrackFileRecord>()
+                while! filesReader.ReadAsync(cancellationToken) do files.Add(readTrackFile filesReader)
+                filesReader.Close()
+
+                let trackIds = files |> Seq.map _.TrackId |> Seq.distinct |> Seq.toArray
+                let readTracks sql configure = task {
+                    use command = new NpgsqlCommand(sql, connection, transaction)
+                    command.Parameters.Add("TrackIds", NpgsqlDbType.Array ||| NpgsqlDbType.Uuid).Value <- trackIds
+                    configure command
+                    use! reader = command.ExecuteReaderAsync(cancellationToken)
+                    let values = ResizeArray<StorageTrackRecord>()
+                    while! reader.ReadAsync(cancellationToken) do values.Add(readTrack reader)
+                    return List.ofSeq values
+                }
+
+                let! tracks = readTracks loadTracksSql ignore
+                let! tracksToDelete =
+                    readTracks
+                        loadScanReconciliationTracksToDeleteSql
+                        (fun command ->
+                            addNullableUuid command "StorageBackendId" storageBackendId |> ignore
+                            command.Parameters.AddWithValue("ScanJobId", scanJobId) |> ignore)
+
+                use membershipCommand = new NpgsqlCommand(loadMembershipsSql, connection, transaction)
+                membershipCommand.Parameters.Add("TrackIds", NpgsqlDbType.Array ||| NpgsqlDbType.Uuid).Value <- tracksToDelete |> List.map _.TrackId |> List.toArray
+                use! membershipReader = membershipCommand.ExecuteReaderAsync(cancellationToken)
+                let memberships = ResizeArray<StoragePlaylistMembershipRecord>()
+                while! membershipReader.ReadAsync(cancellationToken) do
+                    memberships.Add({ PlaylistItemId = membershipReader.GetGuid(0); PlaylistId = membershipReader.GetGuid(1); PlaylistName = membershipReader.GetString(2); TrackId = membershipReader.GetGuid(3); Position = membershipReader.GetInt32(4) })
+                membershipReader.Close()
+
+                use currentCommand = new NpgsqlCommand(loadCurrentSql, connection, transaction)
+                currentCommand.Parameters.Add("TrackIds", NpgsqlDbType.Array ||| NpgsqlDbType.Uuid).Value <- tracksToDelete |> List.map _.TrackId |> List.toArray
+                use! currentReader = currentCommand.ExecuteReaderAsync(cancellationToken)
+                let! currentFound = currentReader.ReadAsync(cancellationToken)
+                let current =
+                    if currentFound then
+                        Some { QueueItemId = currentReader.GetGuid(0); TrackId = currentReader.GetGuid(1); ClaimOwner = currentReader.GetGuid(2); ClaimAttempt = currentReader.GetInt32(3) }
+                    else None
+                currentReader.Close()
+
+                use queuedCommand = new NpgsqlCommand(loadQueuedSql, connection, transaction)
+                queuedCommand.Parameters.Add("TrackIds", NpgsqlDbType.Array ||| NpgsqlDbType.Uuid).Value <- tracksToDelete |> List.map _.TrackId |> List.toArray
+                use! queuedReader = queuedCommand.ExecuteReaderAsync(cancellationToken)
+                let queued = ResizeArray<Guid>()
+                while! queuedReader.ReadAsync(cancellationToken) do queued.Add(queuedReader.GetGuid(0))
+
+                return
+                    { TrackFiles = List.ofSeq files
+                      Tracks = tracks
+                      TracksToDelete = tracksToDelete
+                      PlaylistMemberships = List.ofSeq memberships
+                      CurrentPlayback = current
+                      QueuedTrackIds = List.ofSeq queued }
+            with
+            | :? OperationCanceledException as ex when cancellationToken.IsCancellationRequested -> return raise ex
+            | ex -> return! Error(DatabaseError("StorageContentRepository.loadScanReconciliationImpactInTransaction", ex.Message))
         }
 
     let private compactPlaylist

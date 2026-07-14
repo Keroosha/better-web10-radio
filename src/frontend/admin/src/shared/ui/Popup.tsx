@@ -1,20 +1,17 @@
-import type { CSSProperties, ReactElement, ReactNode } from 'react';
+import type { ReactElement, ReactNode } from 'react';
 
 interface PopupProps {
   readonly title: string;
   readonly onClose: () => void;
   readonly children: ReactNode;
   readonly width?: number;
-  /** Warning-coloured title bar for destructive/dependency confirmations (ПРАВИЛА §6). */
-  readonly warning?: boolean;
 }
 
 /**
- * Modal popup: dim overlay (click-to-close) holding a plain 7.css `.window.active`
+ * Modal popup: dim overlay (click-to-close) holding a shared 7.css Aero window
  * with a close control in its title bar. Body layout is left to the caller.
  */
-export function Popup({ title, onClose, children, width = 480, warning = false }: PopupProps): ReactElement {
-  const titleBarStyle: CSSProperties | undefined = warning ? { ['--w7-w-bg' as string]: '#b5651d' } : undefined;
+export function Popup({ title, onClose, children, width = 480 }: PopupProps): ReactElement {
   return (
     <div
       style={{
@@ -29,11 +26,11 @@ export function Popup({ title, onClose, children, width = 480, warning = false }
       onClick={onClose}
     >
       <div
-        className="window active"
+        className="window glass active"
         style={{ width: `${width}px`, maxWidth: '92vw' }}
         onClick={(event) => event.stopPropagation()}
       >
-        <div className="title-bar" style={titleBarStyle}>
+        <div className="title-bar">
           <div className="title-bar-text">{title}</div>
           <div className="title-bar-controls">
             <button type="button" aria-label="Close" onClick={onClose} />

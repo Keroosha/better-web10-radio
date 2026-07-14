@@ -128,7 +128,7 @@ export function AdminAuthGate({ children }: AdminAuthGateProps): ReactElement {
 
   if (isProbing) {
     return (
-      <div className="admin-desktop admin-desktop--center">
+      <div className="admin-login-desktop">
         <div className="window glass active" style={{ width: 'min(360px, 100%)' }}>
           <div className="title-bar">
             <div className="title-bar-text">Web10.Radio — Admin</div>
@@ -149,7 +149,7 @@ export function AdminAuthGate({ children }: AdminAuthGateProps): ReactElement {
     );
   }
   return (
-    <div className="admin-desktop admin-desktop--center">
+    <div className="admin-login-desktop">
       <div className="window glass active" style={{ width: 'min(420px, 100%)' }}>
         <div className="title-bar">
           <div className="title-bar-text">Web10.Radio — Admin</div>

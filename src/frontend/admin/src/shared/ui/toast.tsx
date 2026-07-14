@@ -10,13 +10,13 @@ import {
 } from 'react';
 
 interface ToastContextValue {
-  /** Show a short confirmation at the bottom-centre; auto-hides after ~2.2s. */
+  /** Show a short confirmation at the bottom-right; auto-hides after ~2.2s. */
   readonly showToast: (message: string) => void;
 }
 
 const ToastContext = createContext<ToastContextValue | null>(null);
 
-/** Bottom-centre confirmation toast host (ПРАВИЛА-UI.md §8). */
+/** Bottom-right confirmation toast host (ПРАВИЛА-UI.md §8). */
 export function ToastProvider({ children }: { readonly children: ReactNode }): ReactElement {
   const [toast, setToast] = useState<string | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -40,9 +40,8 @@ export function ToastProvider({ children }: { readonly children: ReactNode }): R
           aria-live="polite"
           style={{
             position: 'fixed',
-            left: '50%',
+            right: '24px',
             bottom: '84px',
-            transform: 'translateX(-50%)',
             zIndex: 60,
             animation: 'balloonin .18s ease-out',
           }}

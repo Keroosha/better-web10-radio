@@ -16,6 +16,7 @@ import {
 } from '@web10/shared';
 
 import { errorMessage } from '../../shared/lib/errorMessage';
+import { Checkbox } from '../../shared/ui/Checkbox';
 import { useToast } from '../../shared/ui/toast';
 import { COLORS, ellipsis, formGrid, iconButton, panel } from '../../shared/ui/tokens';
 
@@ -214,10 +215,9 @@ export function PlaylistsPage(): ReactElement {
             <input id="pl-name" value={form.name} maxLength={120} onChange={(event) => setField('name', event.target.value)} />
             <label htmlFor="pl-desc">Описание</label>
             <textarea id="pl-desc" rows={2} value={form.description} onChange={(event) => setField('description', event.target.value)} />
-            <label htmlFor="pl-active">Активен</label>
+            <span>Активен</span>
             <div>
-              <input id="pl-active" type="checkbox" checked={form.isActive} onChange={(event) => setField('isActive', event.target.checked)} />{' '}
-              <span style={{ fontSize: '12px', color: COLORS.subtle }}>в ротации эфира</span>
+              <Checkbox id="pl-active" label="в ротации эфира" checked={form.isActive} onChange={(event) => setField('isActive', event.target.checked)} labelStyle={{ fontSize: '12px', color: COLORS.subtle }} />
             </div>
             <label htmlFor="pl-source">Источник</label>
             <select id="pl-source" value={form.source} disabled={selected?.isSystem === true} onChange={(event) => setField('source', event.target.value === 'allStorage' ? 'allStorage' : 'manual')}>
@@ -263,15 +263,26 @@ export function PlaylistsPage(): ReactElement {
           </div>
           <fieldset style={{ marginTop: '12px' }}>
             <legend>Политика воспроизведения</legend>
-            <label style={{ marginRight: '14px' }}>
-              <input type="checkbox" checked={form.isJingle} onChange={(event) => setField('isJingle', event.target.checked)} /> Джингл
-            </label>
-            <label style={{ marginRight: '14px' }}>
-              <input type="checkbox" checked={form.interrupt} onChange={(event) => setField('interrupt', event.target.checked)} /> Прерывать трек
-            </label>
-            <label>
-              <input type="checkbox" checked={form.avoidDuplicates} onChange={(event) => setField('avoidDuplicates', event.target.checked)} /> Избегать повторов
-            </label>
+            <Checkbox
+              id="pl-jingle"
+              label="Джингл"
+              checked={form.isJingle}
+              onChange={(event) => setField('isJingle', event.target.checked)}
+              labelStyle={{ marginRight: '14px' }}
+            />
+            <Checkbox
+              id="pl-interrupt"
+              label="Прерывать трек"
+              checked={form.interrupt}
+              onChange={(event) => setField('interrupt', event.target.checked)}
+              labelStyle={{ marginRight: '14px' }}
+            />
+            <Checkbox
+              id="pl-avoid-duplicates"
+              label="Избегать повторов"
+              checked={form.avoidDuplicates}
+              onChange={(event) => setField('avoidDuplicates', event.target.checked)}
+            />
           </fieldset>
 
           <div style={{ marginTop: '12px' }}>

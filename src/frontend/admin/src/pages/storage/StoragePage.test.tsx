@@ -211,6 +211,42 @@ test('selecting a file offers a delete that previews impact', async () => {
   });
 });
 
+test('deletes a selected folder through preview and confirmation while reporting both result counts', async () => {
+  vi.mocked(getStorage).mockResolvedValue(storage);
+  vi.mocked(getStorageEntries).mockImplementation(async (query) => ({
+    path: query?.path ?? '',
+    items: [albumFolder],
+    nextCursor: null,
+  }));
+  vi.mocked(previewStorageDelete).mockResolvedValue({ ...impact, folderCount: 2 });
+  vi.mocked(deleteStorageEntries).mockResolvedValue({
+    deletedFileCount: 1,
+    deletedFolderCount: 2,
+    detachedPlaylistItemCount: 0,
+    deletedTrackCount: 1,
+    playbackAdvanced: false,
+  });
+
+  renderPage();
+
+  fireEvent.doubleClick(await screen.findByRole('option', { name: 'S3 archive' }));
+  fireEvent.click(await screen.findByRole('option', { name: 'album' }));
+  fireEvent.click(await screen.findByRole('button', { name: '✕ Удалить' }));
+
+  await waitFor(() => expect(vi.mocked(previewStorageDelete)).toHaveBeenCalledWith(
+    { storageBackendId: S3_ID, entries: [{ path: 'album', kind: 'folder' }] },
+    expect.objectContaining({ signal: expect.any(AbortSignal) }),
+  ));
+
+  fireEvent.click(await screen.findByRole('button', { name: 'Удалить' }));
+  await waitFor(() => expect(vi.mocked(deleteStorageEntries)).toHaveBeenCalledWith({
+    storageBackendId: S3_ID,
+    entries: [{ path: 'album', kind: 'folder' }],
+    impactToken: 'token-1',
+  }));
+  expect(await screen.findByText('Удалено файлов: 1, папок: 2')).toBeDefined();
+});
+
 test('Ctrl+Click selects multiple files and bulk-deletes them', async () => {
   const fileA: StorageEntry = { ...trackFile, path: 'a.txt', name: 'a.txt' };
   const fileB: StorageEntry = { ...trackFile, path: 'b.txt', name: 'b.txt' };

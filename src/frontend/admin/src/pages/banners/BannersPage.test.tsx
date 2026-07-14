@@ -114,6 +114,34 @@ test('keeps superchat visibility as a local draft until banner save', async () =
   );
 });
 
+test('renders and toggles both the banner and social-featured 7.css checkboxes', async () => {
+  const socialBanner: Banner = { ...superChatBanner, type: 'social' };
+  const fetchImpl: FetchImpl = async (url, init) => {
+    if (url === '/api/v0/admin/banners' && init?.method === 'GET') {
+      return json([socialBanner]);
+    }
+    if (url === '/api/v0/admin/social-links' && init?.method === 'GET') {
+      return json([]);
+    }
+    return new Response(null, { status: 404 });
+  };
+
+  renderPage(fetchImpl);
+
+  const visibility = await screen.findByLabelText('Показывать на стриме');
+  if (!(visibility instanceof HTMLInputElement)) throw new Error('Expected banner visibility checkbox.');
+  expect(visibility.checked).toBe(true);
+  fireEvent.click(visibility);
+  expect(visibility.checked).toBe(false);
+
+  fireEvent.click(await screen.findByRole('button', { name: '＋ Ссылка' }));
+  const featured = await screen.findByLabelText('Основная (с QR)');
+  if (!(featured instanceof HTMLInputElement)) throw new Error('Expected social featured checkbox.');
+  expect(featured.checked).toBe(true);
+  fireEvent.click(featured);
+  expect(featured.checked).toBe(false);
+});
+
 test('edits the donation goal inside the selected donation banner without replacing banners', async () => {
   const requests: CapturedRequest[] = [];
   const updatedGoal = { ...donationGoal, title: 'Новая цель', goalStars: 7500 };

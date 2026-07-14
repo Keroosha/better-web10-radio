@@ -15,6 +15,7 @@
     <Compile Include="ApiReadModels.fs" />
     <Compile Include="CueSheet.fs" />
     <Compile Include="TrackMetadata.fs" />
+    <Compile Include="StorageCoordination.fs" />
     <Compile Include="BackgroundWorkers.fs" />
     <Compile Include="StorageContent.fs" />
     <Compile Include="DevelopmentFixtures.fs" />

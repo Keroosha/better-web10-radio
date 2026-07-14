@@ -3,6 +3,7 @@ import { afterEach, describe, expect, test, vi } from 'vitest';
 import {
   clearAdminSession,
   createLibraryScan,
+  createStorageFolder,
   createPaidVerticalSliceFixture,
   createPlaylist,
   createPlaylistItem,
@@ -162,6 +163,15 @@ const storage = {
     },
   ],
 };
+const storageFolder = {
+  path: 'media/live',
+  name: 'live',
+  kind: 'folder' as const,
+  sizeBytes: null,
+  lastModifiedUtc: '2026-07-14T10:00:00Z',
+  contentType: null,
+};
+
 const streamStatus = {
   status: 'live',
   desiredState: 'running',
@@ -544,6 +554,20 @@ describe('storage and stream-node routes', () => {
     expect(request.requestUrl()).toBe('/api/v0/admin/storage');
     expect(request.requestInit()?.method).toBe('PUT');
     expect(request.requestInit()?.body).toBe(JSON.stringify(body));
+  });
+
+  test('creates a storage folder with the exact validated path and backend selector', async () => {
+    const request = capturingFetch(storageFolder, 201);
+
+    const created = await createStorageFolder(
+      { storageBackendId: id, path: 'media/live' },
+      { fetchImpl: request.fetchImpl },
+    );
+
+    expect(created.kind).toBe('folder');
+    expect(request.requestUrl()).toBe('/api/v0/admin/storage/folders');
+    expect(request.requestInit()?.method).toBe('POST');
+    expect(request.requestInit()?.body).toBe(JSON.stringify({ storageBackendId: id, path: 'media/live' }));
   });
 
   test('reads stream status through exact lowercase status and control fields', async () => {

@@ -172,7 +172,7 @@ type S3ObjectEnumerator(client: IAmazonS3) as this =
             task {
                 ArgumentException.ThrowIfNullOrWhiteSpace bucketName
                 ArgumentNullException.ThrowIfNull source
-                S3KeyValidation.requireCanonical key
+                if not (S3KeyValidation.isCanonical key || S3KeyValidation.isFolderMarker key) then invalidArg (nameof key) "S3 object key is not canonical."
                 let request = PutObjectRequest(BucketName = bucketName, Key = key, InputStream = source, AutoCloseStream = false)
                 request.Headers.ContentLength <- source.Length
                 ifNoneMatch |> ignore

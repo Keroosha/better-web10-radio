@@ -2425,6 +2425,7 @@ module ApiEndpoints =
             | StorageContentError.RangeNotSatisfiable -> 416, "storage.range_not_satisfiable", "Range not satisfiable", "The requested byte range is invalid."
             | StorageContentError.ReadFailed -> 502, "storage.read_failed", "Storage read failed", "The storage object could not be read."
             | StorageContentError.UploadFailed -> 502, "storage.upload_failed", "Storage upload failed", "The storage object could not be uploaded."
+            | StorageContentError.CreateFolderFailed -> 502, "storage.folder_create_failed", "Storage folder creation failed", "The storage folder could not be created."
             | StorageContentError.DeleteFailed -> 502, "storage.delete_failed", "Storage delete failed", "The storage object could not be deleted."
             | StorageContentError.RepositoryFailed -> 500, "repository.write_failed", "Repository write failed", "The requested change could not be persisted."
         task {
@@ -2540,6 +2541,37 @@ module ApiEndpoints =
                     do! ApiJson.write context 201 ApiJson.JsonContentType (storageEntryDto entry)
                     return 201
         }
+
+    let private parseStorageFolderCreateBody (root: JsonElement) =
+        if not (hasExactProperties (Set.ofList [ "storageBackendId"; "path" ]) root) then None
+        else
+            let backendId =
+                match tryProperty "storageBackendId" root with
+                | Some value when value.ValueKind = JsonValueKind.Null -> Some None
+                | Some value when value.ValueKind = JsonValueKind.String -> tryPositiveGuid (value.GetString()) |> Option.map Some
+                | _ -> None
+            match backendId, tryString "path" root with
+            | Some value, Some path -> Some(value, path)
+            | _ -> None
+
+    let private storageFolderCreate (context: HttpContext) =
+        task {
+            match! readJsonBody (32 * 1024) context with
+            | BodyTooLarge
+            | BodyInvalid -> return! storageError context StorageContentError.RequestInvalid
+            | BodyParsed root ->
+                match parseStorageFolderCreateBody root with
+                | None -> return! storageError context StorageContentError.RequestInvalid
+                | Some(backendId, path) ->
+                    let service = context.RequestServices.GetRequiredService<StorageContentService>()
+                    let! result = service.CreateFolderAsync(backendId, path, context.RequestAborted)
+                    match result with
+                    | Error error -> return! storageError context error
+                    | Ok entry ->
+                        do! ApiJson.write context 201 ApiJson.JsonContentType (storageEntryDto entry)
+                        return 201
+        }
+
 
     let private parseStorageSelections (entries: StorageDeleteEntryDto list) =
         if entries.IsEmpty || entries.Length > 100 then None
@@ -2845,6 +2877,7 @@ module ApiEndpoints =
         map admin logger "GET" "/storage/files/content" "/api/v0/admin/storage/files/content" storageContentRead
         map admin logger "HEAD" "/storage/files/content" "/api/v0/admin/storage/files/content" storageContentHead
         map admin logger "PUT" "/storage/files/content" "/api/v0/admin/storage/files/content" (csrfProtected storageContentUpload)
+        map admin logger "POST" "/storage/folders" "/api/v0/admin/storage/folders" (csrfProtected storageFolderCreate)
         map admin logger "POST" "/storage/files/delete-preview" "/api/v0/admin/storage/files/delete-preview" (csrfProtected storageDeletePreview)
         map admin logger "DELETE" "/storage/files" "/api/v0/admin/storage/files" (csrfProtected storageDelete)
         map admin logger "GET" "/stream-node/status" "/api/v0/admin/stream-node/status" adminStreamStatus

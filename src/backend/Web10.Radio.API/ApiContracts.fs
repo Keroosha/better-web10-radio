@@ -337,6 +337,10 @@ type StorageEntryPageDto =
       Items: StorageEntryDto list
       NextCursor: string option }
 
+type StorageFolderCreateRequestDto =
+    { StorageBackendId: string option
+      Path: string }
+
 type StorageDeleteEntryDto =
     { Path: string
       Kind: string }

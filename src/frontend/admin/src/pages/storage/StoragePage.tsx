@@ -13,6 +13,7 @@ import {
   ApiError,
   apiRawResponse,
   createLibraryScan,
+  createStorageFolder,
   deleteStorageEntries,
   getStorage,
   getStorageCacheSettings,
@@ -313,6 +314,7 @@ function StorageExplorer({ initial }: { readonly initial: Storage }): ReactEleme
   const { entries, cursor, loading, error, loadMore, reload } = browser;
 
   const [addOpen, setAddOpen] = useState(false);
+  const [folderCreateOpen, setFolderCreateOpen] = useState(false);
   const [cacheOpen, setCacheOpen] = useState(false);
   const [deleteDriveId, setDeleteDriveId] = useState<string | null>(null);
   const [deleteDialog, setDeleteDialog] = useState<DeleteDialogState | null>(null);
@@ -499,6 +501,34 @@ function StorageExplorer({ initial }: { readonly initial: Storage }): ReactEleme
     [activeDrive, loc.path, reload, showToast],
   );
 
+  const createFolder = useCallback(
+    async (name: string): Promise<boolean> => {
+      if (activeDrive === null) return false;
+      const folderName = name.trim();
+      if (
+        folderName === '' ||
+        folderName === '.' ||
+        folderName === '..' ||
+        folderName.includes('/') ||
+        folderName.includes('\\')
+      ) {
+        showToast('Укажите имя папки без разделителей пути');
+        return false;
+      }
+      const path = loc.path === '' ? folderName : `${loc.path}/${folderName}`;
+      try {
+        await createStorageFolder({ storageBackendId: activeDrive.backendId, path });
+        showToast(`Создана папка «${folderName}»`);
+        reload();
+        return true;
+      } catch (cause) {
+        showToast(errorMessage(cause, 'Не удалось создать папку'));
+        return false;
+      }
+    },
+    [activeDrive, loc.path, reload, showToast],
+  );
+
   const requestDelete = useCallback(
     async (selections: StorageDeleteSelection[]): Promise<void> => {
       if (selections.length === 0) return;
@@ -512,7 +542,7 @@ function StorageExplorer({ initial }: { readonly initial: Storage }): ReactEleme
         );
         if (!controller.signal.aborted) setDeleteDialog({ impact, entries: selections });
       } catch (cause) {
-        if (!controller.signal.aborted) showToast(errorMessage(cause, 'Не удалось рассчитать влияние удаления'));
+        if (!controller.signal.aborted) showToast(errorMessage(cause, 'Не удалось подготовить удаление'));
       }
     },
     [activeBackendId, showToast],
@@ -537,7 +567,7 @@ function StorageExplorer({ initial }: { readonly initial: Storage }): ReactEleme
         (cause.code === 'storage.delete_impact_changed' || cause.code === 'storage.delete_failed');
       showToast(
         retryable
-          ? 'Содержимое изменилось. Обновите влияние и повторите.'
+          ? 'Содержимое изменилось. Выберите папку ещё раз и подтвердите удаление.'
           : errorMessage(cause, 'Не удалось удалить содержимое'),
       );
       reload();
@@ -741,6 +771,11 @@ function StorageExplorer({ initial }: { readonly initial: Storage }): ReactEleme
           </button>
         ) : null}
         {activeDrive !== null ? (
+          <button type="button" style={commandBtn} disabled={!activeDrive.enabled} onClick={() => setFolderCreateOpen(true)}>
+            📁 Создать папку
+          </button>
+        ) : null}
+        {activeDrive !== null ? (
           <>
             <label>
               <input
@@ -910,6 +945,10 @@ function StorageExplorer({ initial }: { readonly initial: Storage }): ReactEleme
       ) : null}
 
       {cacheOpen ? <CacheSettingsPopup onClose={() => setCacheOpen(false)} /> : null}
+
+      {folderCreateOpen && activeDrive !== null ? (
+        <CreateFolderPopup onClose={() => setFolderCreateOpen(false)} onCreate={createFolder} />
+      ) : null}
 
       {deleteDriveId !== null ? (
         <Popup title="⚠ Удаление хранилища" width={420} onClose={() => setDeleteDriveId(null)}>
@@ -1393,6 +1432,64 @@ function Tile({ name, subtitle, selected, onSelect, onOpen, children }: TileProp
   );
 }
 
+interface CreateFolderPopupProps {
+  readonly onClose: () => void;
+  readonly onCreate: (name: string) => Promise<boolean>;
+}
+
+function CreateFolderPopup({ onClose, onCreate }: CreateFolderPopupProps): ReactElement {
+  const { showToast } = useToast();
+  const [name, setName] = useState('');
+  const [creating, setCreating] = useState(false);
+
+  const create = async (): Promise<void> => {
+    const folderName = name.trim();
+    if (
+      folderName === '' ||
+      folderName === '.' ||
+      folderName === '..' ||
+      folderName.includes('/') ||
+      folderName.includes('\\')
+    ) {
+      showToast('Укажите имя папки без разделителей пути');
+      return;
+    }
+    setCreating(true);
+    try {
+      if (await onCreate(folderName)) onClose();
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  return (
+    <Popup title="Новая папка" width={400} onClose={onClose}>
+      <div style={{ padding: '18px' }}>
+        <label htmlFor="storage-folder-name">Имя папки</label>
+        <input
+          id="storage-folder-name"
+          autoFocus
+          value={name}
+          onChange={(event) => setName(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') void create();
+          }}
+          placeholder="Например, Новая музыка"
+          style={{ boxSizing: 'border-box', display: 'block', marginTop: '6px', width: '100%' }}
+        />
+        <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '16px' }}>
+          <button type="button" disabled={creating} onClick={onClose}>
+            Отмена
+          </button>
+          <button type="button" className="default" disabled={creating} onClick={() => void create()}>
+            {creating ? 'Создание…' : 'Создать'}
+          </button>
+        </div>
+      </div>
+    </Popup>
+  );
+}
+
 interface AddStorageFormProps {
   readonly onClose: () => void;
   readonly onCreate: (name: string, type: 'local' | 's3', path: string) => Promise<void>;
@@ -1556,34 +1653,32 @@ function DeleteImpactPopup({ dialog, deleting, onCancel, onConfirm }: DeleteImpa
     <Popup title="⚠ Подтверждение удаления" width={560} onClose={onCancel}>
       <div style={{ padding: '12px' }}>
         <p>
-          Файлов: {impact.fileCount}, папок: {impact.folderCount}, размер: {formatBytes(impact.totalBytes)}.
+          Будут удалены: файлов {impact.fileCount}, папок {impact.folderCount}, всего {formatBytes(impact.totalBytes)}.
         </p>
-        <p>
-          Отслеживаемых файлов: {impact.trackedFileCount}; треков будет удалено: {impact.tracksToDeleteCount}.
-        </p>
+        {impact.tracksToDeleteCount > 0 ? <p>Из библиотеки исчезнет треков: {impact.tracksToDeleteCount}.</p> : null}
         {impact.playlistMemberships.length > 0 ? (
           <p>
-            Сначала треки будут удалены из плейлистов:{' '}
-            {impact.playlistMemberships.map((item) => `${item.playlistName} (${item.trackCount})`).join(', ')}, затем
-            удалится содержимое хранилища.
+            Из плейлистов исчезнут треки: {impact.playlistMemberships.map((item) => `${item.playlistName} (${item.trackCount})`).join(', ')}.
           </p>
         ) : null}
         {impact.currentTrack !== null ? (
           <p>
-            Текущий трек «{impact.currentTrack.title}» — «{impact.currentTrack.artist}»; воспроизведение переключится до
-            удаления.
+            Сейчас играет «{impact.currentTrack.title}» — «{impact.currentTrack.artist}». Перед удалением он будет пропущен.
           </p>
         ) : null}
         {impact.sampleTracks.length > 0 ? (
-          <ul>
-            {impact.sampleTracks.map((track) => (
-              <li key={track.trackId}>
-                {track.title} — {track.artist}
-              </li>
-            ))}
-          </ul>
+          <>
+            <p>Будут удалены треки:</p>
+            <ul>
+              {impact.sampleTracks.map((track) => (
+                <li key={track.trackId}>
+                  {track.title} — {track.artist}
+                </li>
+              ))}
+            </ul>
+          </>
         ) : null}
-        {impact.sampleTracksTruncated ? <p>ещё больше треков</p> : null}
+        {impact.sampleTracksTruncated ? <p>И ещё несколько треков.</p> : null}
         <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px' }}>
           <button type="button" disabled={deleting} onClick={onCancel}>
             Отмена

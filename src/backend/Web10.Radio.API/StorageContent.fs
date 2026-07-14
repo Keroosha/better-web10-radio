@@ -25,6 +25,7 @@ type StorageContentError =
     | RangeNotSatisfiable
     | ReadFailed
     | UploadFailed
+    | CreateFolderFailed
     | DeleteFailed
     | ImpactChanged
     | RepositoryFailed
@@ -428,6 +429,60 @@ type StorageContentService(options: StorageOptions, dataSource: NpgsqlDataSource
                         | :? InvalidDataException -> return Error StorageContentError.UploadTooLarge
                         | _ -> return Error StorageContentError.UploadFailed
         }
+    member _.CreateFolderAsync(backendId: Guid option, path: string, cancellationToken: CancellationToken) : Task<Result<StorageContentEntry, StorageContentError>> =
+        task {
+            match StoragePath.nonRoot path with
+            | Error () -> return Error StorageContentError.RequestInvalid
+            | Ok path ->
+                let! resolved = resolveBackend backendId cancellationToken
+                match resolved with
+                | Error error -> return Error error
+                | Ok backend ->
+                    let! lease = coordinator.AcquireAsync(backend.Key, cancellationToken)
+                    use lease = lease
+                    match backend.Type with
+                    | Local ->
+                        match StoragePath.localAbsolute backend.LocalRoot.Value path with
+                        | Error () -> return Error StorageContentError.RequestInvalid
+                        | Ok full ->
+                            if File.Exists(full) || Directory.Exists(full) then
+                                return Error StorageContentError.FileExists
+                            else
+                                try
+                                    let info = Directory.CreateDirectory(full)
+                                    return
+                                        Ok
+                                            { Path = path
+                                              Name = info.Name
+                                              Kind = "folder"
+                                              SizeBytes = None
+                                              LastModifiedUtc = Some(DateTimeOffset(info.LastWriteTimeUtc))
+                                              ContentType = None
+                                              ETag = None }
+                                with
+                                | :? OperationCanceledException as error when cancellationToken.IsCancellationRequested -> return raise error
+                                | _ -> return Error StorageContentError.CreateFolderFailed
+                    | S3 ->
+                        try
+                            use marker = new MemoryStream(Array.empty<byte>)
+                            let markerPath = path + "/"
+                            do! s3.UploadAsync(backend.Scope, backend.S3Bucket.Value, markerPath, marker, None, true, cancellationToken)
+                            let! metadata = s3.GetMetadataAsync(backend.Scope, backend.S3Bucket.Value, markerPath, cancellationToken)
+                            return
+                                Ok
+                                    { Path = path
+                                      Name = Path.GetFileName(path)
+                                      Kind = "folder"
+                                      SizeBytes = None
+                                      LastModifiedUtc = metadata.LastModifiedUtc
+                                      ContentType = None
+                                      ETag = metadata.ETag }
+                        with
+                        | :? Amazon.S3.AmazonS3Exception as error when error.StatusCode = HttpStatusCode.PreconditionFailed -> return Error StorageContentError.FileExists
+                        | :? OperationCanceledException as error when cancellationToken.IsCancellationRequested -> return raise error
+                        | _ -> return Error StorageContentError.CreateFolderFailed
+        }
+
 
     member private _.EnumerateDescriptors
         (backend: StorageContentBackend, selections: StorageSelection list, cancellationToken: CancellationToken)

@@ -42,6 +42,7 @@ import {
   StorageCacheSettingsSchema,
   type StorageEntry,
   type StorageEntryPage,
+  type StorageFolderCreateRequest,
   StorageEntrySchema,
   StorageEntryPageSchema,
   type StorageDeleteRequest,
@@ -541,6 +542,19 @@ export function uploadStorageFile(
     method: 'PUT',
     body: file,
     contentType: file.type === '' ? 'application/octet-stream' : file.type,
+    admin: true,
+    ...opts,
+  });
+}
+
+export function createStorageFolder(
+  body: StorageFolderCreateRequest,
+  opts: RequestOptions = {},
+): Promise<StorageEntry> {
+  return apiFetch(`${API_V0_PREFIX}/admin/storage/folders`, {
+    schema: StorageEntrySchema,
+    method: 'POST',
+    body,
     admin: true,
     ...opts,
   });

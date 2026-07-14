@@ -3,6 +3,7 @@ import { afterEach, expect, test, vi } from 'vitest';
 
 import {
   createLibraryScan,
+  createStorageFolder,
   deleteStorageEntries,
   getStorage,
   getStorageEntries,
@@ -26,6 +27,7 @@ vi.mock('@web10/shared', async () => {
     replaceStorage: vi.fn(),
     createLibraryScan: vi.fn(),
     uploadStorageFile: vi.fn(),
+    createStorageFolder: vi.fn(),
     previewStorageDelete: vi.fn(),
     deleteStorageEntries: vi.fn(),
   };
@@ -172,7 +174,7 @@ test('joins a directory upload path to the current folder', async () => {
   );
 });
 
-test('selecting a file offers a delete that previews impact', async () => {
+test('selecting a file shows plain deletion confirmation copy', async () => {
   vi.mocked(getStorage).mockResolvedValue(storage);
   vi.mocked(getStorageEntries).mockImplementation(async (query) => ({
     path: query?.path ?? '',
@@ -201,6 +203,8 @@ test('selecting a file offers a delete that previews impact', async () => {
     expect.objectContaining({ signal: expect.any(AbortSignal) }),
   );
   await screen.findByText('⚠ Подтверждение удаления');
+  expect(screen.getByText('Будут удалены: файлов 1, папок 0, всего 5 Б.')).toBeDefined();
+  expect(screen.queryByText(/влияние/i)).toBeNull();
 
   fireEvent.click(screen.getByRole('button', { name: 'Удалить' }));
   await waitFor(() => expect(vi.mocked(deleteStorageEntries)).toHaveBeenCalled());
@@ -310,4 +314,24 @@ test('scan-all issues a library scan for every backend', async () => {
 
   fireEvent.click(await screen.findByRole('button', { name: '⟳ Сканировать всё' }));
   await waitFor(() => expect(vi.mocked(createLibraryScan)).toHaveBeenCalledWith({}));
+});
+
+test('creates a folder in the active storage path', async () => {
+  vi.mocked(getStorage).mockResolvedValue(storage);
+  vi.mocked(getStorageEntries).mockResolvedValue({ path: '', items: [], nextCursor: null });
+  vi.mocked(createStorageFolder).mockResolvedValue(albumFolder);
+
+  renderPage();
+
+  fireEvent.doubleClick(await screen.findByRole('option', { name: 'Хранилище по умолчанию' }));
+  fireEvent.click(await screen.findByRole('button', { name: '📁 Создать папку' }));
+  fireEvent.change(screen.getByLabelText('Имя папки'), { target: { value: 'Новая музыка' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Создать' }));
+
+  await waitFor(() =>
+    expect(vi.mocked(createStorageFolder)).toHaveBeenCalledWith({
+      storageBackendId: null,
+      path: 'Новая музыка',
+    }),
+  );
 });

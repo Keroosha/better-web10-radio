@@ -110,6 +110,48 @@ type StorageContentTests() =
         Assert.That(S3KeyValidation.isFolderMarker "foobar/", Is.True)
 
     [<Test>]
+    member _.``local folder creation creates canonical descendants and rejects duplicates``() =
+        task {
+            let localRoot = Path.Combine(Path.GetTempPath(), "web10-radio-storage-create-" + Guid.NewGuid().ToString("N"))
+            let cacheRoot = Path.Combine(Path.GetTempPath(), "web10-radio-storage-cache-" + Guid.NewGuid().ToString("N"))
+            try
+                use dataSource = NpgsqlDataSource.Create("Host=localhost;Database=web10")
+                let service =
+                    new StorageContentService(
+                        localStorageOptions localRoot cacheRoot,
+                        dataSource,
+                        unusedS3Storage,
+                        TimeProvider.System,
+                        new StorageOperationCoordinator()
+                    )
+
+                let! created = service.CreateFolderAsync(None, "album/disc-1", CancellationToken.None)
+                match created with
+                | Ok entry ->
+                    Assert.That(entry.Path, Is.EqualTo("album/disc-1"))
+                    Assert.That(entry.Kind, Is.EqualTo("folder"))
+                    Assert.That(entry.SizeBytes.IsNone, Is.True)
+                | Error error -> Assert.Fail(sprintf "Folder creation failed: %A" error)
+
+                Assert.That(Directory.Exists(Path.Combine(localRoot, "album", "disc-1")), Is.True)
+
+                let! duplicate = service.CreateFolderAsync(None, "album/disc-1", CancellationToken.None)
+                match duplicate with
+                | Error StorageContentError.FileExists -> ()
+                | Ok _ -> Assert.Fail("Duplicate folder creation unexpectedly succeeded.")
+                | Error error -> Assert.Fail(sprintf "Expected FileExists, got %A" error)
+
+                let! unsafePath = service.CreateFolderAsync(None, "album/../escape", CancellationToken.None)
+                match unsafePath with
+                | Error StorageContentError.RequestInvalid -> ()
+                | Ok _ -> Assert.Fail("Traversal folder creation unexpectedly succeeded.")
+                | Error error -> Assert.Fail(sprintf "Expected RequestInvalid, got %A" error)
+            finally
+                if Directory.Exists(localRoot) then Directory.Delete(localRoot, true)
+                if Directory.Exists(cacheRoot) then Directory.Delete(cacheRoot, true)
+        }
+
+    [<Test>]
     member _.``local path resolution rejects symlink traversal``() =
         let root = Path.Combine(Path.GetTempPath(), "web10-storage-test-" + Guid.NewGuid().ToString("N"))
         let outside = Path.Combine(Path.GetTempPath(), "web10-storage-outside-" + Guid.NewGuid().ToString("N"))

@@ -371,6 +371,12 @@ export const StorageEntryPageSchema = z.strictObject({
 });
 export type StorageEntryPage = z.infer<typeof StorageEntryPageSchema>;
 
+export const StorageFolderCreateRequestSchema = z.strictObject({
+  storageBackendId: StorageUuidSchema.nullable(),
+  path: z.string().min(1),
+});
+export type StorageFolderCreateRequest = z.infer<typeof StorageFolderCreateRequestSchema>;
+
 export const StorageDeleteSelectionSchema = z.strictObject({
   path: z.string().min(1),
   kind: StorageEntryKindSchema,

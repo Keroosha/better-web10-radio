@@ -9,6 +9,8 @@ import {
   playNow,
   queueTrack,
   type AdminTrack,
+  type LibraryScanRequest,
+  type LibraryScanStatus,
   type Storage,
 } from '@web10/shared';
 
@@ -22,17 +24,45 @@ interface LibraryPageProps {
   readonly groupBy: LibraryGroupBy;
 }
 
-interface TracksState {
-  readonly tracks: readonly AdminTrack[];
-  readonly hasMore: boolean;
-}
-
 interface TrackGroup {
   readonly name: string;
   readonly tracks: readonly AdminTrack[];
 }
 
+
 const PAGE_LIMIT = 100;
+
+async function loadAllTracks(query: string, storageBackendId: string, signal: AbortSignal): Promise<readonly AdminTrack[]> {
+  const tracks: AdminTrack[] = [];
+  let cursor: string | null = null;
+  do {
+    const page = await getTracksPage(
+      {
+        query,
+        limit: PAGE_LIMIT,
+        ...(storageBackendId === '' ? {} : { storageBackendId }),
+        ...(cursor === null ? {} : { cursor }),
+      },
+      { signal },
+    );
+    tracks.push(...page.items);
+    cursor = page.nextCursor;
+  } while (cursor !== null);
+  return tracks;
+}
+
+async function waitForScan(scanJobId: string): Promise<LibraryScanStatus> {
+  for (let attempt = 0; attempt < 600; attempt += 1) {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    setTimeout(resolve, 1500);
+    await promise;
+    const status = await getLibraryScan(scanJobId);
+    if (status.status === 'completed' || status.status === 'failed') {
+      return status;
+    }
+  }
+  throw new Error('Сканирование не завершилось за 15 минут');
+}
 
 /** Библиотека: выбор хранилища, поиск, группировка по альбомам/исполнителям. */
 export function LibraryPage({ groupBy: navGroupBy }: LibraryPageProps): ReactElement {
@@ -41,7 +71,7 @@ export function LibraryPage({ groupBy: navGroupBy }: LibraryPageProps): ReactEle
   const [storageId, setStorageId] = useState<string>('');
   const [query, setQuery] = useState('');
   const [groupBy, setGroupBy] = useState<LibraryGroupBy>(navGroupBy);
-  const [state, setState] = useState<TracksState>({ tracks: [], hasMore: false });
+  const [tracks, setTracks] = useState<readonly AdminTrack[]>([]);
   const [searching, setSearching] = useState(false);
   const [openGroup, setOpenGroup] = useState<string | null>(null);
   const [popupTrack, setPopupTrack] = useState<AdminTrack | null>(null);
@@ -60,17 +90,10 @@ export function LibraryPage({ groupBy: navGroupBy }: LibraryPageProps): ReactEle
     let active = true;
     setSearching(true);
     const timer = setTimeout(() => {
-      void getTracksPage(
-        {
-          query: query.trim(),
-          limit: PAGE_LIMIT,
-          ...(storageId === '' ? {} : { storageBackendId: storageId }),
-        },
-        { signal: controller.signal },
-      )
-        .then((page) => {
+      void loadAllTracks(query.trim(), storageId, controller.signal)
+        .then((items) => {
           if (active) {
-            setState({ tracks: page.items, hasMore: page.nextCursor !== null });
+            setTracks(items);
             setSearching(false);
           }
         })
@@ -89,7 +112,7 @@ export function LibraryPage({ groupBy: navGroupBy }: LibraryPageProps): ReactEle
 
   const groups: TrackGroup[] = useMemo(() => {
     const map = new Map<string, AdminTrack[]>();
-    for (const track of state.tracks) {
+    for (const track of tracks) {
       const key = (groupBy === 'album' ? track.album : track.artist) || 'Без названия';
       const bucket = map.get(key);
       if (bucket === undefined) {
@@ -99,36 +122,42 @@ export function LibraryPage({ groupBy: navGroupBy }: LibraryPageProps): ReactEle
       }
     }
     return [...map.entries()].map(([name, tracks]) => ({ name, tracks }));
-  }, [state.tracks, groupBy]);
+  }, [tracks, groupBy]);
 
   const openTracks = groups.find((group) => group.name === openGroup)?.tracks ?? [];
 
   const scan = (): void => {
-    createLibraryScan(storageId === '' ? {} : { storageBackendId: storageId })
-      .then((accepted) => {
-        showToast('Сканирование запущено…');
-        void pollScan(accepted.scanJobId);
+    if (storageId === '' && storage === null) {
+      showToast('Список хранилищ ещё загружается');
+      return;
+    }
+
+    const requests: LibraryScanRequest[] =
+      storageId === ''
+        ? [
+            {},
+            ...(storage?.additionalBackends
+              .filter((backend) => backend.isEnabled)
+              .map((backend) => ({ storageBackendId: backend.id })) ?? []),
+          ]
+        : [{ storageBackendId: storageId }];
+
+    void Promise.all(requests.map((request) => createLibraryScan(request)))
+      .then(async (accepted) => {
+        showToast(`Сканирование запущено: хранилищ ${accepted.length}`);
+        return Promise.all(accepted.map((job) => waitForScan(job.scanJobId)));
+      })
+      .then((statuses) => {
+        const failed = statuses.find((status) => status.status === 'failed');
+        if (failed !== undefined) {
+          showToast(`Сканирование не удалось: ${failed.failureReason ?? 'неизвестная ошибка'}`);
+          return;
+        }
+        const discovered = statuses.reduce((total, status) => total + status.discoveredCount, 0);
+        showToast(`Найдено треков: ${discovered}`);
+        setReloadKey((key) => key + 1);
       })
       .catch((cause) => showToast(errorMessage(cause, 'Ошибка сканирования')));
-  };
-
-  const pollScan = async (scanJobId: string): Promise<void> => {
-    for (let attempt = 0; attempt < 60; attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 1500));
-      const status = await getLibraryScan(scanJobId).catch(() => null);
-      if (status === null) {
-        return;
-      }
-      if (status.status === 'completed') {
-        showToast(`Найдено треков: ${status.discoveredCount}`);
-        setReloadKey((key) => key + 1);
-        return;
-      }
-      if (status.status === 'failed') {
-        showToast(`Сканирование не удалось: ${status.failureReason ?? ''}`);
-        return;
-      }
-    }
   };
 
   const toggleBg = (active: boolean): string => (active ? COLORS.selection : '');
@@ -179,11 +208,6 @@ export function LibraryPage({ groupBy: navGroupBy }: LibraryPageProps): ReactEle
         <div style={{ padding: '40px', textAlign: 'center', color: '#89a' }}>
           В этом хранилище нет треков по запросу.
         </div>
-      ) : null}
-      {state.hasMore ? (
-        <p style={{ fontSize: '11px', color: COLORS.muted, margin: '0 0 8px' }}>
-          Показаны первые {PAGE_LIMIT} треков — уточните поиск, чтобы увидеть остальные.
-        </p>
       ) : null}
 
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill,minmax(150px,1fr))', gap: '12px' }}>

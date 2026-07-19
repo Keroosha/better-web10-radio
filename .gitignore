@@ -505,3 +505,5 @@ fabric.properties
 # write it without a storage-init one-shot; ignore any media dropped inside.
 .storage/*
 !.storage/.gitkeep
+
+.playwright-cli/

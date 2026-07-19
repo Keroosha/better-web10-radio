@@ -313,7 +313,9 @@ test('scan-all issues a library scan for every backend', async () => {
   renderPage();
 
   fireEvent.click(await screen.findByRole('button', { name: '⟳ Сканировать всё' }));
-  await waitFor(() => expect(vi.mocked(createLibraryScan)).toHaveBeenCalledWith({}));
+  await waitFor(() => expect(vi.mocked(createLibraryScan)).toHaveBeenCalledTimes(2));
+  expect(vi.mocked(createLibraryScan)).toHaveBeenCalledWith({});
+  expect(vi.mocked(createLibraryScan)).toHaveBeenCalledWith({ storageBackendId: S3_ID });
 });
 
 test('creates a folder in the active storage path', async () => {

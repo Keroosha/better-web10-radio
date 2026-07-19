@@ -441,10 +441,15 @@ function StorageExplorer({ initial }: { readonly initial: Storage }): ReactEleme
   );
 
   const scanAll = useCallback((): void => {
-    createLibraryScan({})
-      .then(() => showToast('Сканирование запущено…'))
+    const enabledDrives = drives.filter((drive) => drive.enabled);
+    void Promise.all(
+      enabledDrives.map((drive) =>
+        createLibraryScan(drive.backendId === null ? {} : { storageBackendId: drive.backendId }),
+      ),
+    )
+      .then(() => showToast(`Сканирование запущено: хранилищ ${enabledDrives.length}`))
       .catch((cause) => showToast(errorMessage(cause, 'Ошибка сканирования')));
-  }, [showToast]);
+  }, [drives, showToast]);
 
   const scanDrive = useCallback(
     (drive: Drive): void => {

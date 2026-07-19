@@ -28,7 +28,9 @@ type RuntimeSnapshot =
       LastHeartbeatUtc: DateTimeOffset }
 
 module Runtime =
-    let callbackStartDeadline = TimeSpan.FromSeconds 5.0
+    // Custom media protocols materialize the whole source before Liquidsoap emits on_track.
+    // Allow large Local/S3 objects to finish resolving without falsely failing live playback.
+    let callbackStartDeadline = TimeSpan.FromSeconds 60.0
     let pollCadence = TimeSpan.FromSeconds 2.0
     let heartbeatCadence = TimeSpan.FromSeconds 10.0
     let leaseCadence = TimeSpan.FromSeconds 10.0

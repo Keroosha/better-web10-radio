@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-for command in liquidsoap Xvfb chromium ffmpeg ffprobe unclutter fc-match; do
+for command in liquidsoap Xvfb chromium ffmpeg ffprobe unclutter fc-match vulkaninfo; do
     command -v "$command" >/dev/null
 done
 
@@ -21,11 +21,14 @@ liquidsoap --check ./liquidsoap/web10.liq
 width="${WEB10_STREAM__WIDTH:-1280}"
 height="${WEB10_STREAM__HEIGHT:-720}"
 framerate="${WEB10_STREAM__FRAMERATE:-30}"
+video_bitrate_kbps="${WEB10_STREAM__VIDEO_BITRATE_KBPS:-2500}"
+video_preset="${WEB10_STREAM__VIDEO_PRESET:-veryfast}"
 display_number=$((100 + ($$ % 800)))
 display=":${display_number}"
 runtime_dir=$(mktemp -d)
 chromium_profile="${runtime_dir}/chromium"
 flv_output="${runtime_dir}/capture.flv"
+stage_html="${runtime_dir}/webgl.html"
 unclutter_pid=""
 chromium_pid=""
 
@@ -80,14 +83,40 @@ if ! kill -0 "$unclutter_pid" 2>/dev/null; then
     exit 1
 fi
 
-DISPLAY="$display" chromium \
-    --kiosk \
-    --no-sandbox \
-    --enable-unsafe-swiftshader \
-    --autoplay-policy=no-user-gesture-required \
-    "--window-size=${width},${height}" \
-    "--user-data-dir=${chromium_profile}" \
-    about:blank >/dev/null 2>&1 &
+cat >"$stage_html" <<EOF
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+html, body, canvas { width: 100%; height: 100%; margin: 0; overflow: hidden; background: black; cursor: none; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="stage" width="${width}" height="${height}"></canvas>
+<script>
+const canvas = document.getElementById("stage");
+const gl = canvas.getContext("webgl2") || canvas.getContext("webgl");
+if (gl) {
+    const draw = () => {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        gl.clearColor(1.0, 0.0, 1.0, 1.0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        requestAnimationFrame(draw);
+    };
+    draw();
+}
+</script>
+</body>
+</html>
+EOF
+
+DISPLAY="$display" ./scripts/start-chromium.sh \
+    "$chromium_profile" \
+    "file://${stage_html}" >/dev/null 2>&1 &
 chromium_pid=$!
 
 sleep 1
@@ -97,11 +126,11 @@ if ! kill -0 "$chromium_pid" 2>/dev/null; then
 fi
 
 DISPLAY="$display" ffmpeg -hide_banner -loglevel error -y \
-    -f x11grab -framerate "$framerate" -video_size "${width}x${height}" -i "$display" \
+    -f x11grab -draw_mouse 0 -framerate "$framerate" -video_size "${width}x${height}" -i "$display" \
     -f lavfi -i anullsrc=r=48000:cl=stereo \
     -t 3 -map 0:v:0 -map 1:a:0 \
     -x264-params sar=1/1 \
-    -c:v libx264 -pix_fmt yuv420p -preset veryfast -b:v 2500k -g $((framerate * 2)) \
+    -c:v libx264 -pix_fmt yuv420p -preset "$video_preset" -b:v "${video_bitrate_kbps}k" -g $((framerate * 2)) \
     -c:a aac -ar 48000 -b:a "${WEB10_STREAM__BITRATE_KBPS:-192}k" \
     -f flv "$flv_output"
 
@@ -114,6 +143,50 @@ video_geometry="$(ffprobe -v error -select_streams v:0 -show_entries stream=widt
 expected_video_geometry="${width},${height},1:1"
 if [ "$video_geometry" != "$expected_video_geometry" ]; then
     echo "FFmpeg produced ${video_geometry}; expected ${expected_video_geometry}" >&2
+    exit 1
+fi
+
+rgb_values="$(
+    ffmpeg -hide_banner -loglevel error \
+        -i "$flv_output" \
+        -an -vf "format=rgb24,crop=1:1:trunc(iw/2):trunc(ih/2)" \
+        -f rawvideo -pix_fmt rgb24 - |
+    tail -c 3 |
+    od -An -tu1
+)"
+set -- $rgb_values
+if [ "$#" -ne 3 ]; then
+    echo "FFmpeg did not extract the final central RGB pixel" >&2
+    exit 1
+fi
+red="$1"
+green="$2"
+blue="$3"
+if [ "$red" -lt 220 ] || [ "$green" -gt 35 ] || [ "$blue" -lt 220 ]; then
+    echo "WebGL frame pixel ${red},${green},${blue} is not magenta" >&2
+    exit 1
+fi
+
+crash_report_dir="${HOME:-/home/web10}/.config/chromium/Crash Reports/pending"
+mkdir -p "$crash_report_dir"
+: >"${crash_report_dir}/smoke-renderer.dmp"
+attempt=0
+while kill -0 "$chromium_pid" 2>/dev/null; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 50 ]; then
+        echo "Chromium wrapper did not exit after a child crash report" >&2
+        exit 1
+    fi
+    sleep 0.1
+done
+if wait "$chromium_pid"; then
+    chromium_status=0
+else
+    chromium_status=$?
+fi
+chromium_pid=""
+if [ "$chromium_status" -ne 70 ]; then
+    echo "Chromium wrapper exited ${chromium_status}; expected child-crash status 70" >&2
     exit 1
 fi
 
@@ -131,3 +204,7 @@ if ! awk -v duration="$cue_duration" 'BEGIN { exit !(duration >= 0.90 && duratio
     echo "FFmpeg did not produce a 0.90-1.10 second FLAC CUE segment" >&2
     exit 1
 fi
+
+graphics_backend="${WEB10_STREAM__GRAPHICS_BACKEND-swiftshader}"
+printf 'graphics_backend=%s rgb=%s,%s,%s geometry=%sx%s sar=1:1 status=passed\n' \
+    "$graphics_backend" "$red" "$green" "$blue" "$width" "$height"

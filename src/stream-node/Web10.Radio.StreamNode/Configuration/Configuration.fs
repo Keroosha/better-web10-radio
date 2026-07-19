@@ -40,6 +40,28 @@ module Configuration =
             | _ -> Error(ConfigurationError.Invalid key)
         | _ -> Error(ConfigurationError.Invalid key)
 
+    let private graphicsBackend environment =
+        match optional environment "WEB10_STREAM__GRAPHICS_BACKEND" "swiftshader" with
+        | Ok "swiftshader" -> Ok GraphicsBackend.SwiftShader
+        | Ok "vulkan" -> Ok GraphicsBackend.Vulkan
+        | Ok _
+        | Error _ -> Error(ConfigurationError.Invalid "WEB10_STREAM__GRAPHICS_BACKEND")
+
+    let private videoPreset environment =
+        match optional environment "WEB10_STREAM__VIDEO_PRESET" "veryfast" with
+        | Ok "ultrafast" -> Ok VideoPreset.UltraFast
+        | Ok "superfast" -> Ok VideoPreset.SuperFast
+        | Ok "veryfast" -> Ok VideoPreset.VeryFast
+        | Ok "faster" -> Ok VideoPreset.Faster
+        | Ok "fast" -> Ok VideoPreset.Fast
+        | Ok "medium" -> Ok VideoPreset.Medium
+        | Ok "slow" -> Ok VideoPreset.Slow
+        | Ok "slower" -> Ok VideoPreset.Slower
+        | Ok "veryslow" -> Ok VideoPreset.VerySlow
+        | Ok "placebo" -> Ok VideoPreset.Placebo
+        | Ok _
+        | Error _ -> Error(ConfigurationError.Invalid "WEB10_STREAM__VIDEO_PRESET")
+
     let private validateHttp key (allowQuery: bool) value =
         try
             let parsed = Uri(value, UriKind.Absolute)
@@ -84,10 +106,13 @@ module Configuration =
             do!
                 if display.IsMatch displayValue then Ok()
                 else Error(ConfigurationError.Invalid "WEB10_STREAM__DISPLAY")
+            let! graphicsBackend = graphicsBackend environment
             let! width = positiveInt environment "WEB10_STREAM__WIDTH" 1280
             let! height = positiveInt environment "WEB10_STREAM__HEIGHT" 720
             let! framerate = positiveInt environment "WEB10_STREAM__FRAMERATE" 30
             let! bitrate = positiveInt environment "WEB10_STREAM__BITRATE_KBPS" 192
+            let! videoBitrate = positiveInt environment "WEB10_STREAM__VIDEO_BITRATE_KBPS" 2500
+            let! videoPreset = videoPreset environment
             let! storageRoot = optional environment "WEB10_STORAGE__ROOT" "/var/lib/web10/storage"
             let! cacheRoot = optional environment "WEB10_STORAGE__CACHE_ROOT" "/var/lib/web10/cache"
             let! callbackPort = positiveInt environment "WEB10_STREAM__CALLBACK_PORT" 18080
@@ -97,8 +122,10 @@ module Configuration =
             let! socket = optional environment "WEB10_STREAM__LIQUIDSOAP_SOCKET" "/run/web10/liquidsoap.sock"
             return
                 { ApiBaseUrl = api.TrimEnd('/'); CallbackToken = callbackToken; StageUrl = stage
-                  RtmpUrl = rtmp; RtmpKey = rtmpKey; Display = displayValue; Width = width
-                  Height = height; Framerate = framerate; BitrateKbps = bitrate; StorageRoot = storageRoot
+                  RtmpUrl = rtmp; RtmpKey = rtmpKey; Display = displayValue
+                  GraphicsBackend = graphicsBackend; Width = width; Height = height
+                  Framerate = framerate; BitrateKbps = bitrate
+                  VideoBitrateKbps = videoBitrate; VideoPreset = videoPreset; StorageRoot = storageRoot
                   CacheRoot = cacheRoot; CallbackPort = callbackPort; LiquidsoapSocket = socket }
         }
 

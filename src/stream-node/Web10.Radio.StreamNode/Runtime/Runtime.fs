@@ -61,10 +61,13 @@ module Runtime =
         values["WEB10_STREAM__RTMP_URL"] <- config.RtmpUrl
         values["WEB10_STREAM__RTMP_KEY"] <- config.RtmpKey
         values["WEB10_STREAM__DISPLAY"] <- config.Display
+        values["WEB10_STREAM__GRAPHICS_BACKEND"] <- GraphicsBackend.value config.GraphicsBackend
         values["WEB10_STREAM__WIDTH"] <- string config.Width
         values["WEB10_STREAM__HEIGHT"] <- string config.Height
         values["WEB10_STREAM__FRAMERATE"] <- string config.Framerate
         values["WEB10_STREAM__BITRATE_KBPS"] <- string config.BitrateKbps
+        values["WEB10_STREAM__VIDEO_BITRATE_KBPS"] <- string config.VideoBitrateKbps
+        values["WEB10_STREAM__VIDEO_PRESET"] <- VideoPreset.value config.VideoPreset
         values["WEB10_STREAM__CALLBACK_PORT"] <- string config.CallbackPort
         values["WEB10_STORAGE__ROOT"] <- config.StorageRoot
         values["WEB10_STORAGE__CACHE_ROOT"] <- config.CacheRoot
@@ -217,7 +220,7 @@ type RuntimeSupervisor(
                 try Directory.Delete(profile, true) with _ -> ()
                 let childEnv = Dictionary<string, string>(env)
                 childEnv["DISPLAY"] <- config.Display
-                chromium <- Some(processFactory.Start(ProcessKind.Chromium, [ "chromium"; "--kiosk"; "--no-sandbox"; "--enable-unsafe-swiftshader"; "--autoplay-policy=no-user-gesture-required"; sprintf "--window-size=%d,%d" config.Width config.Height; "--user-data-dir=/tmp/web10-chromium"; Runtime.captureStageUrl config.StageUrl ], childEnv, Directory.GetCurrentDirectory(), false))
+                chromium <- Some(processFactory.Start(ProcessKind.Chromium, [ "./scripts/start-chromium.sh"; profile; Runtime.captureStageUrl config.StageUrl ], childEnv, Directory.GetCurrentDirectory(), false))
         }
 
     member private _.StartMedia() =

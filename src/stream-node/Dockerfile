@@ -44,7 +44,9 @@ RUN set -eu; \
         socat \
         unclutter-xfixes \
         fontconfig \
-        fonts-noto-cjk; \
+        fonts-noto-cjk \
+        mesa-vulkan-drivers \
+        vulkan-tools; \
     liquidsoap_deb=/tmp/liquidsoap.deb; \
     curl --fail --location --proto '=https' --tlsv1.2 "${LIQUIDSOAP_DEB_URL}" --output "${liquidsoap_deb}"; \
     printf '%s  %s\n' "${LIQUIDSOAP_DEB_SHA256}" "${liquidsoap_deb}" | sha256sum --check --status -; \
@@ -59,8 +61,9 @@ RUN set -eu; \
 WORKDIR /opt/web10/stream-node
 COPY --from=build /app/publish/ ./
 COPY scripts/check-runtime.sh ./scripts/check-runtime.sh
+COPY scripts/start-chromium.sh ./scripts/start-chromium.sh
 COPY liquidsoap/web10.liq ./liquidsoap/web10.liq
-RUN chmod 0755 ./scripts/check-runtime.sh \
+RUN chmod 0755 ./scripts/check-runtime.sh ./scripts/start-chromium.sh \
     && install -d -o 1000 -g 1000 -m 0775 /run/web10 /var/lib/web10/storage /var/lib/web10/cache
 USER 1000:1000
 

@@ -70,6 +70,81 @@ type StreamNodeContractTests() =
         | Error error -> Assert.Fail(sprintf "Expected valid 4:3 stream configuration, got %A." error)
 
     [<Test>]
+    member _.``runtime configuration defaults graphics to propagated SwiftShader``() =
+        let values = StreamNodeContractTests.ConfigurationValues()
+
+        match Configuration.validate values with
+        | Ok config ->
+            let processEnvironment = Runtime.environment config
+            Assert.Multiple(fun () ->
+                Assert.That(config.GraphicsBackend, Is.EqualTo(GraphicsBackend.SwiftShader))
+                Assert.That(processEnvironment["WEB10_STREAM__GRAPHICS_BACKEND"], Is.EqualTo("swiftshader")))
+        | Error error -> Assert.Fail(sprintf "Expected default graphics configuration, got %A." error)
+
+    [<Test>]
+    member _.``runtime configuration propagates explicit Vulkan graphics``() =
+        let values = StreamNodeContractTests.ConfigurationValues()
+        values["WEB10_STREAM__GRAPHICS_BACKEND"] <- "vulkan"
+
+        match Configuration.validate values with
+        | Ok config ->
+            let processEnvironment = Runtime.environment config
+            Assert.Multiple(fun () ->
+                Assert.That(config.GraphicsBackend, Is.EqualTo(GraphicsBackend.Vulkan))
+                Assert.That(processEnvironment["WEB10_STREAM__GRAPHICS_BACKEND"], Is.EqualTo("vulkan")))
+        | Error error -> Assert.Fail(sprintf "Expected Vulkan graphics configuration, got %A." error)
+
+    [<TestCase("auto")>]
+    [<TestCase("")>]
+    [<TestCase(" vulkan")>]
+    member _.``runtime configuration rejects invalid graphics backend``(value: string) =
+        let values = StreamNodeContractTests.ConfigurationValues()
+        values["WEB10_STREAM__GRAPHICS_BACKEND"] <- value
+
+        match Configuration.validate values with
+        | Error(ConfigurationError.Invalid key) ->
+            Assert.That(key, Is.EqualTo("WEB10_STREAM__GRAPHICS_BACKEND"))
+        | result -> Assert.Fail(sprintf "Expected graphics backend validation failure, got %A." result)
+
+    [<Test>]
+    member _.``runtime configuration propagates explicit video encoding settings``() =
+        let values = StreamNodeContractTests.ConfigurationValues()
+        values["WEB10_STREAM__VIDEO_BITRATE_KBPS"] <- "3000"
+        values["WEB10_STREAM__VIDEO_PRESET"] <- "medium"
+
+        match Configuration.validate values with
+        | Ok config ->
+            let processEnvironment = Runtime.environment config
+            Assert.Multiple(fun () ->
+                Assert.That(config.VideoBitrateKbps, Is.EqualTo(3000))
+                Assert.That(config.VideoPreset, Is.EqualTo(VideoPreset.Medium))
+                Assert.That(processEnvironment["WEB10_STREAM__VIDEO_BITRATE_KBPS"], Is.EqualTo("3000"))
+                Assert.That(processEnvironment["WEB10_STREAM__VIDEO_PRESET"], Is.EqualTo("medium")))
+        | Error error -> Assert.Fail(sprintf "Expected valid video encoding configuration, got %A." error)
+
+    [<TestCase("auto")>]
+    [<TestCase("")>]
+    [<TestCase("Medium")>]
+    member _.``runtime configuration rejects invalid video preset``(value: string) =
+        let values = StreamNodeContractTests.ConfigurationValues()
+        values["WEB10_STREAM__VIDEO_PRESET"] <- value
+
+        match Configuration.validate values with
+        | Error(ConfigurationError.Invalid key) ->
+            Assert.That(key, Is.EqualTo("WEB10_STREAM__VIDEO_PRESET"))
+        | result -> Assert.Fail(sprintf "Expected video preset validation failure, got %A." result)
+
+    [<Test>]
+    member _.``runtime configuration rejects nonpositive video bitrate``() =
+        let values = StreamNodeContractTests.ConfigurationValues()
+        values["WEB10_STREAM__VIDEO_BITRATE_KBPS"] <- "0"
+
+        match Configuration.validate values with
+        | Error(ConfigurationError.Invalid key) ->
+            Assert.That(key, Is.EqualTo("WEB10_STREAM__VIDEO_BITRATE_KBPS"))
+        | result -> Assert.Fail(sprintf "Expected video bitrate validation failure, got %A." result)
+
+    [<Test>]
     member _.``runtime configuration rejects non-RTMP target``() =
         let values = Dictionary<string, string>()
         values["WEB10_API__BASE_URL"] <- "http://api:8080"
@@ -151,14 +226,17 @@ type StreamNodeContractTests() =
         | Error(BackendError.InvalidResponse _) -> ()
         | actual -> Assert.Fail(sprintf "Expected invalid CUE timing rejection, got %A." actual)
 
-    static member private SampleConfig() =
+    static member private ConfigurationValues() : Dictionary<string, string> =
         let values = Dictionary<string, string>()
         values["WEB10_API__BASE_URL"] <- "http://api:8080"
         values["WEB10_STREAM__CALLBACK_TOKEN"] <- "stream-callback-token-1234567890"
         values["WEB10_STREAM__STAGE_URL"] <- "http://frontend/"
         values["WEB10_STREAM__RTMP_URL"] <- "rtmp://rtmp-sink:1935/s/"
         values["WEB10_STREAM__RTMP_KEY"] <- "compose-smoke-rtmp-key"
-        match Configuration.validate values with
+        values
+
+    static member private SampleConfig() =
+        match Configuration.validate (StreamNodeContractTests.ConfigurationValues()) with
         | Ok config -> config
         | Error error -> failwithf "Expected valid stream-node configuration, got %A." error
 

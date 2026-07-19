@@ -29,6 +29,11 @@ bitrate_kbps = int_of_string(
   environment.get(default="192", "WEB10_STREAM__BITRATE_KBPS"),
   default=192
 )
+video_bitrate_kbps = int_of_string(
+  environment.get(default="2500", "WEB10_STREAM__VIDEO_BITRATE_KBPS"),
+  default=2500
+)
+video_preset = environment.get(default="veryfast", "WEB10_STREAM__VIDEO_PRESET")
 rtmp_url = environment.get("WEB10_STREAM__RTMP_URL")
 rtmp_key = environment.get("WEB10_STREAM__RTMP_KEY")
 rtmp_target = "#{rtmp_url}#{rtmp_key}"
@@ -175,8 +180,8 @@ rtmp_encoder = %ffmpeg(
     codec="libx264",
     "x264-params"="sar=1/1",
     pixel_format="yuv420p",
-    b="2500k",
-    preset="veryfast",
+    b="#{video_bitrate_kbps}k",
+    preset=video_preset,
     framerate=framerate,
     g=gop
   )

@@ -1,0 +1,10 @@
+# Optional stream-node AMD WebGL overlay. Merge after production and Xray overlays.
+services:
+  stream-node:
+    image: "${WEB10_GPU_STREAM_NODE_IMAGE:?WEB10_GPU_STREAM_NODE_IMAGE is required with compose.amd-gpu.yaml}"
+    environment:
+      WEB10_STREAM__GRAPHICS_BACKEND: vulkan
+    devices:
+      - "${WEB10_GPU_RENDER_DEVICE:?WEB10_GPU_RENDER_DEVICE is required with compose.amd-gpu.yaml}:${WEB10_GPU_RENDER_DEVICE:?WEB10_GPU_RENDER_DEVICE is required with compose.amd-gpu.yaml}:rwm"
+    group_add:
+      - "${WEB10_GPU_RENDER_GID:?WEB10_GPU_RENDER_GID is required with compose.amd-gpu.yaml}"

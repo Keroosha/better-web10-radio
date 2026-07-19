@@ -34,6 +34,42 @@ type CallbackName =
     | ProtocolError
     | StartTimeout
 
+[<RequireQualifiedAccess>]
+type GraphicsBackend =
+    | SwiftShader
+    | Vulkan
+
+module GraphicsBackend =
+    let value = function
+        | GraphicsBackend.SwiftShader -> "swiftshader"
+        | GraphicsBackend.Vulkan -> "vulkan"
+
+[<RequireQualifiedAccess>]
+type VideoPreset =
+    | UltraFast
+    | SuperFast
+    | VeryFast
+    | Faster
+    | Fast
+    | Medium
+    | Slow
+    | Slower
+    | VerySlow
+    | Placebo
+
+module VideoPreset =
+    let value = function
+        | VideoPreset.UltraFast -> "ultrafast"
+        | VideoPreset.SuperFast -> "superfast"
+        | VideoPreset.VeryFast -> "veryfast"
+        | VideoPreset.Faster -> "faster"
+        | VideoPreset.Fast -> "fast"
+        | VideoPreset.Medium -> "medium"
+        | VideoPreset.Slow -> "slow"
+        | VideoPreset.Slower -> "slower"
+        | VideoPreset.VerySlow -> "veryslow"
+        | VideoPreset.Placebo -> "placebo"
+
 [<CLIMutable>]
 type RuntimeConfig =
     { ApiBaseUrl: string
@@ -42,10 +78,13 @@ type RuntimeConfig =
       RtmpUrl: string
       RtmpKey: string
       Display: string
+      GraphicsBackend: GraphicsBackend
       Width: int
       Height: int
       Framerate: int
       BitrateKbps: int
+      VideoBitrateKbps: int
+      VideoPreset: VideoPreset
       StorageRoot: string
       CacheRoot: string
       CallbackPort: int

@@ -23,6 +23,6 @@ module MigrationMetadataTests =
 
         Assert.That(
             versions,
-            Is.EqualTo(([| 202607080001L; 202607100001L; 202607100002L; 202607100003L; 202607100004L; 202607110001L; 202607110002L; 202607110003L; 202607110004L; 202607120001L; 202607120002L; 202607120003L; 202607130001L; 202607130002L; 202607130003L |] : int64 array) :> obj),
-            "The ordered schema sequence must include the 20260713 storage cache settings, super chat banner, and FLAC CUE migrations."
+            Is.EqualTo(([| 202607080001L; 202607100001L; 202607100002L; 202607100003L; 202607100004L; 202607110001L; 202607110002L; 202607110003L; 202607110004L; 202607120001L; 202607120002L; 202607120003L; 202607130001L; 202607130002L; 202607130003L; 202607140001L |] : int64 array) :> obj),
+            "The ordered schema sequence must include the 20260713 storage cache settings, super chat banner, FLAC CUE migrations, and 20260714 library scan reconciliation migration."
         )

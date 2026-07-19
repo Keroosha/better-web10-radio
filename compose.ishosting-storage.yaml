@@ -1,0 +1,9 @@
+# Optional production overlay for the host-managed ishosting SSHFS mount.
+services:
+  api:
+    volumes:
+      - type: bind
+        source: /var/data/ishosting-storage
+        target: /var/lib/web10/ishosting-storage
+        bind:
+          propagation: rslave

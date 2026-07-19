@@ -62,6 +62,9 @@ flowchart LR
   StreamNode --> FFmpeg[FFmpeg + x11grab]
   StreamNode --> RTMP[Telegram RTMP]
   LS --> RTMP
+  Bot -. optional SOCKS5 egress .-> Xray[production Xray egress sidecar]
+  StreamNode -. optional transparent public TCP .-> Xray
+  Xray --> TelegramEgress[Telegram Bot API + RTMP]
 ```
 
 Архитектурные решения v0:
@@ -71,6 +74,7 @@ flowchart LR
 - `/api/v0/telegram/*` is served by the Telegram process and exposed through the reverse proxy; the API process has no Telegram adapter reference.
 - `src/stream-node/` is an F# container/process group because Chromium/Xvfb/LiquidSoap/FFmpeg require OS-level dependencies and process supervision.
 - `src/frontend/web-stage` and `src/frontend/admin` are frontend workspaces inside one Bun monorepo.
+- Production deployment has one optional Xray egress boundary. `compose.prod.yaml` remains the direct baseline; only `compose.xray.yaml` sends Telegram Bot API calls through SOCKS5 and stream-node public TCP through transparent redirect. Application images and their Bot/RTMP configuration remain identical in both topologies.
 
 ## 5. Backend contract: HTTP API v0
 
@@ -441,6 +445,12 @@ The selected row is updated to `Claimed` in the same transaction before playback
 - `WEB10_OTEL__ENABLED=true|false` (optional; defaults to `true`)
 - `WEB10_OTEL__EXPORTER_OTLP_ENDPOINT` is required only when `WEB10_OTEL__ENABLED=true`.
 
+Production Xray overlay inputs не являются application configuration:
+
+- `WEB10_XRAY__OUTBOUND_CONFIG_FILE` — required only with `compose.xray.yaml`; points to an owner-only file-backed secret with exact top-level shape `{ "outbounds": [...] }`.
+- Ровно один non-direct outbound имеет exact tag `proxy`; case-insensitive protocols `direct` and `freedom` запрещены. Optional helper outbounds также должны быть non-direct. Infrastructure-owned inbounds/routing не входят в operator secret.
+- `WEB10_XRAY__NO_PROXY` optional and defaults to exact `localhost,127.0.0.1,postgres,api`.
+
 Optional development configuration:
 
 - `WEB10_DEV__FIXTURES_ENABLED=false` controls only the development fixture endpoint. It never enables that endpoint outside `IWebHostEnvironment.IsDevelopment()`.
@@ -477,6 +487,10 @@ Startup validation rules:
 - Compose smoke explicitly supplies request/say prices `100`/`50`; production также обязана задать оба keys и не получает runtime default.
 - Compose startup order: PostgreSQL healthcheck → migrator successful completion → API/frontend/stream-node/RTMP sink health. Bounded `docker compose up --wait --wait-timeout` возвращает success только после healthy declared services; ad hoc `sleep` не входит в smoke contract.
 - В chiseled API container healthcheck выполняет exact managed command `dotnet Web10.Radio.API.dll --health-check http://127.0.0.1:8080/health/live`; image не предполагает наличие shell, `curl` или `wget`, а probe exit code отражает HTTP success.
+- `compose.prod.yaml` never references Xray, proxy variables, shared network namespaces, or the Xray secret. Proxy mode is enabled only by merging `compose.xray.yaml`; omitting it and using `--remove-orphans` restores direct Telegram/RTMP egress and removes the sidecar without rebuilding application images.
+- `xray-proxy` uses the immutable `xray-proxy:${WEB10_IMAGE_TAG}` image built from pinned Xray-core `26.6.1` into `debian:trixie-slim`. It runs Xray as root PID 1 with `cap_drop: ALL`, retaining only `DAC_READ_SEARCH` for the owner-only secret and `NET_ADMIN` for transparent sockets/iptables; root-owned Xray and health traffic are excluded from redirect.
+- Infrastructure config owns one no-auth TCP-only SOCKS inbound and separate IPv4/IPv6 transparent TCP inbounds. Before network mutation, entrypoint validates the file secret, rejects direct/freedom fallback, and runs Xray config test. IPv4 redirect bypasses loopback/private/link-local/CGNAT/multicast/reserved ranges. An IPv6 default route requires a working IPv6 nat redirect with equivalent bypasses; otherwise startup fails closed.
+- Active Xray health performs a TLS-verified GET to `https://api.telegram.org/` through local `socks5h`. Telegram and stream-node wait for healthy Xray on initial proxy-mode startup. Upstream loss has no direct fallback; Telegram readiness degrades and stream-node preserves terminal `RTMP output failed` behavior.
 
 DI rules aligned with ASP.NET lifecycle:
 
@@ -537,6 +551,7 @@ Web-stage visual invariants from the mock:
 - Missing file, no start callback in five seconds, decoder/output failure, or callback error invokes fenced completion with `failed` and a bounded reason, then emits `degraded`. An RTMP output exit during an active assignment reports the exact `RTMP output failed` reason, enters terminal failure without consuming blind restart attempts, and requires an admin restart after the target is restored.
 - The runtime polls `GET /api/v0/stream-node/control`. `stopped` tears down LiquidSoap/FFmpeg while retaining supervisor, Xvfb, and Chromium and heartbeats `offline`; a larger `restartGeneration` restarts the media pipeline once and resumes `running`. Other child crashes emit `restarting` with exponential 1/2/4/8/16-second delays. Exceeding the restart budget emits `failed` and remains a healthy control daemon until an admin raises restart generation.
 - It reports `live` only when Xvfb, Chromium, LiquidSoap, FFmpeg input/output, and an active playback assignment are healthy. Valid statuses are exact lowercase `starting|live|degraded|restarting|failed|offline` at the API boundary. Every heartbeat includes bitrate, restart attempt, and current queue item (or null).
+- With `compose.xray.yaml`, stream-node uses exact `network_mode: "service:xray-proxy"` while retaining UID `1000:1000`. Its unchanged `${WEB10_STREAM__RTMP_URL}${WEB10_STREAM__RTMP_KEY}` TCP connection is transparently redirected with the original RTMPS hostname/SNI; loopback and private Compose destinations such as `api` remain direct. The sidecar stays on the default network, so the shared namespace preserves internal DNS/service reachability.
 - `check-runtime.sh` validates actual runtime capability: required binaries, F# `validate-config`, LiquidSoap syntax, Chromium/Xvfb startup, and FFmpeg `x11grab`/FLV capture. The F# Tools smoke suite covers playback controls and callback/configuration contracts.
 ## 12. Testing and acceptance
 
@@ -548,3 +563,4 @@ Integration tests are preferred over unit tests because v0 risk sits at contract
 - stream-node smoke checks for Xvfb, Chromium, LiquidSoap, FFmpeg availability, and heartbeat reporting.
 - frontend checks for strict TypeScript, no JavaScript, no `any`/`unknown`, scene cleanup, and API fallback behavior.
 - Docker smoke path: PostgreSQL + API + frontend + stream-node start and health endpoints become green.
+- Xray acceptance includes the pinned Debian image audit/build, invalid/malformed/direct outbound fail-closed fixtures, unreachable-upstream `unhealthy` state, resolved overlay and direct Compose models, effective capability/UID/listener checks, Telegram `getMe` readiness through SOCKS, and an observed Telegram RTMP stream with increasing transparent redirect counters. Compose liveness alone is not RTMP acceptance.

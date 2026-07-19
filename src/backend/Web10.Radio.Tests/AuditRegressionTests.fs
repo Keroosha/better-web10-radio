@@ -74,16 +74,19 @@ module AuditRegressionTests =
         let apiDockerfilePath, apiDockerfile = readRelativePath "src/backend/Dockerfile"
         let migratorDockerfilePath, migratorDockerfile = readRelativePath "src/backend/Dockerfile.migrator"
         let streamNodeDockerfilePath, streamNodeDockerfile = readRelativePath "src/stream-node/Dockerfile"
+        let xrayDockerfilePath, xrayDockerfile = readRelativePath "deploy/Dockerfile.xray"
         let composePath, compose = readRelativePath "compose.yaml"
         let imageDefinitions =
             [ apiDockerfilePath, apiDockerfile
               migratorDockerfilePath, migratorDockerfile
               streamNodeDockerfilePath, streamNodeDockerfile
+              xrayDockerfilePath, xrayDockerfile
               composePath, compose ]
 
         Assert.That(apiDockerfile, Does.Contain("mcr.microsoft.com/dotnet/aspnet:10.0-noble-chiseled"))
         Assert.That(migratorDockerfile, Does.Contain("mcr.microsoft.com/dotnet/runtime:10.0-noble-chiseled"))
         Assert.That(streamNodeDockerfile, Does.Contain("FROM debian:trixie-slim"))
+        Assert.That(xrayDockerfile, Does.Contain("FROM debian:trixie-slim"))
 
         [ "alpine"
           "libmusl"

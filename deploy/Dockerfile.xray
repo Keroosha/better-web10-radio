@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1
+# Optional production egress gateway. The Xray binary is pinned by version and
+# source-image digest; the runtime remains Debian/glibc per SPEC §9.
+FROM ghcr.io/xtls/xray-core:26.6.1@sha256:3943bddece5fab72308a4415917f0391917b7b81ddbf50708988b89e6e2bd213 AS xray
+
+FROM debian:trixie-slim
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates \
+        curl \
+        iproute2 \
+        iptables \
+        jq \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=xray /usr/local/bin/xray /usr/local/bin/xray
+COPY deploy/xray/base.json /etc/xray/base.json
+COPY deploy/xray/entrypoint.sh /usr/local/bin/web10-xray-entrypoint
+COPY deploy/xray/healthcheck.sh /usr/local/bin/web10-xray-healthcheck
+RUN chmod 0755 /usr/local/bin/web10-xray-entrypoint /usr/local/bin/web10-xray-healthcheck
+
+HEALTHCHECK --interval=30s --timeout=15s --start-period=10s --retries=3 \
+    CMD ["/usr/local/bin/web10-xray-healthcheck"]
+ENTRYPOINT ["/usr/local/bin/web10-xray-entrypoint"]

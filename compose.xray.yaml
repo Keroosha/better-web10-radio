@@ -1,0 +1,42 @@
+# Optional production-only Xray egress overlay.
+# Merge after compose.prod.yaml; omit this file to retain direct egress.
+services:
+  xray-proxy:
+    image: "ghcr.io/keroosha/better-web10-radio/xray-proxy:${WEB10_IMAGE_TAG:?WEB10_IMAGE_TAG is required in prod}"
+    cap_drop: [ALL]
+    cap_add: [DAC_READ_SEARCH, NET_ADMIN]
+    read_only: true
+    tmpfs:
+      - "/run:size=1m,mode=0755"
+    security_opt: [no-new-privileges:true]
+    secrets:
+      - source: xray-outbound
+        target: /run/secrets/xray-outbound.json
+        mode: 0400
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+        compress: "true"
+    restart: unless-stopped
+
+  telegram:
+    depends_on:
+      xray-proxy:
+        condition: service_healthy
+    environment:
+      HTTPS_PROXY: "socks5://xray-proxy:1080"
+      https_proxy: "socks5://xray-proxy:1080"
+      NO_PROXY: "${WEB10_XRAY__NO_PROXY:-localhost,127.0.0.1,postgres,api}"
+      no_proxy: "${WEB10_XRAY__NO_PROXY:-localhost,127.0.0.1,postgres,api}"
+
+  stream-node:
+    network_mode: "service:xray-proxy"
+    depends_on:
+      xray-proxy:
+        condition: service_healthy
+
+secrets:
+  xray-outbound:
+    file: "${WEB10_XRAY__OUTBOUND_CONFIG_FILE:?WEB10_XRAY__OUTBOUND_CONFIG_FILE is required with compose.xray.yaml}"

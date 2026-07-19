@@ -66,6 +66,9 @@ jobs:
           - name: stream-node
             dockerfile: src/stream-node/Dockerfile
             context: src/stream-node
+          - name: xray-proxy
+            dockerfile: deploy/Dockerfile.xray
+            context: .
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3

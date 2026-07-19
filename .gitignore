@@ -8,6 +8,8 @@ TestResults/
 .env.*
 !.defaults.env
 !.env.prod.example
+!.env.xray.example
+.secrets/
 # Created by https://www.toptal.com/developers/gitignore/api/node,aspnetcore,rider
 # Edit at https://www.toptal.com/developers/gitignore?templates=node,aspnetcore,rider
 

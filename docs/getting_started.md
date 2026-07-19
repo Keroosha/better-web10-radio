@@ -79,14 +79,16 @@ WEB10_STREAM__RTMP_KEY=1594396085:XXXXXXXXXXXXXXXXXXXXXX
 
 ### 2.1 Production server с optional Xray egress
 
-Домашний production server, который не видит Telegram Bot API/RTMP напрямую, запускает
-`compose.xray.yaml` только как overlay после `compose.prod.yaml`. Development
-`compose.yaml` и его локальный `rtmp-sink` overlay не используют.
-
-Подготовьте interpolation file и owner-only outbound secret:
+Минимальный production bundle использует один owner-only `.env`. Этот файл одновременно
+выбирает Compose project/topology, участвует в interpolation и передаёт application
+configuration контейнерам. Одноразовая подготовка:
 
 ```sh
-cp .env.xray.example .env.xray
+cp .env.prod.example .env
+cat .env.xray.example deploy/compose.production.env >> .env
+${EDITOR:-vi} .env
+chmod 0600 .env
+
 mkdir -p .secrets
 chmod 0700 .secrets
 # Перенесите существующий Xray client outbound в этот файл и задайте ему tag "proxy".
@@ -94,70 +96,57 @@ ${EDITOR:-vi} .secrets/xray-outbound.json
 chmod 0600 .secrets/xray-outbound.json
 ```
 
+`deploy/compose.production.env` задаёт:
+
+```text
+COMPOSE_PROJECT_NAME=web10-radio-prod
+COMPOSE_FILE=compose.prod.yaml:compose.xray.yaml
+WEB10_PROD_ENV_FILE=.env
+WEB10_XRAY_ENV_FILE=.env
+```
+
+После этого все команды запускаются непосредственно из deployment directory:
+
+```sh
+docker compose config -q
+docker compose pull
+docker compose up -d --wait --wait-timeout 180 --remove-orphans
+docker compose ps
+
+# Перезапуск одного сервиса или всего проекта:
+docker compose restart stream-node
+docker compose restart
+
+# Диагностика:
+docker compose logs -f xray-proxy
+docker compose logs -f stream-node
+docker compose exec xray-proxy iptables -t nat -L WEB10_XRAY -v -n
+```
+
+Глобальные аргументы `-p`, `-f`, `--env-file` и `--profile` больше не нужны.
+Если Bot/Stars настроены реальными значениями, добавьте
+`COMPOSE_PROFILES=telegram` в `.env`; иначе optional Telegram service не запускается.
+
 Secret имеет exact top-level shape `{ "outbounds": [...] }`, содержит ровно один
 `tag: "proxy"` и не содержит protocol `direct`/`freedom`. VLESS/REALITY, Trojan, SOCKS и
 дополнительные non-direct helper outbounds остаются Xray-native JSON; endpoint credentials
 не попадают в `.env`, Compose command или repository. `inbounds`/`routing` принадлежат
 `deploy/xray/base.json`, а не operator secret.
 
-Proxy-on command:
-
-```sh
-docker compose \
-  -p web10-radio-prod \
-  --env-file .env.prod \
-  --env-file .env.xray \
-  -f compose.prod.yaml \
-  -f compose.xray.yaml \
-  --profile telegram \
-  up -d --wait --wait-timeout 180 --remove-orphans
-```
-
-Проверки и диагностика:
-
-```sh
-# Invalid JSON/contract/Xray config: container exits before iptables mutation.
-docker compose -p web10-radio-prod --env-file .env.prod --env-file .env.xray \
-  -f compose.prod.yaml -f compose.xray.yaml logs xray-proxy
-
-# unhealthy = api.telegram.org не прошёл TLS GET через SOCKS/upstream.
-docker compose -p web10-radio-prod --env-file .env.prod --env-file .env.xray \
-  -f compose.prod.yaml -f compose.xray.yaml ps
-
-# Реальный Funogram getMe использует тот же proxy path, что команды/LongPolling.
-docker compose -p web10-radio-prod --env-file .env.prod --env-file .env.xray \
-  -f compose.prod.yaml -f compose.xray.yaml --profile telegram \
-  exec telegram dotnet Web10.Radio.Telegram.dll \
-  --health-check http://127.0.0.1:8080/health/ready
-
-# RTMP должен быть виден в канале; counters подтверждают transparent path.
-docker compose -p web10-radio-prod --env-file .env.prod --env-file .env.xray \
-  -f compose.prod.yaml -f compose.xray.yaml exec xray-proxy \
-  iptables -t nat -L WEB10_XRAY -v -n
-docker compose -p web10-radio-prod --env-file .env.prod --env-file .env.xray \
-  -f compose.prod.yaml -f compose.xray.yaml logs stream-node
-```
-
 `unhealthy` при initial startup не пропускает Telegram/stream-node. Если tunnel пропал после
 успешного старта, direct fallback всё равно нет, но Compose автоматически не остановит уже
 запущенные dependents. Восстановите Xray, restart Telegram и выполните admin **Restart** для
-stream-node. Terminal `RTMP output failed` — ожидаемая fail-closed ошибка, а не повод менять
-`WEB10_STREAM__RTMP_URL`, RTMP key, Liquidsoap или application image.
+stream-node. Terminal `RTMP output failed` — ожидаемая fail-closed ошибка.
 
-Proxy-off после переезда на сеть с прямым Telegram egress:
+Для direct Telegram egress задайте в `.env`
+`COMPOSE_FILE=compose.prod.yaml`, верните direct RTMP URL/key и примените topology:
 
 ```sh
-docker compose \
-  -p web10-radio-prod \
-  --env-file .env.prod \
-  -f compose.prod.yaml \
-  --profile telegram \
-  up -d --wait --wait-timeout 180 --remove-orphans
+docker compose up -d --wait --wait-timeout 180 --remove-orphans
 ```
 
-Тот же project name обязателен: `xray-proxy` удаляется как orphan, Telegram/stream-node
-пересоздаются без proxy environment/shared network namespace, а immutable application
-images, Bot/RTMP configuration и database state остаются теми же.
+Тот же `COMPOSE_PROJECT_NAME` сохраняется в `.env`, поэтому `xray-proxy` удаляется как
+orphan, а database state и immutable application images остаются прежними.
 
 ## 3. Положить музыку в библиотеку
 

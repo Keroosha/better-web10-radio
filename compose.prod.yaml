@@ -1,11 +1,11 @@
 # Web10.Radio — production topology (pulls published GHCR images; does NOT build).
 #
-# This file defines the prod service graph. Actual server provisioning (TLS ingress,
-# secrets store, managed Postgres, backups) is a separate, deferred step. To use:
+# The minimal deployment bundle keeps its canonical configuration in `.env`; Compose loads
+# project/file defaults from it automatically. After one-time setup from the tracked templates:
 #
-#   cp .env.prod.example .env.prod   # fill in real secrets (gitignored)
-#   COMPOSE_PROJECT_NAME=web10-radio-prod docker compose -p "$COMPOSE_PROJECT_NAME" -f compose.prod.yaml --env-file .env.prod up -d --wait
+#   docker compose up -d --wait
 #
+# Legacy split `.env.prod` operation remains supported through WEB10_PROD_ENV_FILE's fallback.
 # WEB10_IMAGE_TAG must be an immutable sha-<short-commit>; latest is not supported.
 #
 # Differences from the dev compose.yaml:
@@ -46,7 +46,7 @@ services:
       postgres:
         condition: service_healthy
     env_file:
-      - path: .env.prod
+      - path: "${WEB10_PROD_ENV_FILE:-.env.prod}"
         required: true
     restart: "no"
 
@@ -62,7 +62,7 @@ services:
       # The single public origin: public stage at '/', admin at '/admin/', API at '/api/v0/'.
       - "${WEB10_API_PUBLISH_ADDRESS:-127.0.0.1}:8080:8080"
     env_file:
-      - path: .env.prod
+      - path: "${WEB10_PROD_ENV_FILE:-.env.prod}"
         required: true
     volumes:
       - ./.storage:/var/lib/web10/storage
@@ -86,7 +86,7 @@ services:
       migrator:
         condition: service_completed_successfully
     env_file:
-      - path: .env.prod
+      - path: "${WEB10_PROD_ENV_FILE:-.env.prod}"
         required: true
     healthcheck:
       test: ["CMD", "dotnet", "Web10.Radio.Telegram.dll", "--health-check", "http://127.0.0.1:8080/health/live"]
@@ -104,7 +104,7 @@ services:
       api:
         condition: service_healthy
     env_file:
-      - path: .env.prod
+      - path: "${WEB10_PROD_ENV_FILE:-.env.prod}"
         required: true
     healthcheck:
       test: ["CMD", "./Web10.Radio.StreamNode", "--health-check", "http://127.0.0.1:18080/healthz"]

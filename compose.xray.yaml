@@ -38,7 +38,7 @@ services:
         condition: service_healthy
 
     env_file:
-      - path: .env.xray
+      - path: "${WEB10_XRAY_ENV_FILE:-.env.xray}"
         required: true
 
 secrets:

@@ -37,6 +37,10 @@ services:
       xray-proxy:
         condition: service_healthy
 
+    env_file:
+      - path: .env.xray
+        required: true
+
 secrets:
   xray-outbound:
     file: "${WEB10_XRAY__OUTBOUND_CONFIG_FILE:?WEB10_XRAY__OUTBOUND_CONFIG_FILE is required with compose.xray.yaml}"

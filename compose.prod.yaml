@@ -60,7 +60,7 @@ services:
         condition: service_completed_successfully
     ports:
       # The single public origin: public stage at '/', admin at '/admin/', API at '/api/v0/'.
-      - "127.0.0.1:8080:8080"
+      - "${WEB10_API_PUBLISH_ADDRESS:-127.0.0.1}:8080:8080"
     env_file:
       - path: .env.prod
         required: true

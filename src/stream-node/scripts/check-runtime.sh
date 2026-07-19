@@ -167,6 +167,29 @@ if [ "$red" -lt 220 ] || [ "$green" -gt 35 ] || [ "$blue" -lt 220 ]; then
     exit 1
 fi
 
+crash_report_dir="${HOME:-/home/web10}/.config/chromium/Crash Reports/pending"
+mkdir -p "$crash_report_dir"
+: >"${crash_report_dir}/smoke-renderer.dmp"
+attempt=0
+while kill -0 "$chromium_pid" 2>/dev/null; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 50 ]; then
+        echo "Chromium wrapper did not exit after a child crash report" >&2
+        exit 1
+    fi
+    sleep 0.1
+done
+if wait "$chromium_pid"; then
+    chromium_status=0
+else
+    chromium_status=$?
+fi
+chromium_pid=""
+if [ "$chromium_status" -ne 70 ]; then
+    echo "Chromium wrapper exited ${chromium_status}; expected child-crash status 70" >&2
+    exit 1
+fi
+
 cue_source="${runtime_dir}/cue-source.flac"
 cue_segment="${runtime_dir}/cue-segment.flac"
 ffmpeg -hide_banner -loglevel error -y \
